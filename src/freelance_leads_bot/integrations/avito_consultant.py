@@ -356,6 +356,9 @@ class AvitoConsultant:
         best = context.retrieved_expert_answers[0]
         score = float(best.get("score") or 0)
         answer = str(best.get("answer_client") or "").strip()
+        risk_level = str(best.get("risk_level") or "").strip().lower()
+        if risk_level == "high":
+            return None
         if not answer or score < self.rag_autoanswer_threshold:
             return None
         return AvitoConsultantReply(

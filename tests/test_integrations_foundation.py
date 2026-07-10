@@ -127,7 +127,11 @@ from src.freelance_leads_bot.integrations.yclients import (
 )
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import APPROVED, NEEDS_REVIEW, ExpertRagStore
-from scripts.avito_unanswered_monitor import _find_unanswered as find_unanswered_avito_chat, autoreply_once as autoreply_unanswered_once
+from scripts.avito_unanswered_monitor import (
+    _find_unanswered as find_unanswered_avito_chat,
+    _report_item as report_unanswered_item,
+    autoreply_once as autoreply_unanswered_once,
+)
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.avito_live_telegram_relay import (
     compact_handoff_event,
@@ -4660,6 +4664,33 @@ async def test_avito_consultant_answers_from_high_confidence_expert_rag(tmp_path
     assert reply.handoff is None
 
 
+@pytest.mark.anyio
+async def test_avito_consultant_does_not_autoanswer_high_risk_expert_rag(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Можно делать процедуру после операции?",
+        answer_client="После операции процедуру можно делать только после очного разрешения врача.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    consultant = AvitoConsultant(
+        AutomationToolbox(DryRunYClientsGateway()),
+        expert_rag=store,
+        rag_autoanswer_threshold=0.2,
+        rag_handoff_threshold=0.1,
+    )
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-risk-rag",
+        chat_id="chat-risk-rag",
+        text="Можно делать процедуру после операции?",
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action != "expert_rag_answer"
+
+
 def test_expert_rag_price_or_medical_answer_requires_review(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     item = store.upsert_from_handoff(
@@ -4713,6 +4744,34 @@ async def test_unanswered_monitor_skips_messages_before_activation(tmp_path) -> 
 
     assert stats["attempted"] == 0
     assert "activated_at" in state
+
+
+def test_unanswered_monitor_report_marks_handled_items() -> None:
+    chat = {"id": "chat-1", "users": [{"id": 10, "name": "Анна"}]}
+    message = {"id": "m1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "Ок"}}
+    item = find_unanswered_avito_chat(
+        account_id=1,
+        chat=chat,
+        messages=[message],
+        now=2000,
+        min_age_seconds=1200,
+        lookback_seconds=5000,
+    )
+    assert item is not None
+    state = {
+        "handled": {
+            "1:chat-1:m1": {
+                "handled_at": 1500,
+                "result": {"ok": True, "ignored": True, "reason": "client_ack_after_pending_reply"},
+            }
+        }
+    }
+
+    row = report_unanswered_item(item, state)
+
+    assert row["autoreply_state"] == "handled"
+    assert row["needs_action"] is False
+    assert row["ignored_reason"] == "client_ack_after_pending_reply"
 
 
 def test_avito_live_telegram_relay_builds_one_card_with_client_and_bot_messages() -> None:

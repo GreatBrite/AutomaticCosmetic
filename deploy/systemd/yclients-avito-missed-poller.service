@@ -1,0 +1,15 @@
+[Unit]
+Description=AutomaticCosmetic Avito missed message poller
+After=network-online.target yclients-avito-webhook.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AutomaticCosmetic
+Environment=PATH=/root/.local/bin:/root/AutomaticCosmetic/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/AutomaticCosmetic/.venv/bin/python /root/AutomaticCosmetic/scripts/avito_missed_message_poller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

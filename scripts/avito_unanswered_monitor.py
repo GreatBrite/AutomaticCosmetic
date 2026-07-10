@@ -195,6 +195,30 @@ def _state_key(item: UnansweredChat) -> str:
     return f"{item.account_id}:{item.chat_id}:{item.message_id}"
 
 
+def _report_item(item: UnansweredChat, state: dict[str, Any]) -> dict[str, Any]:
+    key = _state_key(item)
+    data = item.to_dict()
+    handled = state.get("handled") if isinstance(state.get("handled"), dict) else {}
+    failed = state.get("failed") if isinstance(state.get("failed"), dict) else {}
+    handled_row = handled.get(key) if isinstance(handled, dict) else None
+    failed_row = failed.get(key) if isinstance(failed, dict) else None
+    if isinstance(handled_row, dict):
+        result = handled_row.get("result") if isinstance(handled_row.get("result"), dict) else {}
+        data["autoreply_state"] = "handled"
+        data["handled_at"] = handled_row.get("handled_at")
+        data["handled_action"] = result.get("action")
+        data["ignored_reason"] = result.get("reason") if result.get("ignored") else ""
+        data["needs_action"] = False
+    elif isinstance(failed_row, dict):
+        data["autoreply_state"] = "failed"
+        data["last_attempt_at"] = failed_row.get("last_attempt_at")
+        data["needs_action"] = True
+    else:
+        data["autoreply_state"] = "pending"
+        data["needs_action"] = True
+    return data
+
+
 def _load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"alerts": {}}
@@ -473,8 +497,12 @@ async def main() -> None:
                 "ok": True,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "count": len(items),
-                "items": [item.to_dict() for item in items],
+                "actionable_count": 0,
+                "items": [],
             }
+            report_state = _load_state(args.state_path)
+            report["items"] = [_report_item(item, report_state) for item in items]
+            report["actionable_count"] = sum(1 for item in report["items"] if item.get("needs_action"))
             args.report_path.parent.mkdir(parents=True, exist_ok=True)
             args.report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
