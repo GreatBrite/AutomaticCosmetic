@@ -96,6 +96,7 @@ from src.freelance_leads_bot.integrations.models import (
     Slot,
     UpsellRule,
 )
+from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 import src.freelance_leads_bot.integrations.roles as roles_module
 from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
@@ -5872,6 +5873,69 @@ def test_prelaunch_report_keeps_live_guards_off_before_preview() -> None:
     assert report.flags["avito_send_enabled"] is False
     assert report.flags["yclients_allow_mutations"] is False
     assert "AVITO_CODEX_ENABLED" in report.next_step
+
+
+def test_ops_status_reports_actionable_avito_queue(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps({"ok": True, "count": 1, "actionable_count": 1, "items": [{"needs_action": True}]}),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+    )
+
+    queue_check = next(check for check in report.checks if check.name == "avito_unanswered_queue")
+    assert report.ok is True
+    assert queue_check.ok is False
+    assert queue_check.severity == "warning"
+    assert report.summary["avito_actionable"] == 1
+
+
+def test_ops_status_failed_autoreply_is_error(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {"chat:msg": {"error": "boom"}}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+    )
+
+    failed_check = next(check for check in report.checks if check.name == "avito_autoreply_failures")
+    assert report.ok is False
+    assert failed_check.ok is False
+    assert failed_check.severity == "error"
+    assert report.summary["avito_autoreply_failed"] == 1
 
 
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:

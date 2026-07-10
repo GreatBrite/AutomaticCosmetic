@@ -59,6 +59,7 @@ cd /root/AutomaticCosmetic
 cd /root/AutomaticCosmetic
 .venv/bin/python -m compileall -q src scripts
 .venv/bin/python -m pytest -q
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
 ```
 
 ## Команды Telegram
@@ -82,3 +83,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now freelance-leads-bot
 sudo journalctl -u freelance-leads-bot -f
 ```
+
+Боевые Avito/YCLIENTS сервисы проверяются одной командой:
+
+```bash
+cd /root/AutomaticCosmetic
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
+```
+
+В отчёте важны поля:
+
+- `ok`: общий эксплуатационный статус;
+- `summary.avito_actionable`: сколько Avito-диалогов реально ждут действия;
+- `summary.avito_autoreply_failed`: сколько delayed auto-reply попыток упали;
+- `checks.systemd_services`: живы ли runtime-сервисы;
+- `checks.expert_rag`: есть ли approved RAG-знания.
