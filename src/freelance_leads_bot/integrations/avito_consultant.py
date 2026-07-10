@@ -227,6 +227,9 @@ class AvitoConsultant:
         conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     ) -> AvitoConsultantReply:
         context = await self.build_context(message, conversation_history=conversation_history)
+        preflight = self._preflight_reply(context)
+        if preflight:
+            return preflight
         if self.planner:
             planned = await self.planner.respond(context, self.toolbox)
             if planned:
@@ -251,6 +254,18 @@ class AvitoConsultant:
             role_profile=self.profile,
             conversation_key=_conversation_key_for_message(message, self.profile),
         )
+
+    def _preflight_reply(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
+        if context.role_profile.role != CodexRole.AVITO_CLIENT:
+            return None
+        message = context.message
+        if _looks_like_strong_ambiguous_booking_without_service(message, context.conversation_history):
+            return AvitoConsultantReply(
+                action="ask_procedure_for_booking",
+                reply="Подскажите, пожалуйста, какая процедура интересует? Тогда уже посмотрю по ней ближайшие варианты.",
+                metadata={"planner": "preflight", "reason": "booking_without_service"},
+            )
+        return None
 
     async def _fallback_response(self, context: AvitoAgentContext) -> AvitoConsultantReply:
         message = context.message
@@ -303,7 +318,7 @@ class AvitoConsultant:
         if _service_tools_may_help(message):
             return await self._answer_price(message)
 
-        if _looks_like_booking_without_service(message):
+        if _looks_like_booking_without_service(message, context.conversation_history):
             return AvitoConsultantReply(
                 action="ask_procedure_for_booking",
                 reply="Подскажите, пожалуйста, какая процедура интересует? Тогда уже посмотрю по ней ближайшие варианты.",
@@ -463,7 +478,7 @@ def _booking_tools_may_help(message: InboundMessage) -> bool:
     return any(word in lowered for word in BOOKING_WORDS) and not _service_tools_may_help(message)
 
 
-def _looks_like_booking_without_service(message: InboundMessage) -> bool:
+def _looks_like_booking_without_service(message: InboundMessage, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = ()) -> bool:
     lowered = message.text.casefold()
     has_booking_signal = (
         bool(extract_date(message.text))
@@ -471,13 +486,44 @@ def _looks_like_booking_without_service(message: InboundMessage) -> bool:
         or bool(AvitoBookingFlow(_NoopBooking()).extract_phone(message.text))
         or any(word in lowered for word in (*BOOKING_WORDS, "следующ", "недел", "прием", "приём", "встреч", "личн"))
     )
-    return has_booking_signal and not _has_service_or_procedure_hint(message)
+    return has_booking_signal and not _has_explicit_service_or_procedure_hint(message, conversation_history)
+
+
+def _looks_like_strong_ambiguous_booking_without_service(
+    message: InboundMessage,
+    conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+) -> bool:
+    lowered = message.text.casefold()
+    strong_booking_signal = (
+        bool(extract_date(message.text))
+        or bool(extract_time(message.text))
+        or bool(AvitoBookingFlow(_NoopBooking()).extract_phone(message.text))
+        or any(word in lowered for word in ("следующ", "недел", "прием", "приём", "встреч", "личн"))
+    )
+    return strong_booking_signal and not _has_explicit_service_or_procedure_hint(message, conversation_history)
 
 
 def _has_service_or_procedure_hint(message: InboundMessage) -> bool:
     text = message.text.casefold()
     listing_title = (message.listing.title if message.listing else "").casefold()
     source = f"{text} {listing_title}"
+    if any(word in source for word in ("процедур", "услуг", "губ", "ягод", "груд", "ботокс", "диспорт", "филлер", "носогуб", "скул", "подбород", "биоревитал", "мезотерап", "чистк", "пилинг", "волос", "кожа головы", "тесоро", "tesoro")):
+        return True
+    return False
+
+
+def _has_explicit_service_or_procedure_hint(
+    message: InboundMessage,
+    conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+) -> bool:
+    source = " ".join(
+        part
+        for part in (
+            message.text,
+            " ".join(str(item.get("content") or "") for item in conversation_history[-8:] if str(item.get("role") or "") == "user"),
+        )
+        if part
+    ).casefold()
     if any(word in source for word in ("процедур", "услуг", "губ", "ягод", "груд", "ботокс", "диспорт", "филлер", "носогуб", "скул", "подбород", "биоревитал", "мезотерап", "чистк", "пилинг", "волос", "кожа головы", "тесоро", "tesoro")):
         return True
     return False

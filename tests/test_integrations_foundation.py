@@ -2648,6 +2648,63 @@ async def test_avito_consultant_does_not_turn_phone_and_week_into_personal_meeti
 
 
 @pytest.mark.anyio
+async def test_avito_preflight_blocks_ambiguous_booking_before_planner(tmp_path) -> None:
+    class ExplodingPlanner:
+        async def respond(self, context, toolbox):
+            raise AssertionError("ambiguous booking without explicit service must not reach planner")
+
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, planner=ExplodingPlanner())
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-no-procedure-planner",
+            "content": {
+                "text": "На следующую неделю, 950-025-01-15 имя Ганжина",
+                "item": {
+                    "id": 10,
+                    "title": "Модель на Увеличение груди Увеличение ягодиц Акция",
+                    "city": "Санкт-Петербург",
+                },
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_procedure_for_booking"
+    assert reply.handoff is None
+    assert "какая процедура" in reply.reply.lower()
+
+
+@pytest.mark.anyio
+async def test_avito_preflight_uses_history_service_before_booking(tmp_path) -> None:
+    class Planner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def respond(self, context, toolbox):
+            self.called = True
+            return AvitoConsultantReply(action="planned", reply="Планирую по истории.")
+
+    planner = Planner()
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, planner=planner)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-history-procedure",
+            "content": {"text": "на следующую неделю, телефон 950-025-01-15"},
+        }
+    )
+
+    reply = await consultant.respond(message, conversation_history=[{"role": "user", "content": "Интересует увеличение губ"}])
+
+    assert planner.called is True
+    assert reply.action == "planned"
+
+
+@pytest.mark.anyio
 async def test_avito_consultant_uses_knowledge_for_medical_questions_instead_of_empty_handoff(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     knowledge.create(
@@ -3903,7 +3960,7 @@ async def test_codex_tool_loop_planner_writes_redacted_trace_log(tmp_path) -> No
             "type": "message",
             "message_id": "m-redact",
             "chat_id": "chat-redact",
-            "content": {"text": "Запишите меня, телефон +7 999 123-45-67"},
+            "content": {"text": "Запишите меня на чистку лица, телефон +7 999 123-45-67"},
         }
     )
 
