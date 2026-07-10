@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from .models import Appointment, ClientProfile, Handoff, InboundMessage, Service, Slot
+from .models import Appointment, ClientProfile, Handoff, HandoffReason, InboundMessage, Service, Slot
 from .avito import avito_photo_handoff
 from .config import DEFAULT_CITIES
 from .yclients import YClientsGateway
@@ -46,9 +46,10 @@ class BookingDecision:
 
 
 class AvitoBookingFlow:
-    def __init__(self, booking: YClientsGateway, cities: tuple[str, ...] = DEFAULT_CITIES) -> None:
+    def __init__(self, booking: YClientsGateway, cities: tuple[str, ...] = DEFAULT_CITIES, *, allow_create: bool = True) -> None:
         self.booking = booking
         self.cities = cities
+        self.allow_create = allow_create
 
     async def process(self, request: BookingRequest) -> BookingDecision:
         handoff = avito_photo_handoff(request.message)
@@ -113,6 +114,27 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_contact",
                 reply="Пришлите, пожалуйста, имя для записи и номер телефона для связи.",
+                slots=slots,
+                service=service,
+            )
+
+        if not self.allow_create:
+            return BookingDecision(
+                action="booking_confirmation_required",
+                reply=(
+                    f"Вижу подходящее время: {service.title}, {city}, "
+                    f"{selected_slot.starts_at.strftime('%d.%m %H:%M')}. "
+                    "Сейчас проверю оформление записи и вернусь с подтверждением."
+                ),
+                handoff=Handoff(
+                    reason=HandoffReason.BOOKING_AMBIGUOUS,
+                    message=request.message,
+                    summary=(
+                        f"Клиент хочет записаться: {service.title}, {city}, "
+                        f"{selected_slot.starts_at.strftime('%d.%m.%Y %H:%M')}, телефон {phone}. "
+                        "Fallback Avito не создаёт live-запись автоматически; нужно подтвердить оформление."
+                    ),
+                ),
                 slots=slots,
                 service=service,
             )

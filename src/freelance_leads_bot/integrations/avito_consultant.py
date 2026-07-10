@@ -218,7 +218,7 @@ class AvitoConsultant:
         self.expert_rag = expert_rag
         self.rag_autoanswer_threshold = rag_autoanswer_threshold
         self.rag_handoff_threshold = rag_handoff_threshold
-        self.booking_flow = AvitoBookingFlow(toolbox.booking, cities=cities)
+        self.booking_flow = AvitoBookingFlow(toolbox.booking, cities=cities, allow_create=False)
 
     async def respond(
         self,

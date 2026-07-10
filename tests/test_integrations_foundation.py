@@ -4478,10 +4478,11 @@ def test_avito_webhook_processes_booking_decision_and_deduplicates() -> None:
         second = client.post("/avito/webhook?token=webhook", json=event)
 
         assert first.status_code == 200
-        assert first.json()["action"] == "created"
+        assert first.json()["action"] == "booking_confirmation_required"
         assert first.json()["dry_run"] is True
         assert first.json()["send"]["reason"] == "preview_only"
-        assert len(gateway.appointments) == 1
+        assert first.json()["handoff"] == "booking_ambiguous"
+        assert len(gateway.appointments) == 0
         assert second.json()["ignored"] is True
         assert second.json()["reason"] == "duplicate"
     finally:
