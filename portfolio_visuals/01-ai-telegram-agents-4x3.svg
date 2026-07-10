@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <rect width="1600" height="1000" fill="#f7f8fb"/>
+  <rect x="88" y="84" width="1424" height="832" rx="36" fill="#ffffff" stroke="#d8dde8" stroke-width="3"/>
+  <text x="140" y="170" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="700" fill="#111827">AI Telegram Agents for Client Operations</text>
+  <text x="140" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">Telegram, Avito, YClients, OpenRouter, persistent memory, admin workflows</text>
+  <rect x="140" y="295" width="380" height="455" rx="26" fill="#eef6ff" stroke="#b9d8ff" stroke-width="3"/>
+  <text x="180" y="365" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#0f172a">Client Message</text>
+  <rect x="180" y="415" width="285" height="54" rx="18" fill="#ffffff"/>
+  <text x="205" y="450" font-family="Inter, Arial, sans-serif" font-size="20" fill="#334155">Can I book tomorrow?</text>
+  <rect x="210" y="495" width="260" height="54" rx="18" fill="#1d9bf0"/>
+  <text x="235" y="530" font-family="Inter, Arial, sans-serif" font-size="20" fill="#ffffff">Checking schedule...</text>
+  <rect x="180" y="585" width="300" height="54" rx="18" fill="#ffffff"/>
+  <text x="205" y="620" font-family="Inter, Arial, sans-serif" font-size="20" fill="#334155">Slot found: 14:30</text>
+  <rect x="610" y="295" width="380" height="455" rx="26" fill="#f0fdf4" stroke="#b6e9c6" stroke-width="3"/>
+  <text x="650" y="365" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#0f172a">Agent Tools</text>
+  <text x="650" y="425" font-family="Inter, Arial, sans-serif" font-size="24" fill="#166534">• Intent parsing</text>
+  <text x="650" y="480" font-family="Inter, Arial, sans-serif" font-size="24" fill="#166534">• Booking lookup</text>
+  <text x="650" y="535" font-family="Inter, Arial, sans-serif" font-size="24" fill="#166534">• Memory notes</text>
+  <text x="650" y="590" font-family="Inter, Arial, sans-serif" font-size="24" fill="#166534">• Draft + review</text>
+  <text x="650" y="645" font-family="Inter, Arial, sans-serif" font-size="24" fill="#166534">• Human approval</text>
+  <rect x="1080" y="295" width="380" height="455" rx="26" fill="#fff7ed" stroke="#fed7aa" stroke-width="3"/>
+  <text x="1120" y="365" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#0f172a">Business Result</text>
+  <text x="1120" y="425" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Faster replies</text>
+  <text x="1120" y="480" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Cleaner records</text>
+  <text x="1120" y="535" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Booking support</text>
+  <text x="1120" y="590" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Upsell reminders</text>
+  <path d="M530 520 H590" stroke="#94a3b8" stroke-width="8" stroke-linecap="round"/>
+  <path d="M1000 520 H1060" stroke="#94a3b8" stroke-width="8" stroke-linecap="round"/>
+  <text x="140" y="835" font-family="Inter, Arial, sans-serif" font-size="24" fill="#475569">Case study visual: AI-assisted messaging and admin automation</text>
+</svg>
+

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="#f8fafc"/>
+  <rect x="92" y="82" width="1416" height="836" rx="34" fill="#ffffff" stroke="#dbe3ef" stroke-width="3"/>
+  <text x="145" y="170" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="700" fill="#111827">Freelance Lead Desk with Codex Analysis</text>
+  <text x="145" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">Lead sources, SQLite dedupe, risk scoring, Telegram decisions, Codex CLI reviews</text>
+  <rect x="145" y="300" width="1310" height="118" rx="24" fill="#f1f5f9"/>
+  <text x="190" y="350" font-family="Inter, Arial, sans-serif" font-size="26" font-weight="700" fill="#0f172a">New lead</text>
+  <text x="190" y="388" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">Build a Telegram bot with AI proposal generation and API integration</text>
+  <rect x="1140" y="330" width="120" height="46" rx="18" fill="#dcfce7"/>
+  <text x="1172" y="360" font-family="Inter, Arial, sans-serif" font-size="20" fill="#166534">$30/hr</text>
+  <rect x="1290" y="330" width="120" height="46" rx="18" fill="#e0f2fe"/>
+  <text x="1321" y="360" font-family="Inter, Arial, sans-serif" font-size="20" fill="#075985">3-7 d</text>
+  <rect x="145" y="475" width="380" height="260" rx="28" fill="#eef2ff"/>
+  <text x="190" y="535" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#312e81">Scoring</text>
+  <text x="190" y="590" font-family="Inter, Arial, sans-serif" font-size="24" fill="#4338ca">Fit: strong</text>
+  <text x="190" y="640" font-family="Inter, Arial, sans-serif" font-size="24" fill="#4338ca">Risk: low</text>
+  <text x="190" y="690" font-family="Inter, Arial, sans-serif" font-size="24" fill="#4338ca">Client pays infra</text>
+  <rect x="610" y="475" width="380" height="260" rx="28" fill="#ecfeff"/>
+  <text x="655" y="535" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#164e63">Telegram</text>
+  <rect x="655" y="585" width="126" height="54" rx="18" fill="#111827"/>
+  <text x="686" y="620" font-family="Inter, Arial, sans-serif" font-size="20" fill="#ffffff">Do</text>
+  <rect x="800" y="585" width="126" height="54" rx="18" fill="#e5e7eb"/>
+  <text x="831" y="620" font-family="Inter, Arial, sans-serif" font-size="20" fill="#111827">Skip</text>
+  <rect x="655" y="660" width="270" height="54" rx="18" fill="#2563eb"/>
+  <text x="707" y="695" font-family="Inter, Arial, sans-serif" font-size="20" fill="#ffffff">Codex analysis</text>
+  <rect x="1075" y="475" width="380" height="260" rx="28" fill="#fff7ed"/>
+  <text x="1120" y="535" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#7c2d12">Proposal Draft</text>
+  <text x="1120" y="590" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Scope summary</text>
+  <text x="1120" y="640" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">Price guidance</text>
+  <text x="1120" y="690" font-family="Inter, Arial, sans-serif" font-size="24" fill="#9a3412">English reply</text>
+  <text x="145" y="835" font-family="Inter, Arial, sans-serif" font-size="24" fill="#475569">Case study visual: automated lead triage and proposal preparation</text>
+</svg>
+

@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "freelance-proton-email": {
+      "command": "uvx",
+      "args": ["mcp-email-server@latest", "stdio"],
+      "env": {
+        "MCP_EMAIL_SERVER_ACCOUNT_NAME": "freelance-proton",
+        "MCP_EMAIL_SERVER_FULL_NAME": "Your Name",
+        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": "your-address@proton.me",
+        "MCP_EMAIL_SERVER_USER_NAME": "bridge_generated_username",
+        "MCP_EMAIL_SERVER_PASSWORD": "bridge_generated_mailbox_password",
+        "MCP_EMAIL_SERVER_IMAP_HOST": "127.0.0.1",
+        "MCP_EMAIL_SERVER_IMAP_PORT": "1143",
+        "MCP_EMAIL_SERVER_IMAP_SSL": "false",
+        "MCP_EMAIL_SERVER_IMAP_VERIFY_SSL": "false",
+        "MCP_EMAIL_SERVER_SMTP_HOST": "127.0.0.1",
+        "MCP_EMAIL_SERVER_SMTP_PORT": "1025",
+        "MCP_EMAIL_SERVER_SMTP_SSL": "false",
+        "MCP_EMAIL_SERVER_SMTP_START_SSL": "false",
+        "MCP_EMAIL_SERVER_SMTP_VERIFY_SSL": "false",
+        "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD": "false",
+        "MCP_EMAIL_SERVER_SAVE_TO_SENT": "true"
+      }
+    }
+  }
+}
+

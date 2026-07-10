@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <rect width="1600" height="1000" fill="#fafafa"/>
+  <rect x="88" y="84" width="1424" height="832" rx="36" fill="#ffffff" stroke="#e5e7eb" stroke-width="3"/>
+  <text x="140" y="170" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="700" fill="#111827">Scheduling &amp; Payroll Telegram Bot</text>
+  <text x="140" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">Shift planning, substitutions, XLSX exports, payroll helpers, Telegram workflows</text>
+  <rect x="140" y="295" width="1320" height="450" rx="28" fill="#f8fafc"/>
+  <line x1="260" y1="295" x2="260" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="460" y1="295" x2="460" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="660" y1="295" x2="660" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="860" y1="295" x2="860" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="1060" y1="295" x2="1060" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="1260" y1="295" x2="1260" y2="745" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="140" y1="385" x2="1460" y2="385" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="140" y1="475" x2="1460" y2="475" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="140" y1="565" x2="1460" y2="565" stroke="#e2e8f0" stroke-width="3"/>
+  <line x1="140" y1="655" x2="1460" y2="655" stroke="#e2e8f0" stroke-width="3"/>
+  <text x="180" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Mon</text>
+  <text x="380" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Tue</text>
+  <text x="580" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Wed</text>
+  <text x="780" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Thu</text>
+  <text x="980" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Fri</text>
+  <text x="1180" y="350" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#334155">Sat</text>
+  <rect x="300" y="410" width="120" height="42" rx="14" fill="#dbeafe"/>
+  <text x="322" y="438" font-family="Inter, Arial, sans-serif" font-size="18" fill="#1e40af">Store A</text>
+  <rect x="700" y="500" width="120" height="42" rx="14" fill="#dcfce7"/>
+  <text x="722" y="528" font-family="Inter, Arial, sans-serif" font-size="18" fill="#166534">Shift OK</text>
+  <rect x="1100" y="590" width="120" height="42" rx="14" fill="#ffedd5"/>
+  <text x="1122" y="618" font-family="Inter, Arial, sans-serif" font-size="18" fill="#9a3412">Subst.</text>
+  <rect x="140" y="800" width="300" height="70" rx="22" fill="#111827"/>
+  <text x="185" y="845" font-family="Inter, Arial, sans-serif" font-size="22" fill="#ffffff">Export XLSX</text>
+  <rect x="485" y="800" width="300" height="70" rx="22" fill="#f1f5f9"/>
+  <text x="535" y="845" font-family="Inter, Arial, sans-serif" font-size="22" fill="#334155">Payroll report</text>
+  <rect x="830" y="800" width="300" height="70" rx="22" fill="#f1f5f9"/>
+  <text x="890" y="845" font-family="Inter, Arial, sans-serif" font-size="22" fill="#334155">Telegram alerts</text>
+  <text x="1180" y="845" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">Case study visual</text>
+</svg>

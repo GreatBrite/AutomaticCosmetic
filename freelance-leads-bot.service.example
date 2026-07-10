@@ -1,0 +1,14 @@
+[Unit]
+Description=Automatic Cosmetic operations Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AutomaticCosmetic
+ExecStart=/usr/bin/python3 -m src.freelance_leads_bot.main serve
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

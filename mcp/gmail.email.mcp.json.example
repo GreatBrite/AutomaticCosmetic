@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "freelance-gmail": {
+      "command": "uvx",
+      "args": ["mcp-email-server@latest", "stdio"],
+      "env": {
+        "MCP_EMAIL_SERVER_ACCOUNT_NAME": "freelance-gmail",
+        "MCP_EMAIL_SERVER_FULL_NAME": "Your Name",
+        "MCP_EMAIL_SERVER_EMAIL_ADDRESS": "your.freelance@gmail.com",
+        "MCP_EMAIL_SERVER_USER_NAME": "your.freelance@gmail.com",
+        "MCP_EMAIL_SERVER_PASSWORD": "google_16_digit_app_password_without_spaces",
+        "MCP_EMAIL_SERVER_IMAP_HOST": "imap.gmail.com",
+        "MCP_EMAIL_SERVER_IMAP_PORT": "993",
+        "MCP_EMAIL_SERVER_IMAP_SSL": "true",
+        "MCP_EMAIL_SERVER_SMTP_HOST": "smtp.gmail.com",
+        "MCP_EMAIL_SERVER_SMTP_PORT": "465",
+        "MCP_EMAIL_SERVER_SMTP_SSL": "true",
+        "MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD": "false",
+        "MCP_EMAIL_SERVER_SAVE_TO_SENT": "true"
+      }
+    }
+  }
+}
+

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Server Console</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/miniapp/static/style.css?v=20260526-03">
+</head>
+<body>
+  <canvas id="shader-bg" aria-hidden="true"></canvas>
+  <section id="bootloader" class="bootloader" aria-live="polite">
+    <div class="boot-card">
+      <div class="boot-title">
+        <span id="boot-spinner" class="boot-spinner">/</span>
+        <strong>CRT BOOT</strong>
+        <span id="boot-percent" class="boot-percent">00%</span>
+      </div>
+      <pre id="boot-lines"></pre>
+      <div class="boot-progress" aria-hidden="true"><span id="boot-progress"></span></div>
+    </div>
+  </section>
+  <div id="locked" class="locked">
+    <strong>Access denied</strong>
+    <span>Открой Mini App из разрешённого Telegram-аккаунта.</span>
+  </div>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <strong>Server Console</strong>
+        <span id="cwd-short">/root</span>
+      </div>
+      <span id="status">auth</span>
+    </header>
+
+    <nav class="tabs" aria-label="Views">
+      <div class="tab-buttons" role="tablist" aria-label="Views">
+        <button class="tab active" type="button" data-tab="terminal">Terminal</button>
+        <button class="tab" type="button" data-tab="files">Files</button>
+        <button class="tab" type="button" data-tab="stat">Stat</button>
+      </div>
+      <button id="clear-output" class="ghost" type="button">Clear</button>
+    </nav>
+
+    <label class="cwd">
+      <span>cwd</span>
+      <input id="cwd" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+    </label>
+
+    <section class="panels">
+      <div class="panel-track">
+        <section id="terminal-panel" class="panel terminal-panel active">
+          <div class="panel-head">
+            <span>Shell</span>
+            <strong id="terminal-title">live session</strong>
+          </div>
+          <pre id="output"></pre>
+          <form id="command-form" class="command">
+            <span>$</span>
+            <input id="command" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="go" autofocus>
+            <button type="submit">Run</button>
+          </form>
+        </section>
+
+        <section id="files-panel" class="panel files-panel">
+          <div class="filebar">
+            <span>Tree</span>
+            <strong>Directories</strong>
+            <button id="up" type="button">Up</button>
+          </div>
+          <div id="list" class="list"></div>
+        </section>
+
+        <section id="stat-panel" class="panel stat-panel">
+          <div class="panel-head">
+            <span>Stat</span>
+            <strong>system metrics</strong>
+          </div>
+          <section class="dashboard" aria-label="Server stats">
+            <article class="metric">
+              <span class="widget-label">CPU</span>
+              <div>
+                <span>CPU</span>
+                <strong id="cpu-value">--%</strong>
+              </div>
+              <div class="meter"><span id="cpu-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">LOAD</span>
+              <div>
+                <span>Load</span>
+                <strong id="load-value">--</strong>
+              </div>
+              <p id="load-detail" class="metric-detail">--</p>
+              <div class="meter"><span id="load-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">MEM</span>
+              <div>
+                <span>RAM</span>
+                <strong id="ram-value">--</strong>
+              </div>
+              <div class="meter"><span id="ram-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">SWAP</span>
+              <div>
+                <span>Swap</span>
+                <strong id="swap-value">--</strong>
+              </div>
+              <div class="meter"><span id="swap-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">FS</span>
+              <div>
+                <span>Disk</span>
+                <strong id="disk-value">--</strong>
+              </div>
+              <div class="meter"><span id="disk-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">INODE</span>
+              <div>
+                <span>Inodes</span>
+                <strong id="inode-value">--</strong>
+              </div>
+              <div class="meter"><span id="inode-meter"></span></div>
+            </article>
+            <article class="metric">
+              <span class="widget-label">PROC</span>
+              <div>
+                <span>Processes</span>
+                <strong id="process-value">--</strong>
+              </div>
+              <p id="uptime-value" class="metric-detail">uptime --</p>
+            </article>
+            <article class="metric">
+              <span class="widget-label">NET</span>
+              <div>
+                <span>Network</span>
+                <strong id="network-value">--</strong>
+              </div>
+              <p class="metric-detail">rx / tx total</p>
+            </article>
+          </section>
+        </section>
+      </div>
+    </section>
+  </main>
+  <script src="/miniapp/static/app.js?v=20260526-03"></script>
+</body>
+</html>

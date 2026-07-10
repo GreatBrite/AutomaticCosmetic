@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+if [[ -x .venv/bin/python ]]; then
+  exec .venv/bin/python -m src.freelance_leads_bot.main serve
+fi
+exec python3 -m src.freelance_leads_bot.main serve

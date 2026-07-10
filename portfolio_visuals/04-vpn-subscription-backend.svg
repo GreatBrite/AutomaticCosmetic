@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="#f6f7fb"/>
+  <rect x="92" y="82" width="1416" height="836" rx="34" fill="#ffffff" stroke="#dbe3ef" stroke-width="3"/>
+  <text x="145" y="170" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="700" fill="#111827">VPN Subscription Backend &amp; Deployment Toolkit</text>
+  <text x="145" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">FastAPI, SQLite, Xray config generation, systemd services, traffic sync</text>
+  <rect x="170" y="310" width="320" height="245" rx="28" fill="#eff6ff" stroke="#bfdbfe" stroke-width="3"/>
+  <text x="215" y="375" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#1e3a8a">API Service</text>
+  <text x="215" y="430" font-family="Inter, Arial, sans-serif" font-size="23" fill="#1d4ed8">FastAPI endpoints</text>
+  <text x="215" y="480" font-family="Inter, Arial, sans-serif" font-size="23" fill="#1d4ed8">Subscriptions</text>
+  <rect x="640" y="310" width="320" height="245" rx="28" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="3"/>
+  <text x="685" y="375" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#14532d">Database</text>
+  <text x="685" y="430" font-family="Inter, Arial, sans-serif" font-size="23" fill="#166534">SQLite state</text>
+  <text x="685" y="480" font-family="Inter, Arial, sans-serif" font-size="23" fill="#166534">Users + traffic</text>
+  <rect x="1110" y="310" width="320" height="245" rx="28" fill="#fefce8" stroke="#fde68a" stroke-width="3"/>
+  <text x="1155" y="375" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#713f12">Xray Config</text>
+  <text x="1155" y="430" font-family="Inter, Arial, sans-serif" font-size="23" fill="#854d0e">VLESS Reality</text>
+  <text x="1155" y="480" font-family="Inter, Arial, sans-serif" font-size="23" fill="#854d0e">Restart workflow</text>
+  <path d="M510 430 H620" stroke="#94a3b8" stroke-width="8" stroke-linecap="round"/>
+  <path d="M980 430 H1090" stroke="#94a3b8" stroke-width="8" stroke-linecap="round"/>
+  <rect x="240" y="650" width="1120" height="118" rx="26" fill="#111827"/>
+  <text x="300" y="722" font-family="Inter, Arial, sans-serif" font-size="28" fill="#ffffff">Deployment bundle: install scripts, systemd units, config templates, health checks</text>
+  <text x="145" y="850" font-family="Inter, Arial, sans-serif" font-size="24" fill="#475569">Case study visual: backend automation and server deployment</text>
+</svg>

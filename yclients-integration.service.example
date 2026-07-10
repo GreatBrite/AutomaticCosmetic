@@ -1,0 +1,14 @@
+[Unit]
+Description=Automatic Cosmetic YCLIENTS integration adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AutomaticCosmetic
+ExecStart=/root/AutomaticCosmetic/run_yclients_integration.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
