@@ -3974,6 +3974,57 @@ async def test_codex_tool_loop_planner_writes_redacted_trace_log(tmp_path) -> No
     assert '"phone": "[redacted]"' in content
 
 
+@pytest.mark.anyio
+async def test_avito_tool_loop_rejects_tools_outside_role_even_with_unfiltered_toolbox(tmp_path) -> None:
+    class RecordingGateway(DryRunYClientsGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.create_calls = 0
+
+        async def create_appointment(self, appointment):
+            self.create_calls += 1
+            return await super().create_appointment(appointment)
+
+    gateway = RecordingGateway()
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+
+    async def fake_codex_loop(payload, trace):
+        if not trace:
+            return {
+                "tool_calls": [
+                    {
+                        "name": "yclients.appointments.create",
+                        "arguments": {
+                            "city": "Москва",
+                            "service_id": 7,
+                            "datetime": "2026-06-01T10:00:00",
+                            "phone": "+7 999 123-45-67",
+                        },
+                    }
+                ]
+            }
+        assert trace[-1]["ok"] is False
+        assert "not allowed" in trace[-1]["error"]
+        return {"action": "codex_reply", "reply": "Не буду создавать запись без подтверждения администратора."}
+
+    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "message_id": "m-forbidden-tool",
+            "chat_id": "chat-forbidden-tool",
+            "content": {"text": "Запишите меня на чистку лица, телефон +7 999 123-45-67"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "codex_reply"
+    assert gateway.create_calls == 0
+    assert reply.metadata["trace"][1]["ok"] is False
+    assert "not allowed" in reply.metadata["trace"][1]["error"]
+
+
 def test_redact_sensitive_masks_nested_values() -> None:
     payload = {"message": "телефон 8 999 123-45-67", "auth": {"token": "secret"}, "items": [{"phone": "79991234567"}]}
 

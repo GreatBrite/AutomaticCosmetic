@@ -150,6 +150,18 @@ class CodexToolLoopPlanner:
                     name = str(call.get("name") or "")
                     arguments = dict(call.get("arguments") or {})
                     trace.append({"type": "tool_call", "tool": name, "arguments": arguments})
+                    if name not in context.available_tools:
+                        trace.append(
+                            {
+                                "type": "tool_result",
+                                "tool": name,
+                                "arguments": arguments,
+                                "ok": False,
+                                "data": {},
+                                "error": f"tool {name} is not allowed for role {context.role_profile.role.value}",
+                            }
+                        )
+                        continue
                     result = await toolbox.execute(name, arguments)
                     trace.append(
                         {
