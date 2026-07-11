@@ -1,5 +1,7 @@
 # Automatic Cosmetic
 
+[![tests](https://github.com/GreatBrite/AutomaticCosmetic/actions/workflows/tests.yml/badge.svg)](https://github.com/GreatBrite/AutomaticCosmetic/actions/workflows/tests.yml)
+
 Операционная система для косметолога: Avito-консультант, Telegram-администратор и контур заботы/допродаж поверх YCLIENTS.
 
 ## Зачем нужен бот
