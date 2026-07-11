@@ -177,12 +177,5 @@ df -h .
 ```bash
 cd /root/AutomaticCosmetic
 .venv/bin/python -m pytest -q
-.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
-systemctl --failed --no-pager
-journalctl -u freelance-leads-bot.service \
-  -u yclients-avito-webhook.service \
-  -u yclients-avito-missed-poller.service \
-  -u yclients-avito-unanswered-monitor.service \
-  -u yclients-yclients-integration.service \
-  --since '2 hours ago' -p warning..alert --no-pager
+scripts/live_smoke_check.sh
 ```

@@ -94,6 +94,13 @@ cd /root/AutomaticCosmetic
 .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
 ```
 
+Расширенная live-smoke проверка после изменений:
+
+```bash
+cd /root/AutomaticCosmetic
+scripts/live_smoke_check.sh
+```
+
 Для alert/cron можно включить строгий режим, где warning тоже даёт ненулевой exit-code:
 
 ```bash
