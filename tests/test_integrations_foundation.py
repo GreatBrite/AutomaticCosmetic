@@ -6224,6 +6224,7 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
     assert "AutomaticCosmetic ops: WARN" in text
     assert "needs_review=1" in text
     assert "expert_rag_needs_review" in text
+    assert "expert_rag_review list" in text
 
 
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:
