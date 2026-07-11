@@ -15,7 +15,11 @@ DEFAULT_AUDIT_LOG_PATH = Path("data/expert_rag_review_audit.jsonl")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Review AutomaticCosmetic expert RAG items")
     parser.add_argument("--db", type=Path, default=DEFAULT_EXPERT_RAG_DB_PATH, help="Path to expert RAG SQLite database.")
-    parser.add_argument("--audit-log", type=Path, default=DEFAULT_AUDIT_LOG_PATH, help="Path to append review mutation audit JSONL.")
+    parser.add_argument(
+        "--audit-log",
+        type=Path,
+        help="Path to append/read review mutation audit JSONL. Defaults to data/ for the live DB, or next to a custom --db.",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -50,6 +54,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
     parser = build_parser()
     args = parser.parse_args(argv)
     store = ExpertRagStore(args.db)
+    audit_log_path = resolve_audit_log_path(args.db, args.audit_log)
 
     if args.command == "list":
         items = store.list_answers(status=args.status, limit=args.limit)
@@ -75,7 +80,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
             item = store.approve(args.id, approved_by=args.by)
         except KeyError:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
-        _append_audit_log(args.audit_log, action="approve", previous=previous, current=item, approved_by=args.by)
+        _append_audit_log(audit_log_path, action="approve", previous=previous, current=item, approved_by=args.by)
         return 0, _json_or_text(args.json, {"ok": True, "item": item.to_dict()}, f"Approved expert RAG item {item.id} by {item.approved_by}.")
 
     if args.command == "deprecate":
@@ -92,7 +97,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         if not changed:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
         current = store.get(args.id) or previous
-        _append_audit_log(args.audit_log, action="deprecate", previous=previous, current=current)
+        _append_audit_log(audit_log_path, action="deprecate", previous=previous, current=current)
         return 0, _json_or_text(args.json, {"ok": True, "id": args.id, "status": "deprecated"}, f"Deprecated expert RAG item {args.id}.")
 
     if args.command == "export":
@@ -110,7 +115,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         return 0, content
 
     if args.command == "audit":
-        events = _read_audit_log(args.audit_log, limit=args.limit)
+        events = _read_audit_log(audit_log_path, limit=args.limit)
         return 0, _json_or_text(args.json, {"events": events}, _format_audit_events(events))
 
     return 2, "Unsupported command."
@@ -118,6 +123,14 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
 
 def _json_or_text(as_json: bool, payload: dict[str, Any], text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2) if as_json else text
+
+
+def resolve_audit_log_path(db_path: Path, explicit_audit_log: Path | None = None) -> Path:
+    if explicit_audit_log is not None:
+        return explicit_audit_log
+    if Path(db_path) == DEFAULT_EXPERT_RAG_DB_PATH:
+        return DEFAULT_AUDIT_LOG_PATH
+    return Path(db_path).parent / DEFAULT_AUDIT_LOG_PATH.name
 
 
 def _append_audit_log(

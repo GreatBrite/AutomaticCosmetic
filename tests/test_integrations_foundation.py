@@ -98,7 +98,7 @@ from src.freelance_leads_bot.integrations.models import (
 )
 from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
-from src.freelance_leads_bot.integrations.expert_rag_review import run_review_command
+from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
 from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
 import src.freelance_leads_bot.integrations.telegram_admin_bot as telegram_admin_bot_module
@@ -4920,6 +4920,27 @@ def test_expert_rag_review_cli_writes_audit_log_for_mutations_only(tmp_path) -> 
     assert events[1]["item_id"] == deprecate_item.id
     assert events[1]["previous"]["status"] == NEEDS_REVIEW
     assert events[1]["current"]["status"] == "deprecated"
+
+
+def test_expert_rag_review_cli_custom_db_defaults_audit_log_next_to_db(tmp_path) -> None:
+    db_path = tmp_path / "nested" / "expert.sqlite3"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+
+    assert resolve_audit_log_path(db_path) == db_path.parent / DEFAULT_AUDIT_LOG_PATH.name
+
+    code, _ = run_review_command(["--db", str(db_path), "approve", str(item.id), "--by", "olga"])
+
+    assert code == 0
+    audit_path = db_path.parent / DEFAULT_AUDIT_LOG_PATH.name
+    assert audit_path.exists()
+    event = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+    assert event["item_id"] == item.id
+    assert event["action"] == "approve"
 
 
 def test_expert_rag_review_cli_reads_audit_log(tmp_path) -> None:
