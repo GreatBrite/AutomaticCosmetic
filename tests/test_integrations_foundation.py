@@ -96,7 +96,7 @@ from src.freelance_leads_bot.integrations.models import (
     Slot,
     UpsellRule,
 )
-from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report
+from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 import src.freelance_leads_bot.integrations.roles as roles_module
 from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
@@ -6088,6 +6088,52 @@ def test_ops_status_warns_on_stale_unanswered_report(tmp_path) -> None:
     assert freshness_check.data is not None
     assert freshness_check.data["report_age_seconds"] == 1900
     assert report.summary["avito_unanswered_report_age_seconds"] == 1900
+
+
+def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:01:40+00:00",
+                "count": 1,
+                "actionable_count": 1,
+                "items": [{"needs_action": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=2000,
+    )
+
+    text = format_ops_status_report(report)
+
+    assert text.startswith("AutomaticCosmetic ops: WARN")
+    assert "Avito actionable=1" in text
+    assert "report_age=1900s" in text
+    assert "Warnings:" in text
+    assert "avito_unanswered_queue" in text
+    assert "avito_unanswered_report_fresh" in text
+    assert "No immediate action required" not in text
 
 
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:

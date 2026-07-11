@@ -265,11 +265,53 @@ def report_data(report: OpsStatusReport) -> dict[str, Any]:
     return data
 
 
+def format_ops_status_report(report: OpsStatusReport) -> str:
+    failing_errors = [check for check in report.checks if not check.ok and check.severity == "error"]
+    failing_warnings = [check for check in report.checks if not check.ok and check.severity == "warning"]
+    status = "ERROR" if failing_errors else "WARN" if failing_warnings else "OK"
+    summary = report.summary
+    flags = report.flags
+    lines = [
+        f"AutomaticCosmetic ops: {status}",
+        (
+            "Services: "
+            + ("active" if summary.get("services_active") else "attention needed")
+            + f" | Avito actionable={summary.get('avito_actionable', 0)}"
+            + f" failed_autoreplies={summary.get('avito_autoreply_failed', 0)}"
+            + f" report_age={summary.get('avito_unanswered_report_age_seconds', 0)}s"
+        ),
+        (
+            f"RAG: approved={summary.get('rag_approved', 0)}"
+            f" high_risk_approved={summary.get('rag_high_risk_approved', 0)}"
+        ),
+        (
+            "Live flags: "
+            f"avito_send={_on_off(flags.get('avito_send_enabled'))}, "
+            f"avito_codex={_on_off(flags.get('avito_codex_enabled'))}, "
+            f"avito_autoreply={_on_off(flags.get('avito_unanswered_autoreply_enabled'))}, "
+            f"yclients_mutations={_on_off(flags.get('yclients_allow_mutations'))}"
+        ),
+    ]
+    if failing_errors:
+        lines.append("Errors:")
+        lines.extend(f"- {check.name}: {check.detail}" for check in failing_errors)
+    if failing_warnings:
+        lines.append("Warnings:")
+        lines.extend(f"- {check.name}: {check.detail}" for check in failing_warnings)
+    if not failing_errors and not failing_warnings:
+        lines.append("No immediate action required.")
+    return "\n".join(lines)
+
+
 def _health_check(name: str, payload: dict[str, Any], *, required_flags: tuple[str, ...] = ()) -> OpsCheck:
     missing = [flag for flag in required_flags if not payload.get(flag)]
     ok = bool(payload.get("ok")) and not missing
     detail = "Health endpoint is OK." if ok else "Health endpoint failed or required flags are false."
     return OpsCheck(name, ok, "error", detail, {"missing_flags": missing, "ok": payload.get("ok"), **{flag: payload.get(flag) for flag in required_flags}})
+
+
+def _on_off(value: Any) -> str:
+    return "on" if bool(value) else "off"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -288,7 +330,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = build_ops_status_report()
     data = report_data(report)
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(format_ops_status_report(report))
     return 0 if report.ok else 1
 
 
