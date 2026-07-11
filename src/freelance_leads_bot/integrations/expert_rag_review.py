@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .expert_rag import DEFAULT_EXPERT_RAG_DB_PATH, NEEDS_REVIEW, ExpertAnswer, ExpertRagStore
 
 
+DEFAULT_AUDIT_LOG_PATH = Path("data/expert_rag_review_audit.jsonl")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Review AutomaticCosmetic expert RAG items")
     parser.add_argument("--db", type=Path, default=DEFAULT_EXPERT_RAG_DB_PATH, help="Path to expert RAG SQLite database.")
+    parser.add_argument("--audit-log", type=Path, default=DEFAULT_AUDIT_LOG_PATH, help="Path to append review mutation audit JSONL.")
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -60,10 +65,14 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
                 return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
             payload = {"ok": True, "dry_run": True, "action": "approve", "approved_by": args.by, "item": item.to_dict()}
             return 0, _json_or_text(args.json, payload, _format_dry_run(item, action="approve", approved_by=args.by))
+        previous = store.get(args.id)
+        if not previous:
+            return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
         try:
             item = store.approve(args.id, approved_by=args.by)
         except KeyError:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
+        _append_audit_log(args.audit_log, action="approve", previous=previous, current=item, approved_by=args.by)
         return 0, _json_or_text(args.json, {"ok": True, "item": item.to_dict()}, f"Approved expert RAG item {item.id} by {item.approved_by}.")
 
     if args.command == "deprecate":
@@ -73,9 +82,14 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
                 return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
             payload = {"ok": True, "dry_run": True, "action": "deprecate", "item": item.to_dict()}
             return 0, _json_or_text(args.json, payload, _format_dry_run(item, action="deprecate"))
+        previous = store.get(args.id)
+        if not previous:
+            return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
         changed = store.deprecate(args.id)
         if not changed:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
+        current = store.get(args.id) or previous
+        _append_audit_log(args.audit_log, action="deprecate", previous=previous, current=current)
         return 0, _json_or_text(args.json, {"ok": True, "id": args.id, "status": "deprecated"}, f"Deprecated expert RAG item {args.id}.")
 
     if args.command == "export":
@@ -97,6 +111,27 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
 
 def _json_or_text(as_json: bool, payload: dict[str, Any], text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2) if as_json else text
+
+
+def _append_audit_log(
+    path: Path,
+    *,
+    action: str,
+    previous: ExpertAnswer,
+    current: ExpertAnswer,
+    approved_by: str = "",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "action": action,
+        "item_id": current.id,
+        "approved_by": approved_by,
+        "previous": previous.to_dict(),
+        "current": current.to_dict(),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _format_list(items: list[ExpertAnswer]) -> str:

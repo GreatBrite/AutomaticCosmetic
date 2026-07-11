@@ -4882,6 +4882,43 @@ def test_expert_rag_review_cli_dry_run_does_not_mutate_items(tmp_path) -> None:
     assert store.get(deprecate_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
 
 
+def test_expert_rag_review_cli_writes_audit_log_for_mutations_only(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    store = ExpertRagStore(db_path)
+    approve_item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    deprecate_item = store.upsert_from_handoff(
+        question="Старая цена?",
+        answer_client="Старая цена не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+
+    code, _ = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "approve", str(approve_item.id), "--by", "olga", "--dry-run"]
+    )
+    assert code == 0
+    assert not audit_path.exists()
+
+    code, _ = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "approve", str(approve_item.id), "--by", "olga"])
+    assert code == 0
+    code, _ = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "deprecate", str(deprecate_item.id)])
+    assert code == 0
+
+    events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["action"] for event in events] == ["approve", "deprecate"]
+    assert events[0]["item_id"] == approve_item.id
+    assert events[0]["approved_by"] == "olga"
+    assert events[0]["previous"]["status"] == NEEDS_REVIEW
+    assert events[0]["current"]["status"] == APPROVED
+    assert events[1]["item_id"] == deprecate_item.id
+    assert events[1]["previous"]["status"] == NEEDS_REVIEW
+    assert events[1]["current"]["status"] == "deprecated"
+
+
 def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     db_path = tmp_path / "expert.sqlite3"
     export_path = tmp_path / "review.md"
