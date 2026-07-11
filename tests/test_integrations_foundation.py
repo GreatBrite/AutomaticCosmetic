@@ -4828,6 +4828,63 @@ def test_expert_rag_admin_policy_plan_creates_non_autoanswer_rule(tmp_path) -> N
     assert "онлайн-разбор" in created.answer_client
 
 
+def test_expert_rag_admin_updates_tesoro_effect_duration(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    original = store.upsert_from_handoff(
+        question="Сколько держится Tesoro Body?",
+        answer_client="Для ягодиц используем Tesoro Body, эффект может сохраняться до 4 лет.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+
+    plan = service.plan_change("Tesoro теперь до 3 лет", actor="olga")
+    applied = service.apply_plan(plan.id, actor="olga")
+
+    assert plan.status == "pending"
+    assert store.get(original.id).status == "deprecated"  # type: ignore[union-attr]
+    created = store.get(applied.metadata["created_ids"][0])
+    assert created is not None
+    assert "до 3 лет" in created.answer_client
+    assert created.metadata["autoanswer_allowed"] is True
+
+
+def test_expert_rag_admin_remember_freeform_creates_reusable_answer(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+
+    plan = service.plan_change("Запомни вот так: онлайн-консультация с Ольгой бесплатная", actor="olga")
+    applied = service.apply_plan(plan.id, actor="olga")
+    created = store.get(applied.metadata["created_ids"][0])
+
+    assert created is not None
+    assert created.status == APPROVED
+    assert created.metadata["autoanswer_allowed"] is True
+    assert "онлайн-консультация" in created.answer_client
+
+
+def test_expert_rag_admin_ambiguous_price_increase_needs_clarification(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Сколько стоит увеличение ягодиц?",
+        answer_client="Ягодицы 600 мл 100 000.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    store.upsert_from_handoff(
+        question="Сколько стоит увеличение груди?",
+        answer_client="Грудь 700 мл 115 000.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+
+    plan = service.plan_change("Подними цены на 10%", actor="olga")
+
+    assert plan.status == "needs_clarification"
+    assert plan.changes == []
+
+
 @pytest.mark.anyio
 async def test_automation_toolbox_expert_rag_plan_and_apply(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")

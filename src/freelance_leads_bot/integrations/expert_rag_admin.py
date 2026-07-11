@@ -112,7 +112,11 @@ class ExpertRagAdminService:
         percent = _extract_percent(command)
         if percent is not None:
             metadata["kind"] = "price_percent_increase"
-            for item in _price_items(matched):
+            price_items = _price_items(matched)
+            if _price_scope_is_ambiguous(command, price_items):
+                summary = "Нашла цены по нескольким услугам/городам. Уточните, к чему применить изменение."
+                return self._save_plan(command, "needs_clarification", summary, [], actor=actor, metadata=metadata)
+            for item in price_items:
                 new_answer = _apply_percent_to_prices(item.answer_client, percent)
                 if new_answer != item.answer_client:
                     changes.append(
@@ -129,6 +133,54 @@ class ExpertRagAdminService:
             summary = _summary_for_price_plan(changes, percent, query)
             status_value = "pending" if changes else "needs_clarification"
             return self._save_plan(command, status_value, summary, changes, actor=actor, metadata=metadata)
+
+        effect_value = _effect_value_from_command(command)
+        if effect_value:
+            metadata["kind"] = "effect_duration_update"
+            effect_items = _effect_items(matched)
+            if not effect_items and ("tesoro" in command.casefold() or "тесоро" in command.casefold()):
+                effect_items = _effect_items(self.store.list_answers(status=status, limit=max(limit, 100)))
+            for item in effect_items:
+                new_answer = _replace_effect_duration(item.answer_client, effect_value)
+                if new_answer != item.answer_client:
+                    changes.append(
+                        RagAdminChange(
+                            source_id=item.id,
+                            action="replace",
+                            old_answer=item.answer_client,
+                            new_answer=new_answer,
+                            old_status=item.status,
+                            new_status=APPROVED,
+                            note=f"effect duration -> {effect_value}",
+                        )
+                    )
+            if not changes:
+                changes.append(
+                    RagAdminChange(
+                        source_id=0,
+                        action="create",
+                        new_answer=f"Для Tesoro Body эффект может сохраняться до {effect_value}.",
+                        new_status=APPROVED,
+                        note="new reusable effect duration from Olga command",
+                    )
+                )
+            summary = f"Обновлю знание о сроке эффекта: {effect_value}."
+            return self._save_plan(command, "pending", summary, changes, actor=actor, metadata=metadata)
+
+        remembered = _remember_answer_from_command(command)
+        if remembered:
+            metadata["kind"] = "remember_freeform"
+            changes.append(
+                RagAdminChange(
+                    source_id=0,
+                    action="create",
+                    new_answer=remembered,
+                    new_status=APPROVED,
+                    note="new reusable answer from Olga free-form remember command",
+                )
+            )
+            summary = "Создам новое подтверждённое знание из формулировки Ольги."
+            return self._save_plan(command, "pending", summary, changes, actor=actor, metadata=metadata)
 
         policy_answer = _policy_answer_from_command(command)
         if policy_answer:
@@ -223,11 +275,12 @@ class ExpertRagAdminService:
             elif change.action == "deprecate" and change.source_id:
                 self.store.deprecate(change.source_id)
             elif change.action == "create":
+                autoanswer_allowed = "policy" not in change.note.casefold()
                 metadata = {
                     "source": "expert_rag_admin",
                     "admin_plan_id": plan.id,
-                    "autoanswer_allowed": False,
-                    "kind": "policy",
+                    "autoanswer_allowed": autoanswer_allowed,
+                    "kind": "policy" if not autoanswer_allowed else "expert_answer",
                 }
                 inferred = infer_metadata(change.new_answer)
                 created = self.store.upsert_from_handoff(
@@ -434,6 +487,9 @@ def _apply_percent_to_prices(text: str, percent: float) -> str:
 
     def repl(match: re.Match[str]) -> str:
         raw = match.group(1)
+        suffix = text[match.end() : match.end() + 8].casefold()
+        if re.match(r"\s*мл\b", suffix):
+            return raw
         compact = raw.replace(" ", "")
         try:
             value = int(compact)
@@ -449,6 +505,50 @@ def _apply_percent_to_prices(text: str, percent: float) -> str:
         return _group_number(rendered)
 
     return PRICE_RE.sub(repl, text)
+
+
+def _price_scope_is_ambiguous(command: str, items: list[ExpertAnswer]) -> bool:
+    if len(items) <= 1:
+        return False
+    inferred = infer_metadata(command)
+    if inferred.get("service") or inferred.get("city") or any(term in command.casefold() for term in ("tesoro", "тесоро")):
+        return False
+    services = {item.service for item in items if item.service}
+    cities = {item.city for item in items if item.city}
+    return len(services) > 1 or len(cities) > 1 or len(items) > 3
+
+
+def _effect_value_from_command(command: str) -> str:
+    match = re.search(r"(?iu)\bдо\s+(\d+(?:[.,]\d+)?)\s*(лет|года|год|месяц(?:ев|а)?|мес)\b", command)
+    if not match:
+        return ""
+    value = match.group(1).replace(",", ".")
+    unit = match.group(2).casefold()
+    try:
+        numeric = float(value)
+        rendered = str(int(numeric)) if numeric.is_integer() else str(numeric).replace(".", ",")
+    except ValueError:
+        rendered = value
+    if unit.startswith("мес"):
+        return f"{rendered} месяцев"
+    return f"{rendered} лет"
+
+
+def _effect_items(items: list[ExpertAnswer]) -> list[ExpertAnswer]:
+    return [item for item in items if re.search(r"(?iu)(эффект|держит|сохраня)", item.answer_client)]
+
+
+def _replace_effect_duration(text: str, value: str) -> str:
+    replaced = re.sub(r"(?iu)до\s+\d+(?:[.,]\d+)?\s*(?:лет|года|год|месяц(?:ев|а)?|мес)\b", f"до {value}", text)
+    return replaced
+
+
+def _remember_answer_from_command(command: str) -> str:
+    match = re.search(r"(?isu)\bзапомни(?:\s+вот\s+так)?[:：]?\s*(.+)$", command)
+    if not match:
+        return ""
+    answer = re.sub(r"\s+", " ", match.group(1)).strip()
+    return answer if len(answer) >= 12 else ""
 
 
 def _group_number(value: str) -> str:
