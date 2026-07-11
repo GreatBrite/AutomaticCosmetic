@@ -54,6 +54,12 @@ expert_rag_needs_review: N expert RAG items need review
 .venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md
 ```
 
+В export/list/show есть `Review suggestion`. Это только подсказка, не решение:
+
+- `needs_edit` обычно означает, что в ответе есть цена, мл, срок эффекта, старый handoff-контекст или слишком частный случай; такой текст нельзя blindly approve.
+- `approve as-is` ставь только если Ольга подтвердила, что формулировка безопасна и пригодна для повторного использования.
+- `deprecate` ставь для устаревших цен, разовых ответов или знаний, которые не стоит превращать в память.
+
 Открой `data/expert_rag_review.md` и отметь ровно один чекбокс у каждого знания, которое готово к решению:
 
 ```markdown

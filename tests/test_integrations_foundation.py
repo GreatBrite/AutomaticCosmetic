@@ -104,7 +104,7 @@ from src.freelance_leads_bot.integrations.ops_status import (
     read_disk_status,
 )
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
-from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, run_review_command, resolve_audit_log_path
+from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, review_suggestion, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
 from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
 import src.freelance_leads_bot.integrations.telegram_admin_bot as telegram_admin_bot_module
@@ -5012,6 +5012,9 @@ def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     assert "# Expert RAG review backlog: needs_review" in output
     assert f"## #{item.id}" in output
     assert "Candidate client answer:" in output
+    assert "Review suggestion:" in output
+    assert "Suggested action: `needs_edit`" in output
+    assert "contains_effect_duration_claim" in output
     assert "Decision checklist:" in output
     assert f"- [ ] approve #{item.id} as-is" in output
     assert f"- [ ] deprecate #{item.id}" in output
@@ -5027,11 +5030,39 @@ def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     assert code == 0
     assert payload["count"] == 1
     assert payload["items"][0]["id"] == item.id
+    assert payload["items"][0]["review_suggestion"]["suggested_action"] == "needs_edit"
+    assert "contains_effect_duration_claim" in payload["items"][0]["review_suggestion"]["reasons"]
 
     code, output = run_review_command(["--db", str(db_path), "export", "--output", str(export_path)])
     assert code == 0
     assert "Exported 1 expert RAG items" in output
     assert f"## #{item.id}" in export_path.read_text(encoding="utf-8")
+
+
+def test_expert_rag_review_suggestion_flags_context_sensitive_price_items(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    item = store.upsert_from_handoff(
+        question="Клиент прислал несколько сообщений подряд: какая будет цена на 700 мл?",
+        answer_client="700мл 115 000 как модель, 160 000 как пациент.",
+        answer_internal="Нужна ручная консультация\nКонтекст: клиент спрашивал по фото-примеру.",
+        status=NEEDS_REVIEW,
+        metadata={"source": "telegram_olga_history_import"},
+    )
+
+    suggestion = review_suggestion(item)
+    code, list_output = run_review_command(["--db", str(store.path), "list"])
+    code_show, show_output = run_review_command(["--db", str(store.path), "show", str(item.id)])
+
+    assert suggestion["suggested_action"] == "needs_edit"
+    assert "contains_price_or_commercial_terms" in suggestion["reasons"]
+    assert "contains_volume_ml" in suggestion["reasons"]
+    assert "case_specific_context" in suggestion["reasons"]
+    assert "legacy_handoff_card_context" in suggestion["reasons"]
+    assert code == 0
+    assert "Suggestion: needs_edit" in list_output
+    assert code_show == 0
+    assert "Review suggestion:" in show_output
+    assert "suggested_action=needs_edit" in show_output
 
 
 def test_expert_rag_review_cli_dry_runs_markdown_decisions(tmp_path) -> None:

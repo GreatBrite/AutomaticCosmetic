@@ -18,6 +18,10 @@ _DECISION_CHECKBOX_RE = re.compile(
     r"^\s*-\s*\[[xX]\]\s*(approve|deprecate|needs\s+edited\s+answer)(?:\s+for)?\s+#(\d+)\b",
     re.IGNORECASE,
 )
+_MONEY_RE = re.compile(r"(?iu)(?:\b\d[\d\s]{2,}\b\s*(?:₽|руб|р\b)?|стоимост|цена|прайс|как\s+модель|как\s+пациент)")
+_VOLUME_RE = re.compile(r"(?iu)\b\d+(?:[.,-]\d+)?\s*мл\b")
+_CASE_SPECIFIC_RE = re.compile(r"(?iu)(клиент прислал несколько сообщений|после родов|подвисает|жду|буду ждать|еду в питер|мурманск|фото-пример)")
+_EFFECT_RE = re.compile(r"(?iu)(эффект|держится|сохраняется)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -71,13 +75,13 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
 
     if args.command == "list":
         items = store.list_answers(status=args.status, limit=args.limit)
-        return 0, _json_or_text(args.json, {"items": [item.to_dict() for item in items]}, _format_list(items))
+        return 0, _json_or_text(args.json, {"items": [_item_payload(item) for item in items]}, _format_list(items))
 
     if args.command == "show":
         item = store.get(args.id)
         if not item:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
-        return 0, _json_or_text(args.json, item.to_dict(), _format_item(item))
+        return 0, _json_or_text(args.json, _item_payload(item), _format_item(item))
 
     if args.command == "approve":
         if args.dry_run:
@@ -115,7 +119,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
 
     if args.command == "export":
         items = store.list_answers(status=args.status, limit=args.limit)
-        payload = {"status": args.status, "count": len(items), "items": [item.to_dict() for item in items]}
+        payload = {"status": args.status, "count": len(items), "items": [_item_payload(item) for item in items]}
         content = json.dumps(payload, ensure_ascii=False, indent=2) if args.json else _format_export_markdown(items, status=args.status)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +150,71 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
 
 def _json_or_text(as_json: bool, payload: dict[str, Any], text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2) if as_json else text
+
+
+def _item_payload(item: ExpertAnswer) -> dict[str, Any]:
+    return {**item.to_dict(), "review_suggestion": review_suggestion(item)}
+
+
+def review_suggestion(item: ExpertAnswer) -> dict[str, Any]:
+    """Return non-mutating review hints for an expert RAG item."""
+
+    text = " ".join(
+        part
+        for part in (
+            item.question_canonical,
+            item.answer_client,
+            item.answer_internal,
+            item.topic,
+            item.service,
+            item.city,
+        )
+        if part
+    )
+    metadata = item.metadata or {}
+    reasons: list[str] = []
+    if _MONEY_RE.search(text):
+        reasons.append("contains_price_or_commercial_terms")
+    if _VOLUME_RE.search(text):
+        reasons.append("contains_volume_ml")
+    if _EFFECT_RE.search(text):
+        reasons.append("contains_effect_duration_claim")
+    if _CASE_SPECIFIC_RE.search(text):
+        reasons.append("case_specific_context")
+    if str(metadata.get("source") or "") == "telegram_olga_history_import":
+        reasons.append("imported_from_telegram_history")
+    if "Нужна ручная консультация" in item.answer_internal:
+        reasons.append("legacy_handoff_card_context")
+    if not item.service:
+        reasons.append("missing_service_metadata")
+    if not item.city:
+        reasons.append("missing_city_metadata")
+
+    if "case_specific_context" in reasons or "legacy_handoff_card_context" in reasons:
+        action = DECISION_ACTION_NEEDS_EDIT
+    elif any(reason in reasons for reason in ("contains_price_or_commercial_terms", "contains_volume_ml", "contains_effect_duration_claim")):
+        action = DECISION_ACTION_NEEDS_EDIT
+    elif item.status == NEEDS_REVIEW:
+        action = DECISION_ACTION_NEEDS_EDIT
+    else:
+        action = DECISION_ACTION_APPROVE
+
+    return {
+        "suggested_action": action,
+        "confidence": "medium" if reasons else "low",
+        "reasons": reasons,
+        "note": _review_suggestion_note(action, reasons),
+    }
+
+
+def _review_suggestion_note(action: str, reasons: list[str]) -> str:
+    if action == DECISION_ACTION_NEEDS_EDIT:
+        if "contains_price_or_commercial_terms" in reasons or "contains_volume_ml" in reasons:
+            return "Needs Olga-approved reusable wording before approval; raw price/volume answers are too context-sensitive."
+        return "Needs a reusable client-safe wording before approval."
+    if action == DECISION_ACTION_DEPRECATE:
+        return "Likely not safe to reuse."
+    return "Looks reusable, but still requires human approval."
 
 
 def resolve_audit_log_path(db_path: Path, explicit_audit_log: Path | None = None) -> Path:
@@ -376,7 +445,9 @@ def _format_list(items: list[ExpertAnswer]) -> str:
         question = _short(item.question_canonical, 90)
         answer = _short(item.answer_client, 90)
         labels = ", ".join(part for part in (item.topic, item.service, item.city, item.risk_level) if part)
+        suggestion = review_suggestion(item)
         lines.append(f"- #{item.id} [{item.status}] {labels}")
+        lines.append(f"  Suggestion: {suggestion['suggested_action']} ({', '.join(suggestion['reasons']) or 'no review flags'})")
         lines.append(f"  Q: {question}")
         lines.append(f"  A: {answer}")
     return "\n".join(lines)
@@ -384,6 +455,7 @@ def _format_list(items: list[ExpertAnswer]) -> str:
 
 def _format_item(item: ExpertAnswer) -> str:
     metadata = json.dumps(item.metadata or {}, ensure_ascii=False, sort_keys=True)
+    suggestion = review_suggestion(item)
     return "\n".join(
         [
             f"Expert RAG item #{item.id}",
@@ -403,6 +475,11 @@ def _format_item(item: ExpertAnswer) -> str:
             "",
             "Metadata:",
             metadata,
+            "",
+            "Review suggestion:",
+            f"- suggested_action={suggestion['suggested_action']} confidence={suggestion['confidence']}",
+            f"- reasons={', '.join(suggestion['reasons']) or '-'}",
+            f"- note={suggestion['note']}",
         ]
     )
 
@@ -421,6 +498,7 @@ def _format_export_markdown(items: list[ExpertAnswer], *, status: str) -> str:
         return "\n".join(lines)
     for item in items:
         labels = ", ".join(part for part in (item.topic, item.service, item.city, item.risk_level) if part) or "-"
+        suggestion = review_suggestion(item)
         lines.extend(
             [
                 "",
@@ -437,6 +515,12 @@ def _format_export_markdown(items: list[ExpertAnswer], *, status: str) -> str:
                 "Candidate client answer:",
                 "",
                 f"> {_quote_markdown(item.answer_client or '-')}",
+                "",
+                "Review suggestion:",
+                "",
+                f"- Suggested action: `{suggestion['suggested_action']}`",
+                f"- Reasons: {', '.join(suggestion['reasons']) or '-'}",
+                f"- Note: {suggestion['note']}",
                 "",
                 "Decision checklist:",
                 "",
