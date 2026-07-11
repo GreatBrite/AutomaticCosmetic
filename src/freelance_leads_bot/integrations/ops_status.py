@@ -133,6 +133,7 @@ def build_ops_status_report(
     rag = read_rag_status(rag_db)
     rag_approved = int(rag.get("approved_count") or 0)
     rag_needs_review = int(rag.get("needs_review_count") or 0)
+    rag_needs_review_ids = rag.get("needs_review_ids") if isinstance(rag.get("needs_review_ids"), list) else []
     checks.append(
         OpsCheck(
             "expert_rag",
@@ -150,7 +151,9 @@ def build_ops_status_report(
             "No expert RAG items need review."
             if rag_needs_review == 0
             else (
-                f"{rag_needs_review} expert RAG items need review. "
+                f"{rag_needs_review} expert RAG items need review"
+                + (f" (ids: {', '.join(str(item_id) for item_id in rag_needs_review_ids)})." if rag_needs_review_ids else ".")
+                + " "
                 "Run: python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md"
             ),
             rag,
@@ -209,6 +212,7 @@ def build_ops_status_report(
         "rag_approved": rag_approved,
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
         "rag_needs_review": rag_needs_review,
+        "rag_needs_review_ids": rag_needs_review_ids,
         "data_total_bytes": data_total,
         "data_largest_path": largest_entry.get("path", ""),
         "data_largest_bytes": largest_entry_size,
@@ -274,8 +278,8 @@ def read_unanswered_status(
 
 def read_rag_status(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"exists": False, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0}
-    result = {"exists": True, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0}
+        return {"exists": False, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0, "needs_review_ids": []}
+    result = {"exists": True, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0, "needs_review_ids": []}
     try:
         with sqlite3.connect(path) as conn:
             for status, risk_level, count in conn.execute(
@@ -288,8 +292,12 @@ def read_rag_status(path: Path) -> dict[str, Any]:
                         result["approved_high_risk_count"] += count
                 if status == "needs_review":
                     result["needs_review_count"] += count
+            result["needs_review_ids"] = [
+                int(row[0])
+                for row in conn.execute("SELECT id FROM expert_answers WHERE status = ? ORDER BY updated_at DESC, id DESC LIMIT 5", ("needs_review",)).fetchall()
+            ]
     except sqlite3.Error as exc:
-        result.update({"error": type(exc).__name__, "approved_count": 0})
+        result.update({"error": type(exc).__name__, "approved_count": 0, "needs_review_ids": []})
     return result
 
 

@@ -6469,7 +6469,7 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
         status=APPROVED,
         approved_by="olga",
     )
-    store.upsert_from_handoff(
+    review_item = store.upsert_from_handoff(
         question="Можно ли после операции?",
         answer_client="Нужно уточнить у Ольги по анамнезу.",
         status=NEEDS_REVIEW,
@@ -6505,8 +6505,12 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
     assert review_check.ok is False
     assert review_check.severity == "warning"
     assert report.summary["rag_needs_review"] == 1
+    assert report.summary["rag_needs_review_ids"] == [review_item.id]
+    assert review_check.data is not None
+    assert review_check.data["needs_review_ids"] == [review_item.id]
     assert "AutomaticCosmetic ops: WARN" in text
     assert "needs_review=1" in text
+    assert f"ids: {review_item.id}" in text
     assert "expert_rag_needs_review" in text
     assert "expert_rag_review export --output data/expert_rag_review.md" in text
 
