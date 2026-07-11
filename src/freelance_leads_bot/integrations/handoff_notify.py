@@ -233,7 +233,7 @@ def format_handoff_message(handoff: Handoff) -> str:
     message = handoff.message
     listing = message.listing
     lines = [
-        "Нужна ручная консультация",
+        "Нужна ручная проверка",
         f"Причина: {handoff.reason.value}",
         f"Канал: {message.channel.value}",
         _dialog_line(message),

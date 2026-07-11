@@ -56,7 +56,7 @@ class AvitoBookingFlow:
         if handoff:
             return BookingDecision(
                 action="handoff",
-                reply="Спасибо, фото посмотрят индивидуально и вернёмся с ответом.",
+                reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
                 handoff=handoff,
             )
 

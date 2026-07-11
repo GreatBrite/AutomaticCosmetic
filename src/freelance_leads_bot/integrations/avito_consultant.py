@@ -285,7 +285,7 @@ class AvitoConsultant:
         if handoff:
             return AvitoConsultantReply(
                 action="handoff",
-                reply="Спасибо, фото посмотрят индивидуально и вернёмся с ответом.",
+                reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
                 handoff=handoff,
                 metadata={"planner": "fallback", "reason": "photo"},
             )

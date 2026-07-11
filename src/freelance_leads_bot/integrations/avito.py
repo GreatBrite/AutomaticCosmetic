@@ -66,7 +66,7 @@ def avito_photo_handoff(message: InboundMessage) -> Handoff | None:
     return Handoff(
         reason=HandoffReason.PHOTO_CONSULTATION,
         message=message,
-        summary="Клиент отправил фото, нужна индивидуальная консультация косметолога.",
+        summary="Клиент отправил фото/медиа. Нужно оценить вложение и дать короткий ответ по вопросу клиента; не приглашать на очную консультацию без отдельной причины.",
     )
 
 

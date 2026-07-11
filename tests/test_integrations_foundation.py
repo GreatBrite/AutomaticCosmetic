@@ -182,6 +182,7 @@ from src.freelance_leads_bot.main import (
     send_open_handoff_cards,
     telegram_callback_delivery_target,
     telegram_embedded_message_context,
+    telegram_handoff_preview_looks_like_card,
     telegram_handoff_ref_context,
 )
 
@@ -193,6 +194,13 @@ def test_prepare_avito_outgoing_text_removes_second_greeting_today(tmp_path) -> 
     text = prepare_avito_outgoing_text(store, "chat-1", "Добрый день! Продолжаем обсуждение.")
 
     assert text == "Продолжаем обсуждение."
+
+
+def test_telegram_handoff_preview_detects_new_and_legacy_card_headers() -> None:
+    assert telegram_handoff_preview_looks_like_card("Нужна ручная проверка\nПричина: missing_data")
+    assert telegram_handoff_preview_looks_like_card("Нужна ручная консультация\nПричина: missing_data")
+    assert telegram_handoff_preview_looks_like_card("Причина: missing_data\nКанал: avito")
+    assert not telegram_handoff_preview_looks_like_card("Обычное сообщение клиента")
 
 
 def test_handoff_status_is_shared_by_reissued_cards(tmp_path) -> None:
@@ -1128,6 +1136,8 @@ def test_avito_photo_routes_to_human_handoff() -> None:
 
     assert handoff is not None
     assert handoff.reason == "photo_consultation"
+    assert "оценить вложение" in handoff.summary
+    assert "индивидуальная консультация" not in handoff.summary.casefold()
 
 
 def test_avito_photo_urls_are_extracted_from_image_sizes() -> None:
@@ -5714,11 +5724,13 @@ def test_format_handoff_message_includes_avito_context() -> None:
 
     assert handoff is not None
     text = format_handoff_message(handoff)
-    assert "Нужна ручная консультация" in text
+    assert "Нужна ручная проверка" in text
     assert "Диалог: " in text
     assert "#" not in text
     assert "chat-photo" not in text
     assert "Консультация" in text
+    assert "Нужна ручная консультация" not in text
+    assert "очная консультация" not in text.casefold()
 
     named_handoff = replace(handoff, message=replace(handoff.message, metadata={**handoff.message.metadata, "client_name": "Анна"}))
     named_text = format_handoff_message(named_handoff)
@@ -6682,7 +6694,9 @@ async def test_vk_bot_uses_preview_sender_and_shared_handoff(tmp_path) -> None:
     assert result["action"] == "handoff"
     assert result["send"]["reason"] == "preview_only"
     assert result["handoff"] == "photo_consultation"
-    assert "фото посмотрят индивидуально" in outbox.read_text(encoding="utf-8")
+    outbox_text = outbox.read_text(encoding="utf-8")
+    assert "фото передадим на оценку" in outbox_text
+    assert "консультац" not in outbox_text.casefold()
     assert duplicate["reason"] == "duplicate"
 
 

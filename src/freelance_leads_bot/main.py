@@ -1883,7 +1883,11 @@ def telegram_handoff_ref_context(
 
 def telegram_handoff_preview_looks_like_card(text: str) -> bool:
     normalized = str(text or "").casefold()
-    return "нужна ручная консультация" in normalized or ("причина:" in normalized and "канал:" in normalized)
+    return (
+        "нужна ручная проверка" in normalized
+        or "нужна ручная консультация" in normalized
+        or ("причина:" in normalized and "канал:" in normalized)
+    )
 
 
 def telegram_handoff_embedded_text(message: dict) -> str:
