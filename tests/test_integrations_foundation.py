@@ -4854,6 +4854,39 @@ def test_expert_rag_review_cli_lists_shows_and_updates_items(tmp_path) -> None:
     assert store.get(stale_item.id).status == "deprecated"  # type: ignore[union-attr]
 
 
+def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    export_path = tmp_path / "review.md"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Сколько держится эффект?",
+        answer_client="Эффект сохраняется до 4 лет.",
+        status=NEEDS_REVIEW,
+        source_chat_id="chat-1",
+        source_message_id="msg-1",
+        olga_reply_message_id="olga-1",
+    )
+
+    code, output = run_review_command(["--db", str(db_path), "export"])
+    assert code == 0
+    assert "# Expert RAG review backlog: needs_review" in output
+    assert f"## #{item.id}" in output
+    assert "Candidate client answer:" in output
+    assert f"approve {item.id} --by olga" in output
+    assert f"deprecate {item.id}" in output
+
+    code, output = run_review_command(["--db", str(db_path), "--json", "export"])
+    payload = json.loads(output)
+    assert code == 0
+    assert payload["count"] == 1
+    assert payload["items"][0]["id"] == item.id
+
+    code, output = run_review_command(["--db", str(db_path), "export", "--output", str(export_path)])
+    assert code == 0
+    assert "Exported 1 expert RAG items" in output
+    assert f"## #{item.id}" in export_path.read_text(encoding="utf-8")
+
+
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     expert = ExpertRagStore(tmp_path / "expert.sqlite3")
@@ -6224,7 +6257,7 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
     assert "AutomaticCosmetic ops: WARN" in text
     assert "needs_review=1" in text
     assert "expert_rag_needs_review" in text
-    assert "expert_rag_review list" in text
+    assert "expert_rag_review export --output data/expert_rag_review.md" in text
 
 
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:

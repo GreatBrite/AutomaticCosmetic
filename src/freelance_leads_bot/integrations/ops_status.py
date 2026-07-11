@@ -140,7 +140,7 @@ def build_ops_status_report(
             if rag_needs_review == 0
             else (
                 f"{rag_needs_review} expert RAG items need review. "
-                "Run: python -m src.freelance_leads_bot.integrations.expert_rag_review list"
+                "Run: python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md"
             ),
             rag,
         )
