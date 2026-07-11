@@ -374,8 +374,13 @@ class AvitoConsultant:
         if not self.expert_rag:
             return []
         query = " ".join(part for part in (message.text, message.listing.title if message.listing else "") if part)
-        matches = self.expert_rag.search(query, limit=5, min_score=max(0.0, self.rag_handoff_threshold * 0.75))
-        return [answer.to_dict(score=score) for answer, score in matches if str(answer.risk_level or "").strip().lower() != "high"]
+        matches = self.expert_rag.search(
+            query,
+            limit=5,
+            min_score=max(0.0, self.rag_handoff_threshold * 0.75),
+            exclude_risk_levels=("high",),
+        )
+        return [answer.to_dict(score=score) for answer, score in matches]
 
     def _answer_from_expert_rag(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
         if not context.retrieved_expert_answers:

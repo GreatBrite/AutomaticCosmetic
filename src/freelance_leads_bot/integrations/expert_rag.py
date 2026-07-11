@@ -242,6 +242,7 @@ class ExpertRagStore:
         min_score: float = 0.0,
         city: str = "",
         service: str = "",
+        exclude_risk_levels: tuple[str, ...] = (),
     ) -> list[tuple[ExpertAnswer, float]]:
         canonical = canonicalize_question(query)
         query_tokens = _tokens(canonical)
@@ -259,9 +260,12 @@ class ExpertRagStore:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         scored: list[tuple[ExpertAnswer, float]] = []
+        excluded_risks = {risk.strip().casefold() for risk in exclude_risk_levels if risk.strip()}
         for row in rows:
             answer = _answer_from_row(row)
             if not answer:
+                continue
+            if excluded_risks and answer.risk_level.strip().casefold() in excluded_risks:
                 continue
             if answer.expires_at and answer.expires_at < _now():
                 continue

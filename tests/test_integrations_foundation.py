@@ -4762,6 +4762,20 @@ def test_expert_rag_approved_answer_is_retrieved_and_deprecated_ignored(tmp_path
     assert all(item.id != deprecated.id for item, _score in matches)
 
 
+def test_expert_rag_search_can_exclude_high_risk_answers(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    high_risk = store.upsert_from_handoff(
+        question="Можно делать процедуру после операции?",
+        answer_client="После операции процедуру можно делать только после разрешения врача.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+
+    assert high_risk.risk_level == "high"
+    assert store.search("Можно делать процедуру после операции?", min_score=0.1)
+    assert store.search("Можно делать процедуру после операции?", min_score=0.1, exclude_risk_levels=("high",)) == []
+
+
 @pytest.mark.anyio
 async def test_avito_consultant_answers_from_high_confidence_expert_rag(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
