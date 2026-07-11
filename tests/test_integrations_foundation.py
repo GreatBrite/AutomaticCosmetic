@@ -136,6 +136,9 @@ from src.freelance_leads_bot.integrations.yclients import (
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import APPROVED, NEEDS_REVIEW, ExpertRagStore
 from src.freelance_leads_bot.integrations.expert_rag_admin import ExpertRagAdminService, parse_rag_admin_callback
+from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntentParser
+from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
+from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
 from scripts.avito_unanswered_monitor import (
     _find_unanswered as find_unanswered_avito_chat,
     _report_item as report_unanswered_item,
@@ -4883,6 +4886,85 @@ def test_expert_rag_admin_ambiguous_price_increase_needs_clarification(tmp_path)
 
     assert plan.status == "needs_clarification"
     assert plan.changes == []
+
+
+def test_rag_admin_intent_parser_understands_freeform_price_language() -> None:
+    intent = RagAdminIntentParser().parse("Слушай, по попе теперь чуть дороже сделай, процентов на десять")
+
+    assert intent.intent == "price_percent_change"
+    assert intent.scope["service"] == "ягодицы"
+    assert intent.operation["value"] == 10
+
+
+def test_expert_rag_admin_exact_price_and_service_lifecycle(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    original = store.upsert_from_handoff(
+        question="Сколько стоит увеличение ягодиц 600 мл?",
+        answer_client="600 мл 100 000.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "ягодицы", "autoanswer_allowed": True},
+    )
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl", service_catalog=catalog)
+
+    add_plan = service.plan_change("Добавь услугу ягодицы", actor="olga")
+    service.apply_plan(add_plan.id, actor="olga")
+    assert catalog.resolve("по попе") is not None
+    price_plan = service.plan_change("Для ягодиц 600 мл теперь 120 000", actor="olga")
+    applied = service.apply_plan(price_plan.id, actor="olga")
+    created = store.get(applied.metadata["created_ids"][0])
+    assert created is not None
+    assert "120 000" in created.answer_client
+    assert store.get(original.id).status == "deprecated"  # type: ignore[union-attr]
+
+    disable_plan = service.plan_change("Больше не делаем ягодицы", actor="olga")
+    service.apply_plan(disable_plan.id, actor="olga")
+    assert catalog.get("ягодицы").status == HIDDEN  # type: ignore[union-attr]
+
+
+def test_service_delete_soft_deletes_and_excludes_from_shared_retrieval(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="ягодицы", title="Ягодицы", aliases=("ягодицы", "попа"), status=ACTIVE)
+    answer = store.upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Для ягодиц используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "ягодицы", "autoanswer_allowed": True},
+    )
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl", service_catalog=catalog)
+
+    delete_plan = service.plan_change("Удали услугу ягодицы", actor="olga")
+    service.apply_plan(delete_plan.id, actor="olga")
+    result = RagRetrievalService(store, catalog).retrieve(RagRetrievalRequest(channel="avito", text="Какой препарат для ягодиц?", min_score=0.1))
+
+    assert catalog.get("ягодицы").status == DELETED  # type: ignore[union-attr]
+    assert store.get(answer.id).status == "deprecated"  # type: ignore[union-attr]
+    assert result.answers == ()
+
+
+def test_shared_rag_retrieval_filters_by_channel_visibility_and_policy(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="guby", title="Губы", aliases=("губы",), visibility=("avito", "telegram_client"))
+    store.upsert_from_handoff(
+        question="Какой препарат для губ?",
+        answer_client="Для губ используем препарат test.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "guby", "autoanswer_allowed": True},
+    )
+    retrieval = RagRetrievalService(store, catalog)
+
+    avito = retrieval.retrieve(RagRetrievalRequest(channel="avito", text="Какой препарат для губ?", min_score=0.1))
+    telegram = retrieval.retrieve(RagRetrievalRequest(channel="telegram_client", text="Какой препарат для губ?", min_score=0.1))
+    vk = retrieval.retrieve(RagRetrievalRequest(channel="vk", text="Какой препарат для губ?", min_score=0.1))
+
+    assert avito.answers
+    assert telegram.answers
+    assert vk.answers == ()
 
 
 @pytest.mark.anyio

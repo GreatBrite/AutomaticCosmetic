@@ -9,6 +9,8 @@ from typing import Any
 from uuid import uuid4
 
 from .expert_rag import APPROVED, DEPRECATED, NEEDS_REVIEW, ExpertAnswer, ExpertRagStore, infer_metadata
+from .rag_admin_intent import RagAdminIntent, RagAdminIntentParser
+from .service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore, normalize_service_key
 
 
 DEFAULT_RAG_ADMIN_PLANS_PATH = Path("data/expert_rag_admin_plans.json")
@@ -70,10 +72,14 @@ class ExpertRagAdminService:
         *,
         plans_path: Path | str = DEFAULT_RAG_ADMIN_PLANS_PATH,
         audit_path: Path | str = DEFAULT_RAG_ADMIN_AUDIT_PATH,
+        intent_parser: RagAdminIntentParser | None = None,
+        service_catalog: ServiceCatalogStore | None = None,
     ) -> None:
         self.store = store
         self.plans_path = Path(plans_path)
         self.audit_path = Path(audit_path)
+        self.intent_parser = intent_parser or RagAdminIntentParser()
+        self.service_catalog = service_catalog or ServiceCatalogStore()
 
     def search(self, query: str, *, status: str = APPROVED, limit: int = 20) -> list[ExpertAnswer]:
         query_text = str(query or "").strip()
@@ -104,12 +110,17 @@ class ExpertRagAdminService:
         limit: int = 20,
     ) -> RagAdminPlan:
         command = str(command or "").strip()
-        query = str(query or "").strip() or _query_from_command(command)
+        intent = self.intent_parser.parse(command)
+        query = str(query or "").strip() or _query_from_intent(intent) or _query_from_command(command)
         matched = self.search(query or command, status=status, limit=limit)
-        metadata = {"query": query, "matched_ids": [item.id for item in matched], "kind": "unknown"}
+        metadata = {"query": query, "matched_ids": [item.id for item in matched], "kind": intent.intent, "intent": intent.to_dict()}
         changes: list[RagAdminChange] = []
 
-        percent = _extract_percent(command)
+        service_plan = self._service_plan_from_intent(command, intent, actor=actor, metadata=metadata)
+        if service_plan:
+            return service_plan
+
+        percent = _intent_percent(intent)
         if percent is not None:
             metadata["kind"] = "price_percent_increase"
             price_items = _price_items(matched)
@@ -134,7 +145,32 @@ class ExpertRagAdminService:
             status_value = "pending" if changes else "needs_clarification"
             return self._save_plan(command, status_value, summary, changes, actor=actor, metadata=metadata)
 
-        effect_value = _effect_value_from_command(command)
+        exact_price = _intent_exact_price(intent)
+        if exact_price:
+            metadata["kind"] = "price_exact_replace"
+            price_items = _price_items(matched)
+            if _price_scope_is_ambiguous(command, price_items):
+                summary = "Нашла цены по нескольким услугам/городам. Уточните, какую цену заменить."
+                return self._save_plan(command, "needs_clarification", summary, [], actor=actor, metadata=metadata)
+            for item in price_items:
+                new_answer = _replace_relevant_price(item.answer_client, exact_price, _intent_volume_ml(intent))
+                if new_answer != item.answer_client:
+                    changes.append(
+                        RagAdminChange(
+                            source_id=item.id,
+                            action="replace",
+                            old_answer=item.answer_client,
+                            new_answer=new_answer,
+                            old_status=item.status,
+                            new_status=APPROVED,
+                            note=f"price -> {exact_price}",
+                        )
+                    )
+            summary = f"Обновлю цену на {exact_price}."
+            status_value = "pending" if changes else "needs_clarification"
+            return self._save_plan(command, status_value, summary, changes, actor=actor, metadata=metadata)
+
+        effect_value = _intent_effect_value(intent) or _effect_value_from_command(command)
         if effect_value:
             metadata["kind"] = "effect_duration_update"
             effect_items = _effect_items(matched)
@@ -167,7 +203,7 @@ class ExpertRagAdminService:
             summary = f"Обновлю знание о сроке эффекта: {effect_value}."
             return self._save_plan(command, "pending", summary, changes, actor=actor, metadata=metadata)
 
-        remembered = _remember_answer_from_command(command)
+        remembered = intent.answer_text if intent.intent == "remember_answer" else _remember_answer_from_command(command)
         if remembered:
             metadata["kind"] = "remember_freeform"
             changes.append(
@@ -182,7 +218,7 @@ class ExpertRagAdminService:
             summary = "Создам новое подтверждённое знание из формулировки Ольги."
             return self._save_plan(command, "pending", summary, changes, actor=actor, metadata=metadata)
 
-        policy_answer = _policy_answer_from_command(command)
+        policy_answer = intent.answer_text if intent.intent == "policy_update" else _policy_answer_from_command(command)
         if policy_answer:
             metadata["kind"] = "policy"
             changes.append(
@@ -197,7 +233,7 @@ class ExpertRagAdminService:
             summary = "Создам новое подтверждённое правило для будущих ответов."
             return self._save_plan(command, "pending", summary, changes, actor=actor, metadata=metadata)
 
-        if _looks_deprecate_command(command):
+        if intent.intent == "deprecate_knowledge" or _looks_deprecate_command(command):
             metadata["kind"] = "deprecate"
             for item in matched:
                 changes.append(
@@ -216,6 +252,39 @@ class ExpertRagAdminService:
 
         summary = "Не смогла безопасно понять, какие знания нужно изменить. Нужна более конкретная формулировка."
         return self._save_plan(command, "needs_clarification", summary, [], actor=actor, metadata=metadata)
+
+    def _service_plan_from_intent(
+        self,
+        command: str,
+        intent: RagAdminIntent,
+        *,
+        actor: str,
+        metadata: dict[str, Any],
+    ) -> RagAdminPlan | None:
+        if intent.intent not in {"service_add", "service_update", "service_disable", "service_delete"}:
+            return None
+        service_text = str(intent.scope.get("service") or intent.operation.get("title") or "").strip()
+        if not service_text:
+            summary = "Не поняла, какую услугу нужно изменить. Напишите название услуги."
+            return self._save_plan(command, "needs_clarification", summary, [], actor=actor, metadata=metadata)
+        service_key = normalize_service_key(service_text)
+        operation = dict(intent.operation or {})
+        title = str(operation.get("title") or service_text)
+        if intent.intent == "service_add":
+            change = RagAdminChange(source_id=0, action="service_add", new_answer=title, new_status=ACTIVE, note="service catalog add")
+            summary = f"Добавлю услугу «{title}» в каталог и сделаю её активной для клиентских ботов."
+        elif intent.intent == "service_update":
+            change = RagAdminChange(source_id=0, action="service_update", old_answer=service_key, new_answer=title, new_status=ACTIVE, note="service catalog update")
+            summary = f"Обновлю услугу «{service_text}» в каталоге."
+        elif intent.intent == "service_disable":
+            change = RagAdminChange(source_id=0, action="service_status", old_answer=service_key, new_answer=HIDDEN, new_status=HIDDEN, note="service catalog hide")
+            summary = f"Скрою услугу «{service_text}» из автоответов клиентских ботов."
+        else:
+            change = RagAdminChange(source_id=0, action="service_status", old_answer=service_key, new_answer=DELETED, new_status=DELETED, note="service catalog soft delete")
+            summary = f"Помечу услугу «{service_text}» как удалённую/устаревшую без физического удаления истории."
+        metadata["service_key"] = service_key
+        metadata["service_title"] = title
+        return self._save_plan(command, "pending", summary, [change], actor=actor, metadata=metadata)
 
     def get_plan(self, plan_id: str) -> RagAdminPlan | None:
         return _plan_from_dict(self._load_plans().get(str(plan_id)))
@@ -292,6 +361,33 @@ class ExpertRagAdminService:
                     metadata={**metadata, **inferred},
                 )
                 created_ids.append(created.id)
+            elif change.action == "service_add":
+                self.service_catalog.upsert(
+                    service_key=str(plan.metadata.get("service_key") or change.new_answer),
+                    title=change.new_answer,
+                    aliases=(str(plan.metadata.get("service_title") or change.new_answer),),
+                    status=ACTIVE,
+                    metadata={"admin_plan_id": plan.id, "source": "expert_rag_admin"},
+                )
+                created_ids.append(0)
+            elif change.action == "service_update":
+                item = self.service_catalog.upsert(
+                    service_key=str(plan.metadata.get("service_key") or change.old_answer),
+                    title=change.new_answer,
+                    aliases=(change.old_answer,),
+                    status=ACTIVE,
+                    metadata={"admin_plan_id": plan.id, "source": "expert_rag_admin"},
+                )
+                created_ids.append(0)
+            elif change.action == "service_status":
+                service_key = str(plan.metadata.get("service_key") or change.old_answer)
+                try:
+                    item = self.service_catalog.set_status(service_key, change.new_answer, metadata={"admin_plan_id": plan.id, "source": "expert_rag_admin"})
+                except KeyError:
+                    item = self.service_catalog.upsert(service_key=service_key, title=service_key, status=change.new_answer, metadata={"admin_plan_id": plan.id, "source": "expert_rag_admin"})
+                if change.new_answer in {HIDDEN, DELETED, DEPRECATED}:
+                    self._deprecate_service_rag_if_needed(item.service_key, change.new_answer)
+                created_ids.append(0)
         applied = _replace_plan(
             plan,
             status="applied",
@@ -301,6 +397,14 @@ class ExpertRagAdminService:
         self._persist_plan(applied)
         self._append_audit(plan, applied, actor=actor)
         return applied
+
+    def _deprecate_service_rag_if_needed(self, service_key: str, status: str) -> None:
+        if not status:
+            return
+        for item in self.store.list_answers(status=APPROVED, limit=500):
+            metadata = item.metadata or {}
+            if metadata.get("service_key") == service_key or normalize_service_key(item.service or "") == service_key:
+                self.store.deprecate(item.id)
 
     def _save_plan(
         self,
@@ -453,6 +557,45 @@ def _extract_percent(command: str) -> float | None:
         return None
 
 
+def _query_from_intent(intent: RagAdminIntent) -> str:
+    scope = intent.scope or {}
+    return " ".join(str(scope.get(key) or "") for key in ("service", "product", "city", "topic")).strip()
+
+
+def _intent_percent(intent: RagAdminIntent) -> float | None:
+    if intent.intent != "price_percent_change":
+        return None
+    operation = intent.operation or {}
+    try:
+        return float(operation.get("value"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _intent_effect_value(intent: RagAdminIntent) -> str:
+    if intent.intent != "effect_duration_update":
+        return ""
+    return str((intent.operation or {}).get("value") or "").strip()
+
+
+def _intent_exact_price(intent: RagAdminIntent) -> int | None:
+    if intent.intent != "price_exact_replace":
+        return None
+    try:
+        value = intent.operation.get("new_value")
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _intent_volume_ml(intent: RagAdminIntent) -> int | None:
+    try:
+        value = (intent.operation or {}).get("volume_ml") or (intent.scope or {}).get("volume_ml")
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _query_from_command(command: str) -> str:
     lowered = command.casefold()
     for service in ("ягодиц", "ягодицы", "груд", "губ", "tesoro", "тесоро", "ботокс"):
@@ -505,6 +648,22 @@ def _apply_percent_to_prices(text: str, percent: float) -> str:
         return _group_number(rendered)
 
     return PRICE_RE.sub(repl, text)
+
+
+def _replace_relevant_price(text: str, new_price: int, volume_ml: int | None = None) -> str:
+    rendered = _group_number(str(new_price))
+    matches = list(PRICE_RE.finditer(text))
+    if not matches:
+        return text
+    if volume_ml is not None:
+        volume_marker = f"{volume_ml}мл"
+        compact = re.sub(r"\s+", "", text.casefold())
+        volume_pos = compact.find(volume_marker)
+        if volume_pos >= 0:
+            best = min(matches, key=lambda match: abs(match.start() - volume_pos))
+            return text[: best.start(1)] + rendered + text[best.end(1) :]
+    first_price = next((match for match in matches if not re.match(r"\s*мл\b", text[match.end() : match.end() + 8].casefold())), matches[0])
+    return text[: first_price.start(1)] + rendered + text[first_price.end(1) :]
 
 
 def _price_scope_is_ambiguous(command: str, items: list[ExpertAnswer]) -> bool:

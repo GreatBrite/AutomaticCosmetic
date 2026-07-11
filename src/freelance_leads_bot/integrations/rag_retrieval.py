@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .expert_rag import APPROVED, ExpertRagStore, infer_metadata
+from .models import InboundMessage
+from .service_catalog import ACTIVE, HIDDEN, ServiceCatalogStore, service_catalog_from_rag_metadata
+
+
+@dataclass(frozen=True)
+class RagRetrievalRequest:
+    channel: str
+    text: str
+    city: str = ""
+    service_key: str = ""
+    service_hint: str = ""
+    client_context: dict[str, Any] = field(default_factory=dict)
+    risk_policy: str = "client_autoanswer"
+    limit: int = 5
+    min_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class RagRetrievalResult:
+    answers: tuple[dict[str, Any], ...] = ()
+    confidence: float = 0.0
+    safe_for_autoanswer: bool = False
+    handoff_reason: str = ""
+    conflicts: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "answers": list(self.answers),
+            "confidence": self.confidence,
+            "safe_for_autoanswer": self.safe_for_autoanswer,
+            "handoff_reason": self.handoff_reason,
+            "conflicts": list(self.conflicts),
+        }
+
+
+class RagRetrievalService:
+    def __init__(self, store: ExpertRagStore, service_catalog: ServiceCatalogStore | None = None) -> None:
+        self.store = store
+        self.service_catalog = service_catalog or ServiceCatalogStore()
+
+    def retrieve(self, request: RagRetrievalRequest) -> RagRetrievalResult:
+        query = " ".join(part for part in (request.text, request.service_hint, request.service_key) if part)
+        service_filter = self._service_filter(request)
+        matches = self.store.search(
+            query,
+            status=APPROVED,
+            limit=max(request.limit * 3, request.limit),
+            min_score=request.min_score,
+            city=request.city,
+            service=service_filter,
+            exclude_risk_levels=("high",),
+        )
+        answers: list[dict[str, Any]] = []
+        conflicts: list[str] = []
+        for answer, score in matches:
+            payload = answer.to_dict(score=score)
+            if not _autoanswer_allowed(payload):
+                continue
+            if not self._channel_allowed(payload, request.channel):
+                continue
+            if not self._service_allowed(payload, request):
+                continue
+            answers.append(payload)
+            if len(answers) >= request.limit:
+                break
+        confidence = float(answers[0].get("score") or 0) if answers else 0.0
+        if _price_conflict(answers[:3]):
+            conflicts.append("price_conflict")
+        return RagRetrievalResult(
+            answers=tuple(answers),
+            confidence=confidence,
+            safe_for_autoanswer=bool(answers and not conflicts),
+            handoff_reason="conflict" if conflicts else ("" if answers else "no_approved_knowledge"),
+            conflicts=tuple(conflicts),
+        )
+
+    def retrieve_for_message(self, message: InboundMessage, *, min_score: float, limit: int = 5) -> RagRetrievalResult:
+        listing_title = message.listing.title if message.listing else ""
+        text = " ".join(part for part in (message.text, listing_title) if part)
+        return self.retrieve(
+            RagRetrievalRequest(
+                channel=message.channel.value if hasattr(message.channel, "value") else str(message.channel),
+                text=text,
+                service_hint=listing_title,
+                limit=limit,
+                min_score=min_score,
+            )
+        )
+
+    def _channel_allowed(self, answer: dict[str, Any], channel: str) -> bool:
+        metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
+        visibility = metadata.get("visibility") or metadata.get("channels") or ()
+        if isinstance(visibility, str):
+            visibility = [visibility]
+        if visibility and channel not in visibility:
+            return False
+        service_key = service_catalog_from_rag_metadata(metadata)
+        service = self.service_catalog.get(service_key) if service_key else None
+        return not service or not service.visibility or channel in service.visibility
+
+    def _service_allowed(self, answer: dict[str, Any], request: RagRetrievalRequest) -> bool:
+        metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
+        service_key = service_catalog_from_rag_metadata(metadata)
+        service = self.service_catalog.get(service_key) if service_key else None
+        if not service and request.service_hint:
+            service = self.service_catalog.resolve(request.service_hint)
+        if not service:
+            return True
+        if service.status not in {ACTIVE, HIDDEN}:
+            return False
+        if service.status == HIDDEN:
+            return False
+        return True
+
+    def _service_filter(self, request: RagRetrievalRequest) -> str:
+        if request.service_key:
+            return request.service_key
+        for source in (request.service_hint, request.text):
+            service = infer_metadata(source).get("service") if source else ""
+            if service:
+                return service
+        resolved = self.service_catalog.resolve(request.service_hint or request.text)
+        return resolved.service_key if resolved else ""
+
+
+def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
+    metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
+    return answer.get("status") == APPROVED and metadata.get("autoanswer_allowed") is not False
+
+
+def _price_conflict(answers: list[dict[str, Any]]) -> bool:
+    prices: set[str] = set()
+    for answer in answers:
+        text = str(answer.get("answer_client") or "")
+        found = tuple(sorted(__import__("re").findall(r"\b\d[\d\s]{3,}\b", text)))
+        if found:
+            prices.add("|".join(found))
+    return len(prices) > 1

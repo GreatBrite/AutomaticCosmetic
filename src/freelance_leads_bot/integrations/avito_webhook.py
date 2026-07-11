@@ -26,7 +26,7 @@ from .codex_review import AvitoDraftReviewer, CodexDraftReviewer
 from .handoff_notify import HandoffNotifier, handoff_notifier_from_settings
 from .mentor_memory import MentorMemoryService
 from .expert_rag import ExpertRagStore
-from .runtime import booking_from_settings
+from .runtime import booking_from_settings, rag_retrieval_from_settings
 from .roles import CodexRole, legacy_runtime_status, role_profile
 from .yclients import YClientsGateway
 from ..storage import LeadStore
@@ -365,6 +365,7 @@ async def process_avito_message(
         planner=planner,
         profile=role_profile(CodexRole.AVITO_CLIENT),
         expert_rag=expert_rag,
+        rag_retrieval=rag_retrieval_from_settings(settings),
         rag_autoanswer_threshold=settings.rag_autoanswer_threshold,
         rag_handoff_threshold=settings.rag_handoff_threshold,
     )

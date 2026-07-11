@@ -95,6 +95,10 @@ class IntegrationSettings:
     vk_send_enabled: bool
     vk_codex_enabled: bool
     telegram_admin_response_wait_seconds: int = 60
+    rag_dynamic_intent_enabled: bool = True
+    rag_service_catalog_enabled: bool = True
+    rag_shared_retrieval_enabled: bool = True
+    rag_service_catalog_path: Path = ROOT / "data" / "service_catalog.json"
 
     @classmethod
     def from_env(cls, env_path: Path | None = None) -> "IntegrationSettings":
@@ -132,9 +136,13 @@ class IntegrationSettings:
             avito_unanswered_interval_seconds=_env_int("AVITO_UNANSWERED_INTERVAL_SECONDS", 300),
             avito_unanswered_lookback_seconds=_env_int("AVITO_UNANSWERED_LOOKBACK_SECONDS", 86400),
             rag_retrieval_enabled=_env_bool("RAG_RETRIEVAL_ENABLED", True),
+            rag_dynamic_intent_enabled=_env_bool("RAG_DYNAMIC_INTENT_ENABLED", True),
+            rag_service_catalog_enabled=_env_bool("RAG_SERVICE_CATALOG_ENABLED", True),
+            rag_shared_retrieval_enabled=_env_bool("RAG_SHARED_RETRIEVAL_ENABLED", True),
             rag_autoanswer_threshold=_env_float("RAG_AUTOANSWER_THRESHOLD", 0.82),
             rag_handoff_threshold=_env_float("RAG_HANDOFF_THRESHOLD", 0.65),
             rag_expert_db_path=Path(_env("RAG_EXPERT_DB_PATH", str(ROOT / "data" / "expert_rag.sqlite3"))),
+            rag_service_catalog_path=Path(_env("RAG_SERVICE_CATALOG_PATH", str(ROOT / "data" / "service_catalog.json"))),
             yclients_api_key=_env("YCLIENTS_API_KEY"),
             yclients_user_token=_env("YCLIENTS_USER_TOKEN"),
             yclients_company_id=_env_int("YCLIENTS_COMPANY_ID"),

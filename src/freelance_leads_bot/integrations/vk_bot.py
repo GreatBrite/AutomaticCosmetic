@@ -7,7 +7,7 @@ from typing import Any
 from .avito_consultant import AvitoAgentPlanner, AvitoConsultant
 from .config import IntegrationSettings
 from .handoff_notify import HandoffNotifier, handoff_notifier_from_settings
-from .runtime import booking_from_settings, codex_planner_from_settings, toolbox_from_settings
+from .runtime import booking_from_settings, codex_planner_from_settings, rag_retrieval_from_settings, toolbox_from_settings
 from .roles import CodexRole, conversation_key, role_profile
 from .vk import VKLongPollServer, is_vk_message_new, vk_inbound_message
 from .vk_sender import VKClient, VKSender, vk_sender_from_settings
@@ -41,7 +41,15 @@ class VKBot:
             operations_notifier=self.handoff_notifier,
         )
         self.planner = planner or codex_planner_from_settings(self.settings, enabled=self.settings.vk_codex_enabled)
-        self.consultant = AvitoConsultant(self.toolbox, cities=self.settings.cities, planner=self.planner, profile=self.profile)
+        self.consultant = AvitoConsultant(
+            self.toolbox,
+            cities=self.settings.cities,
+            planner=self.planner,
+            profile=self.profile,
+            rag_retrieval=rag_retrieval_from_settings(self.settings),
+            rag_autoanswer_threshold=self.settings.rag_autoanswer_threshold,
+            rag_handoff_threshold=self.settings.rag_handoff_threshold,
+        )
         self.processed: set[str] = set()
 
     async def run(self) -> None:
