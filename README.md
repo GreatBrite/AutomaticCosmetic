@@ -72,6 +72,7 @@ cd /root/AutomaticCosmetic
 ## Важные документы
 
 - [docs/cosmetology_automation_spec.md](/root/AutomaticCosmetic/docs/cosmetology_automation_spec.md) - продуктовая спецификация.
+- [docs/ops_runbook.md](/root/AutomaticCosmetic/docs/ops_runbook.md) - эксплуатационный runbook: `ops_status`, RAG review, Avito warnings, data/disk checks.
 - [DEVELOPMENT.md](/root/AutomaticCosmetic/DEVELOPMENT.md) - заметки по текущей разработке.
 - [docs/parity_report_2026-05-29.md](/root/AutomaticCosmetic/docs/parity_report_2026-05-29.md) - отчет по переносу legacy-интеграций в новый Codex runtime.
 
@@ -91,10 +92,18 @@ cd /root/AutomaticCosmetic
 .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
 ```
 
+Для alert/cron можно включить строгий режим, где warning тоже даёт ненулевой exit-code:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --strict
+```
+
 В отчёте важны поля:
 
 - `ok`: общий эксплуатационный статус;
 - `summary.avito_actionable`: сколько Avito-диалогов реально ждут действия;
 - `summary.avito_autoreply_failed`: сколько delayed auto-reply попыток упали;
+- `summary.rag_needs_review`: сколько RAG-знаний ждёт подтверждения;
+- `summary.data_total_bytes` и `summary.disk_free_bytes`: рост `data/` и запас диска;
 - `checks.systemd_services`: живы ли runtime-сервисы;
 - `checks.expert_rag`: есть ли approved RAG-знания.
