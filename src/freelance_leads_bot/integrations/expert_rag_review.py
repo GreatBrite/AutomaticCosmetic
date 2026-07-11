@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,13 @@ from .expert_rag import DEFAULT_EXPERT_RAG_DB_PATH, NEEDS_REVIEW, ExpertAnswer, 
 
 
 DEFAULT_AUDIT_LOG_PATH = Path("data/expert_rag_review_audit.jsonl")
+DECISION_ACTION_APPROVE = "approve"
+DECISION_ACTION_DEPRECATE = "deprecate"
+DECISION_ACTION_NEEDS_EDIT = "needs_edit"
+_DECISION_CHECKBOX_RE = re.compile(
+    r"^\s*-\s*\[[xX]\]\s*(approve|deprecate|needs\s+edited\s+answer)(?:\s+for)?\s+#(\d+)\b",
+    re.IGNORECASE,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_parser = subparsers.add_parser("audit", help="Show recent expert RAG review mutations.")
     audit_parser.add_argument("--limit", type=int, default=20, help="Maximum number of audit events.")
+
+    decisions_parser = subparsers.add_parser("decisions", help="Parse checked decisions from an exported review Markdown file.")
+    decisions_parser.add_argument("path", type=Path, help="Markdown file produced by the export command and marked with [x].")
+    decisions_parser.add_argument("--apply", action="store_true", help="Apply safe approve/deprecate decisions. Default is dry-run.")
+    decisions_parser.add_argument("--by", default="olga", help="Approver name for applied approve decisions.")
 
     return parser
 
@@ -118,6 +131,16 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         events = _read_audit_log(audit_log_path, limit=args.limit)
         return 0, _json_or_text(args.json, {"events": events}, _format_audit_events(events))
 
+    if args.command == "decisions":
+        return _run_decisions_command(
+            store,
+            audit_log_path=audit_log_path,
+            path=args.path,
+            apply=args.apply,
+            approved_by=args.by,
+            as_json=args.json,
+        )
+
     return 2, "Unsupported command."
 
 
@@ -168,6 +191,119 @@ def _read_audit_log(path: Path, *, limit: int = 20) -> list[dict[str, Any]]:
     return events[-max(1, int(limit or 1)) :][::-1]
 
 
+def _run_decisions_command(
+    store: ExpertRagStore,
+    *,
+    audit_log_path: Path,
+    path: Path,
+    apply: bool,
+    approved_by: str,
+    as_json: bool,
+) -> tuple[int, str]:
+    if not path.exists():
+        return 1, _json_or_text(
+            as_json,
+            {"ok": False, "error": "file_not_found", "path": str(path)},
+            f"Decision file not found: {path}",
+        )
+    parsed = _parse_markdown_decisions(path.read_text(encoding="utf-8"))
+    plan = _build_decision_plan(store, parsed)
+    ok = not plan["conflicts"] and not plan["missing"] and not plan["needs_edit"]
+    if apply and ok:
+        previous_by_id: dict[int, ExpertAnswer] = {}
+        for entry in plan["planned"]:
+            item_id = int(entry["id"])
+            previous = store.get(item_id)
+            if not previous:
+                plan["missing"].append({"id": item_id})
+                ok = False
+                break
+            previous_by_id[item_id] = previous
+    if apply and ok:
+        for entry in plan["planned"]:
+            item_id = int(entry["id"])
+            previous = previous_by_id[item_id]
+            if entry["action"] == DECISION_ACTION_APPROVE:
+                current = store.approve(item_id, approved_by=approved_by)
+                _append_audit_log(
+                    audit_log_path,
+                    action="approve",
+                    previous=previous,
+                    current=current,
+                    approved_by=approved_by,
+                )
+                entry["applied"] = True
+            elif entry["action"] == DECISION_ACTION_DEPRECATE:
+                changed = store.deprecate(item_id)
+                if not changed:
+                    plan["missing"].append({"id": item_id})
+                    ok = False
+                    break
+                current = store.get(item_id) or previous
+                _append_audit_log(audit_log_path, action="deprecate", previous=previous, current=current)
+                entry["applied"] = True
+    payload = {
+        "ok": ok,
+        "dry_run": not apply,
+        "applied": bool(apply and ok and plan["planned"]),
+        "approved_by": approved_by,
+        **plan,
+    }
+    code = 0 if ok else 1
+    return code, _json_or_text(as_json, payload, _format_decision_plan(payload))
+
+
+def _parse_markdown_decisions(markdown: str) -> dict[int, list[str]]:
+    decisions: dict[int, list[str]] = {}
+    for line in markdown.splitlines():
+        match = _DECISION_CHECKBOX_RE.match(line)
+        if not match:
+            continue
+        raw_action, raw_id = match.groups()
+        action = _normalize_decision_action(raw_action)
+        decisions.setdefault(int(raw_id), []).append(action)
+    return decisions
+
+
+def _normalize_decision_action(raw_action: str) -> str:
+    action = " ".join(raw_action.lower().split())
+    if action == "approve":
+        return DECISION_ACTION_APPROVE
+    if action == "deprecate":
+        return DECISION_ACTION_DEPRECATE
+    return DECISION_ACTION_NEEDS_EDIT
+
+
+def _build_decision_plan(store: ExpertRagStore, parsed: dict[int, list[str]]) -> dict[str, list[dict[str, Any]]]:
+    planned: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    needs_edit: list[dict[str, Any]] = []
+    for item_id, actions in sorted(parsed.items()):
+        unique_actions = sorted(set(actions))
+        if len(unique_actions) > 1:
+            conflicts.append({"id": item_id, "actions": unique_actions})
+            continue
+        action = unique_actions[0]
+        item = store.get(item_id)
+        if not item:
+            missing.append({"id": item_id, "action": action})
+            continue
+        if action == DECISION_ACTION_NEEDS_EDIT:
+            needs_edit.append({"id": item_id, "status": item.status, "action": action})
+            continue
+        planned.append(
+            {
+                "id": item.id,
+                "action": action,
+                "from_status": item.status,
+                "question": item.question_canonical,
+                "answer_client": item.answer_client,
+            }
+        )
+    return {"planned": planned, "conflicts": conflicts, "missing": missing, "needs_edit": needs_edit}
+
+
 def _format_audit_events(events: list[dict[str, Any]]) -> str:
     if not events:
         return "No expert RAG review audit events found."
@@ -188,6 +324,48 @@ def _format_audit_events(events: list[dict[str, Any]]) -> str:
         if answer:
             lines.append(f"  A: {_short(answer, 100)}")
     return "\n".join(lines)
+
+
+def _format_decision_plan(payload: dict[str, Any]) -> str:
+    planned = payload.get("planned") if isinstance(payload.get("planned"), list) else []
+    conflicts = payload.get("conflicts") if isinstance(payload.get("conflicts"), list) else []
+    missing = payload.get("missing") if isinstance(payload.get("missing"), list) else []
+    needs_edit = payload.get("needs_edit") if isinstance(payload.get("needs_edit"), list) else []
+    mode = "DRY RUN" if payload.get("dry_run") else "APPLY"
+    lines = [f"{mode}: expert RAG review decisions"]
+    if planned:
+        lines.append(f"Planned safe decisions: {len(planned)}")
+        for entry in planned:
+            applied = " applied" if entry.get("applied") else ""
+            lines.append(
+                f"- #{entry['id']} {entry['action']}: "
+                f"{entry['from_status']} -> {_decision_target_status(entry['action'])}{applied}"
+            )
+            if entry.get("question"):
+                lines.append(f"  Q: {_short(str(entry['question']), 90)}")
+    else:
+        lines.append("Planned safe decisions: 0")
+    if conflicts:
+        lines.append(f"Conflicts: {len(conflicts)}")
+        for entry in conflicts:
+            lines.append(f"- #{entry.get('id')} has multiple checked actions: {', '.join(entry.get('actions') or [])}")
+    if missing:
+        lines.append(f"Missing items: {len(missing)}")
+        for entry in missing:
+            lines.append(f"- #{entry.get('id')} not found")
+    if needs_edit:
+        lines.append(f"Needs edited answer: {len(needs_edit)}")
+        for entry in needs_edit:
+            lines.append(f"- #{entry.get('id')} requires manual edited answer before applying")
+    if not payload.get("ok"):
+        lines.append("No changes were applied because the decision file needs attention.")
+    elif payload.get("dry_run"):
+        lines.append("No changes were applied. Re-run with --apply to mutate approve/deprecate decisions.")
+    return "\n".join(lines)
+
+
+def _decision_target_status(action: str) -> str:
+    return "approved" if action == DECISION_ACTION_APPROVE else "deprecated"
 
 
 def _format_list(items: list[ExpertAnswer]) -> str:

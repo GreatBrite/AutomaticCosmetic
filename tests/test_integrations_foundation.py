@@ -5024,6 +5024,114 @@ def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     assert f"## #{item.id}" in export_path.read_text(encoding="utf-8")
 
 
+def test_expert_rag_review_cli_dry_runs_markdown_decisions(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    review_path = tmp_path / "review.md"
+    store = ExpertRagStore(db_path)
+    approve_item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    deprecate_item = store.upsert_from_handoff(
+        question="Старая цена?",
+        answer_client="Старая цена не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+    review_path.write_text(
+        "\n".join(
+            [
+                f"- [x] approve #{approve_item.id} as-is",
+                f"- [X] deprecate #{deprecate_item.id}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    code, output = run_review_command(["--db", str(db_path), "--json", "decisions", str(review_path)])
+    payload = json.loads(output)
+
+    assert code == 0
+    assert payload["dry_run"] is True
+    assert payload["applied"] is False
+    assert [entry["action"] for entry in payload["planned"]] == ["approve", "deprecate"]
+    assert store.get(approve_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+    assert store.get(deprecate_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+
+
+def test_expert_rag_review_cli_applies_markdown_decisions_with_audit(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    review_path = tmp_path / "review.md"
+    store = ExpertRagStore(db_path)
+    approve_item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    deprecate_item = store.upsert_from_handoff(
+        question="Старая цена?",
+        answer_client="Старая цена не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+    review_path.write_text(
+        f"- [x] approve #{approve_item.id} as-is\n- [x] deprecate #{deprecate_item.id}\n",
+        encoding="utf-8",
+    )
+
+    code, output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "decisions", str(review_path), "--apply", "--by", "olga"]
+    )
+
+    assert code == 0
+    assert "APPLY" in output
+    assert "applied" in output
+    assert store.get(approve_item.id).status == APPROVED  # type: ignore[union-attr]
+    assert store.get(deprecate_item.id).status == "deprecated"  # type: ignore[union-attr]
+    events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["action"] for event in events] == ["approve", "deprecate"]
+    assert events[0]["approved_by"] == "olga"
+
+
+def test_expert_rag_review_cli_rejects_conflicting_markdown_decisions(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    review_path = tmp_path / "review.md"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    edit_item = store.upsert_from_handoff(
+        question="Какой объём нужен?",
+        answer_client="Нужно смотреть фото.",
+        status=NEEDS_REVIEW,
+    )
+    review_path.write_text(
+        "\n".join(
+            [
+                f"- [x] approve #{item.id} as-is",
+                f"- [x] deprecate #{item.id}",
+                f"- [x] needs edited answer for #{edit_item.id}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    code, output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "decisions", str(review_path), "--apply"]
+    )
+
+    assert code == 1
+    assert "Conflicts: 1" in output
+    assert "Needs edited answer: 1" in output
+    assert "No changes were applied" in output
+    assert store.get(item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+    assert store.get(edit_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+    assert not audit_path.exists()
+
+
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     expert = ExpertRagStore(tmp_path / "expert.sqlite3")
