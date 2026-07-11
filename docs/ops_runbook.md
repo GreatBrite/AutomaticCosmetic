@@ -54,6 +54,28 @@ expert_rag_needs_review: N expert RAG items need review
 .venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md
 ```
 
+Открой `data/expert_rag_review.md` и отметь ровно один чекбокс у каждого знания, которое готово к решению:
+
+```markdown
+- [x] approve #158 as-is
+- [ ] deprecate #158
+- [ ] needs edited answer for #158
+```
+
+Потом обязательно проверь файл dry-run командой. Она ничего не меняет в базе:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review decisions data/expert_rag_review.md
+```
+
+Если dry-run показывает только правильные `approve/deprecate` решения и нет `Conflicts`, `Missing items` или `Needs edited answer`, можно применить:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review decisions data/expert_rag_review.md --apply --by olga
+```
+
+`needs edited answer` не применяется автоматически: сначала нужно вручную отредактировать клиентский ответ/знание, затем снова прогнать review.
+
 Посмотреть список в консоли:
 
 ```bash

@@ -154,7 +154,10 @@ def build_ops_status_report(
                 f"{rag_needs_review} expert RAG items need review"
                 + (f" (ids: {', '.join(str(item_id) for item_id in rag_needs_review_ids)})." if rag_needs_review_ids else ".")
                 + " "
-                "Run: python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md"
+                "Run: python -m src.freelance_leads_bot.integrations.expert_rag_review export --output data/expert_rag_review.md; "
+                "mark [x] decisions; "
+                "python -m src.freelance_leads_bot.integrations.expert_rag_review decisions data/expert_rag_review.md; "
+                "then add --apply only after the dry-run is correct."
             ),
             rag,
         )

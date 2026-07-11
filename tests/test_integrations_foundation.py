@@ -6626,6 +6626,9 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
     assert f"ids: {review_item.id}" in text
     assert "expert_rag_needs_review" in text
     assert "expert_rag_review export --output data/expert_rag_review.md" in text
+    assert "mark [x] decisions" in text
+    assert "expert_rag_review decisions data/expert_rag_review.md" in text
+    assert "add --apply only after the dry-run is correct" in text
 
 
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:
