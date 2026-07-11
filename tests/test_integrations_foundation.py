@@ -5002,6 +5002,11 @@ def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     assert "# Expert RAG review backlog: needs_review" in output
     assert f"## #{item.id}" in output
     assert "Candidate client answer:" in output
+    assert "Decision checklist:" in output
+    assert f"- [ ] approve #{item.id} as-is" in output
+    assert f"- [ ] deprecate #{item.id}" in output
+    assert f"- [ ] needs edited answer for #{item.id}" in output
+    assert "Edited client answer, if needed:" in output
     assert f"approve {item.id} --by olga --dry-run" in output
     assert f"approve {item.id} --by olga" in output
     assert f"deprecate {item.id} --dry-run" in output
