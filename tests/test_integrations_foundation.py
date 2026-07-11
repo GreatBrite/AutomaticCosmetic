@@ -6046,6 +6046,50 @@ def test_ops_status_failed_autoreply_is_error(tmp_path) -> None:
     assert report.summary["avito_autoreply_failed"] == 1
 
 
+def test_ops_status_warns_on_stale_unanswered_report(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:01:40+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=2000,
+    )
+
+    freshness_check = next(check for check in report.checks if check.name == "avito_unanswered_report_fresh")
+    assert report.ok is True
+    assert freshness_check.ok is False
+    assert freshness_check.severity == "warning"
+    assert freshness_check.data is not None
+    assert freshness_check.data["report_age_seconds"] == 1900
+    assert report.summary["avito_unanswered_report_age_seconds"] == 1900
+
+
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:
     update = {
         "type": "message_new",

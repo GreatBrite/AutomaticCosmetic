@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,8 +54,10 @@ def build_ops_status_report(
     unanswered_report_path: Path = DEFAULT_UNANSWERED_REPORT_PATH,
     unanswered_state_path: Path = DEFAULT_UNANSWERED_STATE_PATH,
     rag_db_path: Path | None = None,
+    now: int | None = None,
 ) -> OpsStatusReport:
     settings = settings or IntegrationSettings.from_env()
+    generated_at = int(time.time()) if now is None else int(now)
     rag_db = rag_db_path or settings.rag_expert_db_path
     checks: list[OpsCheck] = []
 
@@ -76,15 +79,33 @@ def build_ops_status_report(
     yclients_health = yclients_health if yclients_health is not None else fetch_json("http://127.0.0.1:8020/health")
     checks.append(_health_check("yclients_integration_health", yclients_health))
 
-    unanswered = read_unanswered_status(unanswered_report_path, unanswered_state_path)
+    unanswered = read_unanswered_status(
+        unanswered_report_path,
+        unanswered_state_path,
+        now=generated_at,
+        stale_after_seconds=_unanswered_report_stale_after_seconds(settings),
+    )
     actionable = int(unanswered.get("actionable_count") or 0)
     failed = int(unanswered.get("failed_count") or 0)
+    report_is_stale = bool(unanswered.get("report_is_stale"))
+    report_age = int(unanswered.get("report_age_seconds") or 0)
     checks.append(
         OpsCheck(
             "avito_unanswered_queue",
             actionable == 0,
             "warning",
             "No actionable delayed Avito replies." if actionable == 0 else f"{actionable} Avito chats need action.",
+            unanswered,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "avito_unanswered_report_fresh",
+            not report_is_stale,
+            "warning",
+            "Delayed Avito report is fresh."
+            if not report_is_stale
+            else f"Delayed Avito report is stale or missing; age={report_age}s.",
             unanswered,
         )
     )
@@ -114,11 +135,12 @@ def build_ops_status_report(
         "services_active": not inactive,
         "avito_actionable": actionable,
         "avito_autoreply_failed": failed,
+        "avito_unanswered_report_age_seconds": report_age,
         "rag_approved": rag.get("approved_count", 0),
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
     }
     ok = all(check.ok or check.severity != "error" for check in checks)
-    return OpsStatusReport(ok=ok, generated_at=int(time.time()), checks=tuple(checks), flags=flags, summary=summary)
+    return OpsStatusReport(ok=ok, generated_at=generated_at, checks=tuple(checks), flags=flags, summary=summary)
 
 
 def safe_live_flags(settings: IntegrationSettings) -> dict[str, Any]:
@@ -127,6 +149,7 @@ def safe_live_flags(settings: IntegrationSettings) -> dict[str, Any]:
         "avito_send_enabled": settings.avito_send_enabled,
         "avito_codex_enabled": settings.avito_codex_enabled,
         "avito_unanswered_autoreply_enabled": settings.avito_unanswered_autoreply_enabled,
+        "avito_unanswered_interval_seconds": settings.avito_unanswered_interval_seconds,
         "yclients_ready": settings.yclients_ready,
         "yclients_allow_mutations": settings.yclients_allow_mutations,
         "handoff_notify_ready": settings.handoff_notify_ready,
@@ -138,17 +161,32 @@ def safe_live_flags(settings: IntegrationSettings) -> dict[str, Any]:
     }
 
 
-def read_unanswered_status(report_path: Path, state_path: Path) -> dict[str, Any]:
+def read_unanswered_status(
+    report_path: Path,
+    state_path: Path,
+    *,
+    now: int | None = None,
+    stale_after_seconds: int = 900,
+) -> dict[str, Any]:
+    now_ts = int(time.time()) if now is None else int(now)
     report = _read_json(report_path)
     state = _read_json(state_path)
     items = report.get("items") if isinstance(report.get("items"), list) else []
     actionable_count = int(report.get("actionable_count") or sum(1 for item in items if isinstance(item, dict) and item.get("needs_action")))
     failed = state.get("failed") if isinstance(state.get("failed"), dict) else {}
     handled = state.get("handled") if isinstance(state.get("handled"), dict) else {}
+    report_created_at = str(report.get("created_at") or "")
+    report_created_ts = _parse_iso_timestamp(report_created_at)
+    report_age = max(0, now_ts - report_created_ts) if report_created_ts > 0 else 0
+    stale_after = max(1, int(stale_after_seconds or 1))
+    report_is_stale = not report_path.exists() or report_created_ts <= 0 or report_age > stale_after
     return {
         "report_exists": report_path.exists(),
         "state_exists": state_path.exists(),
-        "report_created_at": report.get("created_at", ""),
+        "report_created_at": report_created_at,
+        "report_age_seconds": report_age,
+        "report_stale_after_seconds": stale_after,
+        "report_is_stale": report_is_stale,
         "total_count": int(report.get("count") or len(items)),
         "actionable_count": actionable_count,
         "handled_count": len(handled),
@@ -176,6 +214,23 @@ def read_rag_status(path: Path) -> dict[str, Any]:
     except sqlite3.Error as exc:
         result.update({"error": type(exc).__name__, "approved_count": 0})
     return result
+
+
+def _unanswered_report_stale_after_seconds(settings: IntegrationSettings) -> int:
+    interval = max(0, int(settings.avito_unanswered_interval_seconds or 0))
+    return max(interval * 2, 900)
+
+
+def _parse_iso_timestamp(value: str) -> int:
+    if not value:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
 
 
 def read_systemd_service_states(services: tuple[str, ...] = DEFAULT_SERVICES) -> dict[str, str]:
