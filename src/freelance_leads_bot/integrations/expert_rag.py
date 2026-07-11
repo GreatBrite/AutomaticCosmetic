@@ -221,6 +221,18 @@ class ExpertRagStore:
             row = conn.execute("SELECT * FROM expert_answers WHERE id = ?", (item_id,)).fetchone()
         return _answer_from_row(row) if row else None
 
+    def list_answers(self, *, status: str = "", limit: int = 20) -> list[ExpertAnswer]:
+        sql = "SELECT * FROM expert_answers"
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit or 1)))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [answer for row in rows if (answer := _answer_from_row(row))]
+
     def search(
         self,
         query: str,

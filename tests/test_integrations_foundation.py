@@ -98,6 +98,7 @@ from src.freelance_leads_bot.integrations.models import (
 )
 from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
+from src.freelance_leads_bot.integrations.expert_rag_review import run_review_command
 import src.freelance_leads_bot.integrations.roles as roles_module
 from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
 import src.freelance_leads_bot.integrations.telegram_admin_bot as telegram_admin_bot_module
@@ -4814,6 +4815,43 @@ def test_expert_rag_price_or_medical_answer_requires_review(tmp_path) -> None:
     approved = store.approve(item.id, approved_by="olga")
     assert approved.status == APPROVED
     assert store.search("сколько стоит увеличение губ", min_score=0.1)
+
+
+def test_expert_rag_review_cli_lists_shows_and_updates_items(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(db_path)
+    review_item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    stale_item = store.upsert_from_handoff(
+        question="Старая цена на ягодицы?",
+        answer_client="Старая цена больше не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+
+    code, output = run_review_command(["--db", str(db_path), "list"])
+    assert code == 0
+    assert f"#{review_item.id}" in output
+    assert "Сколько стоит" in output or "сколько стоит" in output
+
+    code, output = run_review_command(["--db", str(db_path), "show", str(review_item.id)])
+    assert code == 0
+    assert "Client answer:" in output
+    assert "10000" in output
+
+    code, output = run_review_command(["--db", str(db_path), "--json", "approve", str(review_item.id), "--by", "olga"])
+    payload = json.loads(output)
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["item"]["status"] == APPROVED
+    assert payload["item"]["approved_by"] == "olga"
+
+    code, output = run_review_command(["--db", str(db_path), "deprecate", str(stale_item.id)])
+    assert code == 0
+    assert "Deprecated" in output
+    assert store.get(stale_item.id).status == "deprecated"  # type: ignore[union-attr]
 
 
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
