@@ -96,7 +96,13 @@ from src.freelance_leads_bot.integrations.models import (
     Slot,
     UpsellRule,
 )
-from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report, read_data_footprint, read_disk_status
+from src.freelance_leads_bot.integrations.ops_status import (
+    build_ops_status_report,
+    format_ops_status_report,
+    ops_status_exit_code,
+    read_data_footprint,
+    read_disk_status,
+)
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
@@ -6331,6 +6337,46 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
     assert "avito_unanswered_queue" in text
     assert "avito_unanswered_report_fresh" in text
     assert "No immediate action required" not in text
+
+
+def test_ops_status_exit_code_can_be_strict_for_warnings(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:01:40+00:00",
+                "count": 1,
+                "actionable_count": 1,
+                "items": [{"needs_action": True}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=2000,
+    )
+
+    assert report.ok is True
+    assert ops_status_exit_code(report) == 0
+    assert ops_status_exit_code(report, strict=True) == 1
 
 
 def test_ops_status_reports_data_footprint_warning(tmp_path) -> None:

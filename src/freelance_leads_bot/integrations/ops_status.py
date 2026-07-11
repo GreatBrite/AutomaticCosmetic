@@ -342,6 +342,12 @@ def report_data(report: OpsStatusReport) -> dict[str, Any]:
     return data
 
 
+def ops_status_exit_code(report: OpsStatusReport, *, strict: bool = False) -> int:
+    if strict:
+        return 0 if all(check.ok for check in report.checks) else 1
+    return 0 if report.ok else 1
+
+
 def format_ops_status_report(report: OpsStatusReport) -> str:
     failing_errors = [check for check in report.checks if not check.ok and check.severity == "error"]
     failing_warnings = [check for check in report.checks if not check.ok and check.severity == "warning"]
@@ -529,6 +535,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AutomaticCosmetic operational status audit")
     parser.add_argument("--json", action="store_true", help="Print JSON only.")
+    parser.add_argument("--strict", action="store_true", help="Return non-zero for warnings as well as errors.")
     args = parser.parse_args(argv)
     report = build_ops_status_report()
     data = report_data(report)
@@ -536,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
         print(format_ops_status_report(report))
-    return 0 if report.ok else 1
+    return ops_status_exit_code(report, strict=args.strict)
 
 
 if __name__ == "__main__":
