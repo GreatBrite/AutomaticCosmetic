@@ -40,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--limit", type=int, default=50, help="Maximum number of items.")
     export_parser.add_argument("--output", type=Path, help="Write export to this file instead of stdout.")
 
+    audit_parser = subparsers.add_parser("audit", help="Show recent expert RAG review mutations.")
+    audit_parser.add_argument("--limit", type=int, default=20, help="Maximum number of audit events.")
+
     return parser
 
 
@@ -106,6 +109,10 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
             )
         return 0, content
 
+    if args.command == "audit":
+        events = _read_audit_log(args.audit_log, limit=args.limit)
+        return 0, _json_or_text(args.json, {"events": events}, _format_audit_events(events))
+
     return 2, "Unsupported command."
 
 
@@ -132,6 +139,42 @@ def _append_audit_log(
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _read_audit_log(path: Path, *, limit: int = 20) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events[-max(1, int(limit or 1)) :][::-1]
+
+
+def _format_audit_events(events: list[dict[str, Any]]) -> str:
+    if not events:
+        return "No expert RAG review audit events found."
+    lines = [f"Expert RAG audit events: {len(events)}"]
+    for event in events:
+        previous = event.get("previous") if isinstance(event.get("previous"), dict) else {}
+        current = event.get("current") if isinstance(event.get("current"), dict) else {}
+        item_id = event.get("item_id") or current.get("id") or previous.get("id") or "-"
+        before = previous.get("status") or "-"
+        after = current.get("status") or "-"
+        action = event.get("action") or "-"
+        approved_by = event.get("approved_by") or "-"
+        lines.append(
+            f"- {event.get('created_at') or '-'} #{item_id} {action}: {before} -> {after}"
+            + (f" by {approved_by}" if approved_by != "-" else "")
+        )
+        answer = str(current.get("answer_client") or previous.get("answer_client") or "")
+        if answer:
+            lines.append(f"  A: {_short(answer, 100)}")
+    return "\n".join(lines)
 
 
 def _format_list(items: list[ExpertAnswer]) -> str:

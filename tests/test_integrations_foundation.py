@@ -4819,6 +4819,7 @@ def test_expert_rag_price_or_medical_answer_requires_review(tmp_path) -> None:
 
 def test_expert_rag_review_cli_lists_shows_and_updates_items(tmp_path) -> None:
     db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
     store = ExpertRagStore(db_path)
     review_item = store.upsert_from_handoff(
         question="Сколько стоит увеличение губ?",
@@ -4841,14 +4842,16 @@ def test_expert_rag_review_cli_lists_shows_and_updates_items(tmp_path) -> None:
     assert "Client answer:" in output
     assert "10000" in output
 
-    code, output = run_review_command(["--db", str(db_path), "--json", "approve", str(review_item.id), "--by", "olga"])
+    code, output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "--json", "approve", str(review_item.id), "--by", "olga"]
+    )
     payload = json.loads(output)
     assert code == 0
     assert payload["ok"] is True
     assert payload["item"]["status"] == APPROVED
     assert payload["item"]["approved_by"] == "olga"
 
-    code, output = run_review_command(["--db", str(db_path), "deprecate", str(stale_item.id)])
+    code, output = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "deprecate", str(stale_item.id)])
     assert code == 0
     assert "Deprecated" in output
     assert store.get(stale_item.id).status == "deprecated"  # type: ignore[union-attr]
@@ -4917,6 +4920,41 @@ def test_expert_rag_review_cli_writes_audit_log_for_mutations_only(tmp_path) -> 
     assert events[1]["item_id"] == deprecate_item.id
     assert events[1]["previous"]["status"] == NEEDS_REVIEW
     assert events[1]["current"]["status"] == "deprecated"
+
+
+def test_expert_rag_review_cli_reads_audit_log(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    store = ExpertRagStore(db_path)
+    first = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    second = store.upsert_from_handoff(
+        question="Старая цена?",
+        answer_client="Старая цена не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+
+    code, _ = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "approve", str(first.id), "--by", "olga"])
+    assert code == 0
+    audit_path.write_text(audit_path.read_text(encoding="utf-8") + "{bad json\n", encoding="utf-8")
+    code, _ = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "deprecate", str(second.id)])
+    assert code == 0
+
+    code, output = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "audit", "--limit", "2"])
+    assert code == 0
+    assert "Expert RAG audit events: 2" in output
+    assert f"#{second.id} deprecate: needs_review -> deprecated" in output
+    assert f"#{first.id} approve: needs_review -> approved by olga" in output
+    assert output.index(f"#{second.id}") < output.index(f"#{first.id}")
+
+    code, output = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "--json", "audit", "--limit", "1"])
+    payload = json.loads(output)
+    assert code == 0
+    assert len(payload["events"]) == 1
+    assert payload["events"][0]["item_id"] == second.id
 
 
 def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
