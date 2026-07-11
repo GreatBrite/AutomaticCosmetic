@@ -82,7 +82,7 @@ class AvitoAgentContext:
                 "Если просишь данные для записи, проси рабочие данные для оформления и связи, а не веди клиента как анкету.",
                 "Не отправляй клиента к специалисту словами, если вопрос уверенно покрыт контекстом, YCLIENTS, knowledge или экспертной правкой Ольги.",
                 "Если в истории/trace уже есть оценка Ольги или подтверждённое решение специалиста, дай клиенту итог без фраз 'на консультации подберём', 'окончательно индивидуально' и без нового предложения консультации.",
-                "retrieved_expert_answers — проверенные ответы Ольги из RAG-памяти. Если найденный ответ approved и score высокий, используй его как главный источник и отвечай клиенту сам. Если score средний или контекст отличается важной деталью — сделай handoff и приложи похожий ответ как подсказку, не выдумывай.",
+                "retrieved_expert_answers — проверенные low-risk ответы Ольги из RAG-памяти. Если найденный ответ approved и score высокий, используй его как главный источник и отвечай клиенту сам. Если score средний или контекст отличается важной деталью — сделай handoff и приложи похожий ответ как подсказку, не выдумывай.",
                 "Отвечай коротко и по конкретному вопросу клиента.",
                 "Если клиент хочет записаться, сначала должна быть понятна конкретная процедура/услуга. Не превращай слова 'встреча', 'приём', 'лично', 'на следующей неделе' или присланный телефон в запись сами по себе.",
                 "Если клиент оставил телефон/имя и просит 'встречу' или 'на следующей неделе', но процедура не названа и не ясна из истории, не смотри слоты и не делай handoff Ольге; коротко спроси, какая процедура интересует.",
@@ -375,7 +375,7 @@ class AvitoConsultant:
             return []
         query = " ".join(part for part in (message.text, message.listing.title if message.listing else "") if part)
         matches = self.expert_rag.search(query, limit=5, min_score=max(0.0, self.rag_handoff_threshold * 0.75))
-        return [answer.to_dict(score=score) for answer, score in matches]
+        return [answer.to_dict(score=score) for answer, score in matches if str(answer.risk_level or "").strip().lower() != "high"]
 
     def _answer_from_expert_rag(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
         if not context.retrieved_expert_answers:

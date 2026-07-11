@@ -4818,6 +4818,41 @@ async def test_avito_consultant_does_not_autoanswer_high_risk_expert_rag(tmp_pat
     assert reply.action != "expert_rag_answer"
 
 
+@pytest.mark.anyio
+async def test_avito_consultant_does_not_send_high_risk_expert_rag_to_planner(tmp_path) -> None:
+    seen_payload: dict[str, object] = {}
+
+    async def fake_codex_runner(payload, toolbox):
+        del toolbox
+        seen_payload.update(payload)
+        return None
+
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Можно делать процедуру после операции?",
+        answer_client="После операции процедуру можно делать только после разрешения врача.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    consultant = AvitoConsultant(
+        AutomationToolbox(DryRunYClientsGateway()),
+        planner=CodexAvitoPlanner(fake_codex_runner),
+        expert_rag=store,
+        rag_autoanswer_threshold=0.2,
+        rag_handoff_threshold=0.1,
+    )
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-risk-planner",
+        chat_id="chat-risk-planner",
+        text="Можно делать процедуру после операции?",
+    )
+
+    await consultant.respond(message)
+
+    assert seen_payload["retrieved_expert_answers"] == []
+
+
 def test_expert_rag_price_or_medical_answer_requires_review(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     item = store.upsert_from_handoff(
