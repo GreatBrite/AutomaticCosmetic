@@ -34,6 +34,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements.dev.txt -r requirements.integrations.txt
 
+      - name: Compile Python sources
+        run: python -m compileall -q src scripts
+
       - name: Run tests
         env:
           PYTHONPATH: ${{ github.workspace }}
