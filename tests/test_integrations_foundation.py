@@ -6544,6 +6544,47 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
     assert "No immediate action required" not in text
 
 
+def test_ops_status_human_summary_marks_high_risk_rag_as_excluded_from_avito_autoanswer(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Можно делать процедуру после операции?",
+        answer_client="После операции процедуру можно делать только после разрешения врача.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    text = format_ops_status_report(report)
+
+    assert report.summary["rag_high_risk_approved"] == 1
+    assert report.summary["rag_high_risk_excluded_from_avito_autoanswer"] == 1
+    assert "high_risk_approved=1 excluded_from_avito_autoanswer=1" in text
+
+
 def test_ops_status_exit_code_can_be_strict_for_warnings(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"

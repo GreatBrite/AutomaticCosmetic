@@ -214,6 +214,7 @@ def build_ops_status_report(
         "avito_unanswered_report_age_seconds": report_age,
         "rag_approved": rag_approved,
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
+        "rag_high_risk_excluded_from_avito_autoanswer": rag.get("approved_high_risk_count", 0),
         "rag_needs_review": rag_needs_review,
         "rag_needs_review_ids": rag_needs_review_ids,
         "data_total_bytes": data_total,
@@ -377,6 +378,7 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
         (
             f"RAG: approved={summary.get('rag_approved', 0)}"
             f" high_risk_approved={summary.get('rag_high_risk_approved', 0)}"
+            f" excluded_from_avito_autoanswer={summary.get('rag_high_risk_excluded_from_avito_autoanswer', 0)}"
             f" needs_review={summary.get('rag_needs_review', 0)}"
         ),
         (
