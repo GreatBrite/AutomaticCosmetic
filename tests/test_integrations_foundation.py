@@ -96,7 +96,7 @@ from src.freelance_leads_bot.integrations.models import (
     Slot,
     UpsellRule,
 )
-from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report, read_data_footprint
+from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report, read_data_footprint, read_disk_status
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
@@ -6349,6 +6349,15 @@ def test_ops_status_reports_data_footprint_warning(tmp_path) -> None:
     assert footprint["largest_entry"]["size_bytes"] == 80
 
 
+def test_ops_status_reports_disk_free_warning(tmp_path) -> None:
+    disk = read_disk_status(tmp_path, free_warning_bytes=10**18, free_warning_ratio=0.99)
+
+    assert disk["ok"] is False
+    assert disk["total_bytes"] > 0
+    assert disk["free_bytes"] > 0
+    assert 0 < disk["free_ratio"] <= 1
+
+
 def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"
@@ -6387,6 +6396,8 @@ def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
         data_path=data_path,
         data_warning_bytes=200,
         data_entry_warning_bytes=50,
+        disk_free_warning_bytes=1,
+        disk_free_warning_ratio=0.0,
         now=200,
     )
     text = format_ops_status_report(report)
@@ -6397,6 +6408,7 @@ def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
     assert data_check.severity == "warning"
     assert report.summary["data_total_bytes"] == 80
     assert "Data: total=80B" in text
+    assert "disk_free=" in text
     assert "data_footprint" in text
 
 

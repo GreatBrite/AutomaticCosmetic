@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -20,6 +21,8 @@ DEFAULT_UNANSWERED_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
 DEFAULT_DATA_PATH = Path("data")
 DEFAULT_DATA_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_DATA_ENTRY_WARNING_BYTES = 512 * 1024 * 1024
+DEFAULT_DISK_FREE_WARNING_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_DISK_FREE_WARNING_RATIO = 0.10
 
 DEFAULT_SERVICES = (
     "freelance-leads-bot.service",
@@ -60,6 +63,8 @@ def build_ops_status_report(
     data_path: Path = DEFAULT_DATA_PATH,
     data_warning_bytes: int = DEFAULT_DATA_WARNING_BYTES,
     data_entry_warning_bytes: int = DEFAULT_DATA_ENTRY_WARNING_BYTES,
+    disk_free_warning_bytes: int = DEFAULT_DISK_FREE_WARNING_BYTES,
+    disk_free_warning_ratio: float = DEFAULT_DISK_FREE_WARNING_RATIO,
     now: int | None = None,
 ) -> OpsStatusReport:
     settings = settings or IntegrationSettings.from_env()
@@ -175,6 +180,25 @@ def build_ops_status_report(
             data_footprint,
         )
     )
+    disk = read_disk_status(
+        data_path,
+        free_warning_bytes=disk_free_warning_bytes,
+        free_warning_ratio=disk_free_warning_ratio,
+    )
+    disk_ok = bool(disk.get("ok"))
+    free_bytes = int(disk.get("free_bytes") or 0)
+    free_ratio = float(disk.get("free_ratio") or 0.0)
+    checks.append(
+        OpsCheck(
+            "disk_free_space",
+            disk_ok,
+            "warning",
+            "Disk free space is within warning thresholds."
+            if disk_ok
+            else f"Disk free space is low: free={_format_bytes(free_bytes)} ({free_ratio:.1%}).",
+            disk,
+        )
+    )
 
     flags = safe_live_flags(settings)
     summary = {
@@ -188,6 +212,9 @@ def build_ops_status_report(
         "data_total_bytes": data_total,
         "data_largest_path": largest_entry.get("path", ""),
         "data_largest_bytes": largest_entry_size,
+        "disk_free_bytes": free_bytes,
+        "disk_total_bytes": int(disk.get("total_bytes") or 0),
+        "disk_free_ratio": free_ratio,
     }
     ok = all(check.ok or check.severity != "error" for check in checks)
     return OpsStatusReport(ok=ok, generated_at=generated_at, checks=tuple(checks), flags=flags, summary=summary)
@@ -339,6 +366,8 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f"Data: total={_format_bytes(int(summary.get('data_total_bytes') or 0))}"
             f" largest={summary.get('data_largest_path') or '-'}"
             f" {_format_bytes(int(summary.get('data_largest_bytes') or 0))}"
+            f" | disk_free={_format_bytes(int(summary.get('disk_free_bytes') or 0))}"
+            f" ({float(summary.get('disk_free_ratio') or 0.0):.1%})"
         ),
         (
             "Live flags: "
@@ -410,6 +439,52 @@ def read_data_footprint(
         "entry_warning_bytes": entry_warning_bytes,
         "top_entries": entries[: max(1, int(top_limit or 1))],
         "largest_entry": largest_entry,
+    }
+
+
+def read_disk_status(
+    path: Path,
+    *,
+    free_warning_bytes: int = DEFAULT_DISK_FREE_WARNING_BYTES,
+    free_warning_ratio: float = DEFAULT_DISK_FREE_WARNING_RATIO,
+) -> dict[str, Any]:
+    target = Path(path)
+    probe = target if target.exists() else target.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        usage = shutil.disk_usage(probe)
+    except OSError as exc:
+        return {
+            "ok": False,
+            "path": str(path),
+            "probe_path": str(probe),
+            "error": type(exc).__name__,
+            "total_bytes": 0,
+            "used_bytes": 0,
+            "free_bytes": 0,
+            "free_ratio": 0.0,
+            "free_warning_bytes": free_warning_bytes,
+            "free_warning_ratio": free_warning_ratio,
+        }
+    total = int(usage.total)
+    free = int(usage.free)
+    used = int(usage.used)
+    ratio = free / total if total > 0 else 0.0
+    ok = free >= int(free_warning_bytes) and ratio >= float(free_warning_ratio)
+    return {
+        "ok": ok,
+        "path": str(path),
+        "probe_path": str(probe),
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+        "free_ratio": ratio,
+        "total": _format_bytes(total),
+        "used": _format_bytes(used),
+        "free": _format_bytes(free),
+        "free_warning_bytes": int(free_warning_bytes),
+        "free_warning_ratio": float(free_warning_ratio),
     }
 
 
