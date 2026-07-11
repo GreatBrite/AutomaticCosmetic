@@ -135,6 +135,7 @@ from src.freelance_leads_bot.integrations.yclients import (
 )
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import APPROVED, NEEDS_REVIEW, ExpertRagStore
+from src.freelance_leads_bot.integrations.expert_rag_admin import ExpertRagAdminService, parse_rag_admin_callback
 from scripts.avito_unanswered_monitor import (
     _find_unanswered as find_unanswered_avito_chat,
     _report_item as report_unanswered_item,
@@ -4774,6 +4775,107 @@ def test_expert_rag_search_can_exclude_high_risk_answers(tmp_path) -> None:
     assert high_risk.risk_level == "high"
     assert store.search("Можно делать процедуру после операции?", min_score=0.1)
     assert store.search("Можно делать процедуру после операции?", min_score=0.1, exclude_risk_levels=("high",)) == []
+
+
+def test_expert_rag_admin_plans_price_increase_without_mutation_until_apply(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    original = store.upsert_from_handoff(
+        question="Сколько стоит увеличение ягодиц 600 мл?",
+        answer_client="600 мл как модель 100 000, стандартная стоимость 145 000.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    service = ExpertRagAdminService(
+        store,
+        plans_path=tmp_path / "plans.json",
+        audit_path=tmp_path / "audit.jsonl",
+    )
+
+    plan = service.plan_change("Подними цены на ягодицы на 10%", actor="olga")
+
+    assert plan.status == "pending"
+    assert plan.changes[0].source_id == original.id
+    assert "110 000" in plan.changes[0].new_answer
+    assert "159 500" in plan.changes[0].new_answer
+    assert store.get(original.id).status == APPROVED  # type: ignore[union-attr]
+
+    applied = service.apply_plan(plan.id, actor="olga")
+    applied_again = service.apply_plan(plan.id, actor="olga")
+
+    assert applied.status == "applied"
+    assert applied_again.metadata["created_ids"] == applied.metadata["created_ids"]
+    assert store.get(original.id).status == "deprecated"  # type: ignore[union-attr]
+    created = store.get(applied.metadata["created_ids"][0])
+    assert created is not None
+    assert created.status == APPROVED
+    assert "110 000" in created.answer_client
+    assert created.metadata["replaces_id"] == original.id
+    assert (tmp_path / "audit.jsonl").exists()
+
+
+def test_expert_rag_admin_policy_plan_creates_non_autoanswer_rule(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+
+    plan = service.plan_change("Не говори про очную консультацию, максимум онлайн с Ольгой", actor="olga")
+    applied = service.apply_plan(plan.id, actor="olga")
+    created = store.get(applied.metadata["created_ids"][0])
+
+    assert created is not None
+    assert created.status == APPROVED
+    assert created.metadata["autoanswer_allowed"] is False
+    assert "онлайн-разбор" in created.answer_client
+
+
+@pytest.mark.anyio
+async def test_automation_toolbox_expert_rag_plan_and_apply(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Сколько стоит увеличение ягодиц 600 мл?",
+        answer_client="600 мл 100 000.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    rag_admin = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), expert_rag_admin=rag_admin)
+
+    planned = await toolbox.execute("expert_rag.plan_change", {"command": "подними цены на ягодицы на 10%"})
+
+    assert planned.ok
+    plan_id = planned.data["plan"]["id"]
+    assert parse_rag_admin_callback(f"ragplan:{plan_id}:apply") == (plan_id, "apply")
+    applied = await toolbox.execute("expert_rag.apply_plan", {"plan_id": plan_id})
+    assert applied.ok
+    assert applied.data["plan"]["status"] == "applied"
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_excludes_autoanswer_disabled_expert_rag(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Что говорить про очную консультацию?",
+        answer_client="Не рекомендовать очную консультацию по умолчанию.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": False},
+    )
+    consultant = AvitoConsultant(
+        AutomationToolbox(DryRunYClientsGateway()),
+        expert_rag=store,
+        rag_autoanswer_threshold=0.1,
+        rag_handoff_threshold=0.1,
+    )
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-policy-rag",
+        chat_id="chat-policy-rag",
+        text="Нужна очная консультация?",
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action != "expert_rag_answer"
 
 
 @pytest.mark.anyio

@@ -24,6 +24,7 @@ from .avito_read import AvitoReadGateway
 from .avito_sender import AvitoSender
 from .handoff_refs import update_latest_handoff_for_chat
 from .city_schedule import CityScheduleStore
+from .expert_rag_admin import ExpertRagAdminService, format_rag_admin_plan
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,7 @@ class AutomationToolbox:
         role_profile: RoleProfile | None = None,
         history_store: LeadStore | None = None,
         operations_notifier: HandoffNotifier | None = None,
+        expert_rag_admin: ExpertRagAdminService | None = None,
     ) -> None:
         self.booking = booking
         self.knowledge = knowledge or JsonKnowledgeStore()
@@ -194,6 +196,7 @@ class AutomationToolbox:
         self.role_profile = role_profile
         self.history_store = history_store
         self.operations_notifier = operations_notifier
+        self.expert_rag_admin = expert_rag_admin
         self._tool_specs = _tool_specs(enable_workspace_tools=enable_workspace_tools or bool(role_profile and role_profile.allow_workspace_tools))
         if role_profile:
             self._tool_specs = {name: spec for name, spec in self._tool_specs.items() if role_profile.allows_tool(name)}
@@ -366,6 +369,8 @@ class AutomationToolbox:
                 return await self._execute_workspace(name, args)
             if name.startswith("knowledge."):
                 return self._execute_knowledge(name, args)
+            if name.startswith("expert_rag."):
+                return self._execute_expert_rag(name, args)
             return ToolResult(ok=False, error=f"unknown tool: {name}")
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
@@ -751,6 +756,50 @@ class AutomationToolbox:
         if name == "knowledge.delete":
             deleted = self.knowledge.delete(str(args["id"]))
             return ToolResult(ok=deleted, data={"deleted": deleted})
+        return ToolResult(ok=False, error=f"unknown tool: {name}")
+
+    def _execute_expert_rag(self, name: str, args: dict[str, Any]) -> ToolResult:
+        if not self.expert_rag_admin:
+            return ToolResult(ok=False, error="Expert RAG admin service is not configured")
+        if name == "expert_rag.search":
+            items = self.expert_rag_admin.search(
+                str(args.get("query") or ""),
+                status=str(args.get("status") or "approved"),
+                limit=_bounded_int(args.get("limit"), default=10, minimum=1, maximum=50),
+            )
+            return ToolResult(ok=True, data={"items": [item.to_dict() for item in items]})
+        if name == "expert_rag.review.list":
+            items = self.expert_rag_admin.store.list_answers(
+                status=str(args.get("status") or "needs_review"),
+                limit=_bounded_int(args.get("limit"), default=10, minimum=1, maximum=50),
+            )
+            return ToolResult(ok=True, data={"items": [item.to_dict() for item in items]})
+        if name == "expert_rag.plan_change":
+            plan = self.expert_rag_admin.plan_change(
+                str(args.get("command") or ""),
+                query=str(args.get("query") or ""),
+                actor=str(args.get("actor") or "olga"),
+                status=str(args.get("status") or "approved"),
+                limit=_bounded_int(args.get("limit"), default=20, minimum=1, maximum=100),
+            )
+            return ToolResult(ok=True, data={"plan": plan.to_dict(), "text": format_rag_admin_plan(plan)})
+        if name == "expert_rag.apply_plan":
+            plan = self.expert_rag_admin.apply_plan(str(args["plan_id"]), actor=str(args.get("actor") or "olga"))
+            return ToolResult(ok=True, data={"plan": plan.to_dict(), "text": format_rag_admin_plan(plan, details=True)})
+        if name == "expert_rag.deprecate":
+            command = str(args.get("command") or "это устарело")
+            ids = [int(item_id) for item_id in args.get("ids") or [] if str(item_id).strip().isdigit()]
+            if ids:
+                for item_id in ids:
+                    self.expert_rag_admin.store.deprecate(item_id)
+                return ToolResult(ok=True, data={"deprecated_ids": ids})
+            plan = self.expert_rag_admin.plan_change(
+                command,
+                query=str(args.get("query") or ""),
+                actor=str(args.get("actor") or "olga"),
+                status=str(args.get("status") or "approved"),
+            )
+            return ToolResult(ok=True, data={"plan": plan.to_dict(), "text": format_rag_admin_plan(plan)})
         return ToolResult(ok=False, error=f"unknown tool: {name}")
 
     async def _execute_avito_chats_list(self, args: dict[str, Any]) -> ToolResult:
@@ -1247,6 +1296,49 @@ def _tool_specs(*, enable_workspace_tools: bool = False) -> dict[str, ToolSpec]:
             required=("id",),
             properties={"id": "Knowledge item id."},
             mutates=True,
+        ),
+        "expert_rag.search": ToolSpec(
+            name="expert_rag.search",
+            description="Search Olga-approved expert RAG answers by free text, service, city, price wording, or policy topic.",
+            properties={"query": "Free-text search query.", "status": "Status filter, default approved.", "limit": "Max items, 1-50."},
+            guardrail="Internal lookup only. Do not expose RAG ids or raw metadata to clients.",
+        ),
+        "expert_rag.review.list": ToolSpec(
+            name="expert_rag.review.list",
+            description="List expert RAG items waiting for Olga/admin review.",
+            properties={"status": "Status filter, default needs_review.", "limit": "Max items, 1-50."},
+            guardrail="Internal review only.",
+        ),
+        "expert_rag.plan_change": ToolSpec(
+            name="expert_rag.plan_change",
+            description=(
+                "Build a non-mutating plan from Olga's free-form RAG command, e.g. 'подними цены на ягодицы на 10%', "
+                "'это устарело', 'не говори про очную консультацию'."
+            ),
+            required=("command",),
+            properties={
+                "command": "Original Olga/admin instruction.",
+                "query": "Optional narrower search query, e.g. service/city.",
+                "actor": "olga or admin.",
+                "status": "Source status, default approved.",
+                "limit": "Max source items, 1-100.",
+            },
+            guardrail="Never treats a plan as applied. Show it to Olga/admin for confirmation before apply_plan.",
+        ),
+        "expert_rag.apply_plan": ToolSpec(
+            name="expert_rag.apply_plan",
+            description="Apply a previously confirmed expert RAG admin plan.",
+            required=("plan_id",),
+            properties={"plan_id": "Pending RAG admin plan id.", "actor": "Who confirmed the plan."},
+            mutates=True,
+            guardrail="Use only after Olga/admin explicitly confirms the displayed plan.",
+        ),
+        "expert_rag.deprecate": ToolSpec(
+            name="expert_rag.deprecate",
+            description="Deprecate exact RAG ids or build a deprecation plan from a free-form command/query.",
+            properties={"ids": "Exact RAG ids to deprecate.", "command": "Free-form deprecation command.", "query": "Search query.", "actor": "olga or admin."},
+            mutates=True,
+            guardrail="Prefer plan_change for free-form deprecations; exact id deprecation requires explicit ids.",
         ),
     }
     if enable_workspace_tools:

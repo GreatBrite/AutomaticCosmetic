@@ -52,7 +52,7 @@ class MentorMemoryService:
                         source_message_id=str(context.get("source_message_id") or ""),
                         olga_reply_message_id=str(context.get("olga_reply_message_id") or ""),
                         approved_by=actor,
-                        metadata={"source": source, "actor": actor},
+                        metadata={"source": source, "actor": actor, "autoanswer_allowed": True},
                     )
                 )
         return MentorMemoryResult(created=result.created, expert_answers=expert_answers, skipped=result.skipped)

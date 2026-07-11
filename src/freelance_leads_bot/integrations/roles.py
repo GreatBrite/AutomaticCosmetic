@@ -107,6 +107,11 @@ ADMIN_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
         "workspace.logs.tail",
         "workspace.command.run",
         "workspace.python.run",
+        "expert_rag.search",
+        "expert_rag.plan_change",
+        "expert_rag.apply_plan",
+        "expert_rag.deprecate",
+        "expert_rag.review.list",
     }
 )
 
@@ -121,6 +126,11 @@ OLGA_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
         "avito.messages.send_file",
         "schedule.city.set",
         "schedule.city.delete",
+        "expert_rag.search",
+        "expert_rag.plan_change",
+        "expert_rag.apply_plan",
+        "expert_rag.deprecate",
+        "expert_rag.review.list",
     }
 )
 
