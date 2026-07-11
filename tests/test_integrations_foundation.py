@@ -96,7 +96,7 @@ from src.freelance_leads_bot.integrations.models import (
     Slot,
     UpsellRule,
 )
-from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report
+from src.freelance_leads_bot.integrations.ops_status import build_ops_status_report, format_ops_status_report, read_data_footprint
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
@@ -6331,6 +6331,73 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
     assert "avito_unanswered_queue" in text
     assert "avito_unanswered_report_fresh" in text
     assert "No immediate action required" not in text
+
+
+def test_ops_status_reports_data_footprint_warning(tmp_path) -> None:
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    (data_path / "small.log").write_bytes(b"a" * 10)
+    large_dir = data_path / "codex_chat"
+    large_dir.mkdir()
+    (large_dir / "trace.txt").write_bytes(b"b" * 80)
+
+    footprint = read_data_footprint(data_path, warning_bytes=200, entry_warning_bytes=50)
+
+    assert footprint["ok"] is False
+    assert footprint["total_bytes"] == 90
+    assert footprint["largest_entry"]["path"].endswith("codex_chat")
+    assert footprint["largest_entry"]["size_bytes"] == 80
+
+
+def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    data_path = tmp_path / "data"
+    data_path.mkdir()
+    (data_path / "agent_trace.jsonl").write_bytes(b"x" * 80)
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        data_path=data_path,
+        data_warning_bytes=200,
+        data_entry_warning_bytes=50,
+        now=200,
+    )
+    text = format_ops_status_report(report)
+
+    data_check = next(check for check in report.checks if check.name == "data_footprint")
+    assert report.ok is True
+    assert data_check.ok is False
+    assert data_check.severity == "warning"
+    assert report.summary["data_total_bytes"] == 80
+    assert "Data: total=80B" in text
+    assert "data_footprint" in text
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:

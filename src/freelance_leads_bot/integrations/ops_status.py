@@ -17,6 +17,9 @@ from .config import IntegrationSettings
 
 DEFAULT_UNANSWERED_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_UNANSWERED_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
+DEFAULT_DATA_PATH = Path("data")
+DEFAULT_DATA_WARNING_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_DATA_ENTRY_WARNING_BYTES = 512 * 1024 * 1024
 
 DEFAULT_SERVICES = (
     "freelance-leads-bot.service",
@@ -54,6 +57,9 @@ def build_ops_status_report(
     unanswered_report_path: Path = DEFAULT_UNANSWERED_REPORT_PATH,
     unanswered_state_path: Path = DEFAULT_UNANSWERED_STATE_PATH,
     rag_db_path: Path | None = None,
+    data_path: Path = DEFAULT_DATA_PATH,
+    data_warning_bytes: int = DEFAULT_DATA_WARNING_BYTES,
+    data_entry_warning_bytes: int = DEFAULT_DATA_ENTRY_WARNING_BYTES,
     now: int | None = None,
 ) -> OpsStatusReport:
     settings = settings or IntegrationSettings.from_env()
@@ -146,6 +152,30 @@ def build_ops_status_report(
         )
     )
 
+    data_footprint = read_data_footprint(
+        data_path,
+        warning_bytes=data_warning_bytes,
+        entry_warning_bytes=data_entry_warning_bytes,
+    )
+    data_total = int(data_footprint.get("total_bytes") or 0)
+    largest_entry = data_footprint.get("largest_entry") if isinstance(data_footprint.get("largest_entry"), dict) else {}
+    largest_entry_size = int(largest_entry.get("size_bytes") or 0)
+    data_ok = bool(data_footprint.get("ok"))
+    checks.append(
+        OpsCheck(
+            "data_footprint",
+            data_ok,
+            "warning",
+            "Data directory footprint is within warning thresholds."
+            if data_ok
+            else (
+                f"Data footprint needs attention: total={_format_bytes(data_total)}, "
+                f"largest={largest_entry.get('path') or '-'} {_format_bytes(largest_entry_size)}."
+            ),
+            data_footprint,
+        )
+    )
+
     flags = safe_live_flags(settings)
     summary = {
         "services_active": not inactive,
@@ -155,6 +185,9 @@ def build_ops_status_report(
         "rag_approved": rag_approved,
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
         "rag_needs_review": rag_needs_review,
+        "data_total_bytes": data_total,
+        "data_largest_path": largest_entry.get("path", ""),
+        "data_largest_bytes": largest_entry_size,
     }
     ok = all(check.ok or check.severity != "error" for check in checks)
     return OpsStatusReport(ok=ok, generated_at=generated_at, checks=tuple(checks), flags=flags, summary=summary)
@@ -303,6 +336,11 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f" needs_review={summary.get('rag_needs_review', 0)}"
         ),
         (
+            f"Data: total={_format_bytes(int(summary.get('data_total_bytes') or 0))}"
+            f" largest={summary.get('data_largest_path') or '-'}"
+            f" {_format_bytes(int(summary.get('data_largest_bytes') or 0))}"
+        ),
+        (
             "Live flags: "
             f"avito_send={_on_off(flags.get('avito_send_enabled'))}, "
             f"avito_codex={_on_off(flags.get('avito_codex_enabled'))}, "
@@ -330,6 +368,77 @@ def _health_check(name: str, payload: dict[str, Any], *, required_flags: tuple[s
 
 def _on_off(value: Any) -> str:
     return "on" if bool(value) else "off"
+
+
+def read_data_footprint(
+    path: Path,
+    *,
+    warning_bytes: int = DEFAULT_DATA_WARNING_BYTES,
+    entry_warning_bytes: int = DEFAULT_DATA_ENTRY_WARNING_BYTES,
+    top_limit: int = 8,
+) -> dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {
+            "exists": False,
+            "path": str(path),
+            "ok": True,
+            "total_bytes": 0,
+            "warning_bytes": warning_bytes,
+            "entry_warning_bytes": entry_warning_bytes,
+            "top_entries": [],
+            "largest_entry": {},
+        }
+    entries: list[dict[str, Any]] = []
+    total = 0
+    children = list(path.iterdir()) if path.is_dir() else [path]
+    for child in children:
+        size = _path_size(child)
+        total += size
+        entries.append({"path": str(child), "size_bytes": size, "size": _format_bytes(size), "is_dir": child.is_dir()})
+    entries.sort(key=lambda item: int(item.get("size_bytes") or 0), reverse=True)
+    largest_entry = entries[0] if entries else {}
+    largest_size = int(largest_entry.get("size_bytes") or 0)
+    ok = total <= warning_bytes and largest_size <= entry_warning_bytes
+    return {
+        "exists": True,
+        "path": str(path),
+        "ok": ok,
+        "total_bytes": total,
+        "total": _format_bytes(total),
+        "warning_bytes": warning_bytes,
+        "entry_warning_bytes": entry_warning_bytes,
+        "top_entries": entries[: max(1, int(top_limit or 1))],
+        "largest_entry": largest_entry,
+    }
+
+
+def _path_size(path: Path) -> int:
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += int(child.stat().st_size)
+        except OSError:
+            continue
+    return total
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, int(value or 0)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)}B"
+            return f"{size:.1f}{unit}"
+        size /= 1024
 
 
 def _read_json(path: Path) -> dict[str, Any]:
