@@ -120,12 +120,23 @@ def build_ops_status_report(
     )
 
     rag = read_rag_status(rag_db)
+    rag_approved = int(rag.get("approved_count") or 0)
+    rag_needs_review = int(rag.get("needs_review_count") or 0)
     checks.append(
         OpsCheck(
             "expert_rag",
-            bool(rag.get("exists")) and int(rag.get("approved_count") or 0) > 0,
+            bool(rag.get("exists")) and rag_approved > 0,
             "warning",
-            "Expert RAG has approved answers." if int(rag.get("approved_count") or 0) > 0 else "Expert RAG has no approved answers.",
+            "Expert RAG has approved answers." if rag_approved > 0 else "Expert RAG has no approved answers.",
+            rag,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "expert_rag_needs_review",
+            rag_needs_review == 0,
+            "warning",
+            "No expert RAG items need review." if rag_needs_review == 0 else f"{rag_needs_review} expert RAG items need review.",
             rag,
         )
     )
@@ -136,8 +147,9 @@ def build_ops_status_report(
         "avito_actionable": actionable,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
-        "rag_approved": rag.get("approved_count", 0),
+        "rag_approved": rag_approved,
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
+        "rag_needs_review": rag_needs_review,
     }
     ok = all(check.ok or check.severity != "error" for check in checks)
     return OpsStatusReport(ok=ok, generated_at=generated_at, checks=tuple(checks), flags=flags, summary=summary)
@@ -283,6 +295,7 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
         (
             f"RAG: approved={summary.get('rag_approved', 0)}"
             f" high_risk_approved={summary.get('rag_high_risk_approved', 0)}"
+            f" needs_review={summary.get('rag_needs_review', 0)}"
         ),
         (
             "Live flags: "

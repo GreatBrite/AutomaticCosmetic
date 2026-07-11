@@ -6136,6 +6136,58 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
     assert "No immediate action required" not in text
 
 
+def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(rag_path)
+    store.upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    store.upsert_from_handoff(
+        question="Можно ли после операции?",
+        answer_client="Нужно уточнить у Ольги по анамнезу.",
+        status=NEEDS_REVIEW,
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    text = format_ops_status_report(report)
+
+    review_check = next(check for check in report.checks if check.name == "expert_rag_needs_review")
+    assert report.ok is True
+    assert review_check.ok is False
+    assert review_check.severity == "warning"
+    assert report.summary["rag_needs_review"] == 1
+    assert "AutomaticCosmetic ops: WARN" in text
+    assert "needs_review=1" in text
+    assert "expert_rag_needs_review" in text
+
+
 def test_vk_update_is_converted_to_shared_inbound_message() -> None:
     update = {
         "type": "message_new",
