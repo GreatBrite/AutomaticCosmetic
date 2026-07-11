@@ -24,9 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
     approve_parser = subparsers.add_parser("approve", help="Approve an expert answer for retrieval.")
     approve_parser.add_argument("id", type=int)
     approve_parser.add_argument("--by", default="olga", help="Approver name.")
+    approve_parser.add_argument("--dry-run", action="store_true", help="Show what would be approved without changing the database.")
 
     deprecate_parser = subparsers.add_parser("deprecate", help="Deprecate an expert answer.")
     deprecate_parser.add_argument("id", type=int)
+    deprecate_parser.add_argument("--dry-run", action="store_true", help="Show what would be deprecated without changing the database.")
 
     export_parser = subparsers.add_parser("export", help="Export review backlog for Olga approval.")
     export_parser.add_argument("--status", default=NEEDS_REVIEW, help="Status to export; default: needs_review.")
@@ -52,6 +54,12 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         return 0, _json_or_text(args.json, item.to_dict(), _format_item(item))
 
     if args.command == "approve":
+        if args.dry_run:
+            item = store.get(args.id)
+            if not item:
+                return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
+            payload = {"ok": True, "dry_run": True, "action": "approve", "approved_by": args.by, "item": item.to_dict()}
+            return 0, _json_or_text(args.json, payload, _format_dry_run(item, action="approve", approved_by=args.by))
         try:
             item = store.approve(args.id, approved_by=args.by)
         except KeyError:
@@ -59,6 +67,12 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         return 0, _json_or_text(args.json, {"ok": True, "item": item.to_dict()}, f"Approved expert RAG item {item.id} by {item.approved_by}.")
 
     if args.command == "deprecate":
+        if args.dry_run:
+            item = store.get(args.id)
+            if not item:
+                return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
+            payload = {"ok": True, "dry_run": True, "action": "deprecate", "item": item.to_dict()}
+            return 0, _json_or_text(args.json, payload, _format_dry_run(item, action="deprecate"))
         changed = store.deprecate(args.id)
         if not changed:
             return 1, _json_or_text(args.json, {"ok": False, "error": "not_found", "id": args.id}, f"Expert RAG item {args.id} not found.")
@@ -158,11 +172,34 @@ def _format_export_markdown(items: list[ExpertAnswer], *, status: str) -> str:
                 "Decision commands:",
                 "",
                 "```bash",
+                f"python -m src.freelance_leads_bot.integrations.expert_rag_review approve {item.id} --by olga --dry-run",
                 f"python -m src.freelance_leads_bot.integrations.expert_rag_review approve {item.id} --by olga",
+                f"python -m src.freelance_leads_bot.integrations.expert_rag_review deprecate {item.id} --dry-run",
                 f"python -m src.freelance_leads_bot.integrations.expert_rag_review deprecate {item.id}",
                 "```",
             ]
         )
+    return "\n".join(lines)
+
+
+def _format_dry_run(item: ExpertAnswer, *, action: str, approved_by: str = "") -> str:
+    target = "approved" if action == "approve" else "deprecated"
+    lines = [
+        f"DRY RUN: expert RAG item #{item.id} would become {target}.",
+        f"Current status: {item.status}",
+    ]
+    if approved_by:
+        lines.append(f"Approved by would be: {approved_by}")
+    lines.extend(
+        [
+            "",
+            "Question:",
+            item.question_canonical or "-",
+            "",
+            "Client answer:",
+            item.answer_client or "-",
+        ]
+    )
     return "\n".join(lines)
 
 

@@ -4854,6 +4854,34 @@ def test_expert_rag_review_cli_lists_shows_and_updates_items(tmp_path) -> None:
     assert store.get(stale_item.id).status == "deprecated"  # type: ignore[union-attr]
 
 
+def test_expert_rag_review_cli_dry_run_does_not_mutate_items(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(db_path)
+    approve_item = store.upsert_from_handoff(
+        question="Сколько стоит увеличение губ?",
+        answer_client="Увеличение губ стоит 10000 ₽.",
+        status=NEEDS_REVIEW,
+    )
+    deprecate_item = store.upsert_from_handoff(
+        question="Старая цена?",
+        answer_client="Старая цена не актуальна.",
+        status=NEEDS_REVIEW,
+    )
+
+    code, output = run_review_command(["--db", str(db_path), "approve", str(approve_item.id), "--by", "olga", "--dry-run"])
+    assert code == 0
+    assert "DRY RUN" in output
+    assert "would become approved" in output
+    assert store.get(approve_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+
+    code, output = run_review_command(["--db", str(db_path), "--json", "deprecate", str(deprecate_item.id), "--dry-run"])
+    payload = json.loads(output)
+    assert code == 0
+    assert payload["dry_run"] is True
+    assert payload["action"] == "deprecate"
+    assert store.get(deprecate_item.id).status == NEEDS_REVIEW  # type: ignore[union-attr]
+
+
 def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     db_path = tmp_path / "expert.sqlite3"
     export_path = tmp_path / "review.md"
@@ -4872,7 +4900,9 @@ def test_expert_rag_review_cli_exports_backlog_for_approval(tmp_path) -> None:
     assert "# Expert RAG review backlog: needs_review" in output
     assert f"## #{item.id}" in output
     assert "Candidate client answer:" in output
+    assert f"approve {item.id} --by olga --dry-run" in output
     assert f"approve {item.id} --by olga" in output
+    assert f"deprecate {item.id} --dry-run" in output
     assert f"deprecate {item.id}" in output
 
     code, output = run_review_command(["--db", str(db_path), "--json", "export"])
