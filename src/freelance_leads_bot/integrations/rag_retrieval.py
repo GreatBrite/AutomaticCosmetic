@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +48,7 @@ class RagRetrievalService:
     def retrieve(self, request: RagRetrievalRequest) -> RagRetrievalResult:
         query = " ".join(part for part in (request.text, request.service_hint, request.service_key) if part)
         service_filter = self._service_filter(request)
+        request_blocker = _request_autoanswer_blocker(request, service_filter)
         matches = self.store.search(
             query,
             status=APPROVED,
@@ -72,11 +74,13 @@ class RagRetrievalService:
         confidence = float(answers[0].get("score") or 0) if answers else 0.0
         if _price_conflict(answers[:3]):
             conflicts.append("price_conflict")
+        if request_blocker:
+            conflicts.append(request_blocker)
         return RagRetrievalResult(
             answers=tuple(answers),
             confidence=confidence,
             safe_for_autoanswer=bool(answers and not conflicts),
-            handoff_reason="conflict" if conflicts else ("" if answers else "no_approved_knowledge"),
+            handoff_reason=_handoff_reason(conflicts, answers),
             conflicts=tuple(conflicts),
         )
 
@@ -138,7 +142,32 @@ def _price_conflict(answers: list[dict[str, Any]]) -> bool:
     prices: set[str] = set()
     for answer in answers:
         text = str(answer.get("answer_client") or "")
-        found = tuple(sorted(__import__("re").findall(r"\b\d[\d\s]{3,}\b", text)))
+        found = tuple(sorted(re.findall(r"\b\d[\d\s]{3,}\b", text)))
         if found:
             prices.add("|".join(found))
     return len(prices) > 1
+
+
+def _request_autoanswer_blocker(request: RagRetrievalRequest, service_filter: str) -> str:
+    text = str(request.text or "").casefold().replace("ё", "е")
+    if re.search(r"беремен|кормлен|аллерг|осложн|отек|боль|температур|гной|инфекц|операц|онколог|эпилеп|диабет", text):
+        return "risk_case"
+    if re.search(r"\b(встреч|прием|приём|личн|очно|очная)\b", text) and not service_filter:
+        return "personal_meeting_without_service"
+    if request.city == "" and re.search(r"\b(адрес|слот|запис|окн|время|когда|город)\b", text):
+        return "city_required"
+    return ""
+
+
+def _handoff_reason(conflicts: list[str], answers: list[dict[str, Any]]) -> str:
+    if not answers:
+        return "no_approved_knowledge"
+    if not conflicts:
+        return ""
+    if "risk_case" in conflicts:
+        return "risk_case"
+    if "personal_meeting_without_service" in conflicts:
+        return "booking_ambiguous"
+    if "city_required" in conflicts:
+        return "city_required"
+    return "conflict"

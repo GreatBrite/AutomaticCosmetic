@@ -136,6 +136,7 @@ from src.freelance_leads_bot.integrations.yclients import (
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import APPROVED, NEEDS_REVIEW, ExpertRagStore
 from src.freelance_leads_bot.integrations.expert_rag_admin import ExpertRagAdminService, parse_rag_admin_callback
+from src.freelance_leads_bot.integrations.openrouter_intent import OpenRouterIntentClient
 from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntentParser
 from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
 from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
@@ -4894,6 +4895,67 @@ def test_rag_admin_intent_parser_understands_freeform_price_language() -> None:
     assert intent.intent == "price_percent_change"
     assert intent.scope["service"] == "ягодицы"
     assert intent.operation["value"] == 10
+    assert intent.parser_source == "fallback"
+
+
+def test_rag_admin_intent_parser_uses_llm_json_and_falls_back_on_timeout() -> None:
+    def llm(prompt: str) -> str:
+        assert "structured intent" in prompt or "structured intent" in prompt.lower()
+        return json.dumps(
+            {
+                "intent": "effect_duration_update",
+                "confidence": 0.91,
+                "scope": {"product": "Tesoro Body"},
+                "operation": {"type": "set_effect_duration", "value": "3 лет"},
+                "risk_flags": ["effect_duration"],
+            },
+            ensure_ascii=False,
+        )
+
+    parsed = RagAdminIntentParser(llm=llm).parse("Tesoro теперь до 3 лет")
+
+    assert parsed.intent == "effect_duration_update"
+    assert parsed.operation["value"] == "3 лет"
+    assert parsed.parser_source == "llm"
+
+    def timeout(_prompt: str) -> str:
+        raise TimeoutError("slow")
+
+    fallback = RagAdminIntentParser(llm=timeout).parse("Tesoro теперь до 3 лет")
+
+    assert fallback.intent == "effect_duration_update"
+    assert fallback.parser_source == "fallback"
+
+
+def test_openrouter_intent_client_extracts_message_text() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"intent": "policy_update", "confidence": 0.9}, ensure_ascii=False)
+                        }
+                    }
+                ]
+            },
+        )
+
+    client = OpenRouterIntentClient(
+        api_key="key",
+        model="model",
+        client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://openrouter.test"),
+    )
+
+    raw = client("Команда")
+
+    assert json.loads(raw)["intent"] == "policy_update"
+    assert requests
+    assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
 
 
 def test_expert_rag_admin_exact_price_and_service_lifecycle(tmp_path) -> None:
@@ -4945,6 +5007,28 @@ def test_service_delete_soft_deletes_and_excludes_from_shared_retrieval(tmp_path
     assert result.answers == ()
 
 
+def test_service_catalog_seed_and_rag_service_key_migration(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.seed_defaults()
+    answer = store.upsert_from_handoff(
+        question="Сколько держится Tesoro Body для попы?",
+        answer_client="Tesoro Body для ягодиц держится до 4 лет.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+
+    plan = catalog.plan_expert_rag_service_key_migration(store, limit=100)
+    updated_ids = catalog.apply_expert_rag_service_key_migration(store, plan)
+    updated = store.get(answer.id)
+
+    assert catalog.resolve("по попе").service_key == "yagodicy"  # type: ignore[union-attr]
+    assert updated_ids == [answer.id]
+    assert updated is not None
+    assert updated.metadata["service_key"] == "yagodicy"
+
+
 def test_shared_rag_retrieval_filters_by_channel_visibility_and_policy(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     catalog = ServiceCatalogStore(tmp_path / "services.json")
@@ -4965,6 +5049,73 @@ def test_shared_rag_retrieval_filters_by_channel_visibility_and_policy(tmp_path)
     assert avito.answers
     assert telegram.answers
     assert vk.answers == ()
+
+
+def test_shared_rag_retrieval_blocks_unsafe_autoanswer_but_keeps_similar_answers(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="guby", title="Губы", aliases=("губы",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="Сколько стоят губы?",
+        answer_client="Губы стоят 20 000.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "guby", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="После губ аллергия, сколько стоят губы?", min_score=0.0)
+    )
+
+    assert result.safe_for_autoanswer is False
+    assert result.handoff_reason == "risk_case"
+    assert "risk_case" in result.conflicts
+    assert result.answers
+
+
+@pytest.mark.anyio
+async def test_telegram_rag_plan_cancel_and_details_callbacks(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.callbacks = []
+
+        def send_message(self, chat_id, text, **delivery_params):
+            self.messages.append((chat_id, text, delivery_params))
+
+        def answer_callback_query(self, callback_id, text):
+            self.callbacks.append((callback_id, text))
+
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Сколько стоит увеличение ягодиц 600 мл?",
+        answer_client="600 мл 100 000.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    rag_admin = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+    plan = rag_admin.plan_change("подними цены на ягодицы на 10%")
+    settings = replace(_settings(), telegram_admin_history_db_path=tmp_path / "history.sqlite3")
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), expert_rag_admin=rag_admin)
+    transport = TelegramAdminBotTransport(FakeBot(), CodexTelegramAdminService(toolbox, settings), settings)
+    update = {
+        "callback_query": {
+            "id": "cb-1",
+            "from": {"id": 1},
+            "data": f"ragplan:{plan.id}:details",
+            "message": {"chat": {"id": "10"}},
+        }
+    }
+
+    details = await transport.handle_callback_update(update)
+    update["callback_query"]["id"] = "cb-2"
+    update["callback_query"]["data"] = f"ragplan:{plan.id}:cancel"
+    cancelled = await transport.handle_callback_update(update)
+
+    assert details["ok"] is True
+    assert cancelled["ok"] is True
+    assert rag_admin.get_plan(plan.id).status == "cancelled"  # type: ignore[union-attr]
+    assert store.list_answers(status=APPROVED, limit=10)[0].answer_client == "600 мл 100 000."
 
 
 @pytest.mark.anyio

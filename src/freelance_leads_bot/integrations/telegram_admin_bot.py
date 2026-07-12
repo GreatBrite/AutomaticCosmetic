@@ -32,7 +32,7 @@ from .expert_rag_admin import (
     rag_admin_plan_from_dict,
     rag_admin_plan_keyboard,
 )
-from .rag_admin_intent import RagAdminIntentParser
+from .runtime import rag_admin_intent_parser_from_settings
 from .roles import CodexRole, conversation_key, role_profile, telegram_role_for_user
 from .service_catalog import ServiceCatalogStore
 from .yclients import DryRunYClientsGateway, LiveReadDryRunYClientsGateway, YClientsGateway, YClientsHttpGateway
@@ -497,7 +497,7 @@ def build_telegram_admin_transport(
         expert_rag_admin = (
             ExpertRagAdminService(
                 ExpertRagStore(settings.rag_expert_db_path),
-                intent_parser=RagAdminIntentParser(enabled=settings.rag_dynamic_intent_enabled),
+                intent_parser=rag_admin_intent_parser_from_settings(settings),
                 service_catalog=ServiceCatalogStore(settings.rag_service_catalog_path),
             )
             if settings.rag_retrieval_enabled
@@ -652,6 +652,21 @@ def _looks_like_rag_admin_command(text: str) -> bool:
     return any(
         marker in lowered
         for marker in (
+            "подними цены",
+            "поднять цены",
+            "цены на",
+            "теперь стоит",
+            "теперь до",
+            "tesoro теперь",
+            "тесоро теперь",
+            "добавь услугу",
+            "новая услуга",
+            "теперь делаем",
+            "больше не делаем",
+            "отключи услугу",
+            "скрой услугу",
+            "удали услугу",
+            "переименуй",
             "это устарело",
             "цена устарела",
             "цены устарели",

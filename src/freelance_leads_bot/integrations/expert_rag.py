@@ -216,6 +216,21 @@ class ExpertRagStore:
             )
         return cursor.rowcount > 0
 
+    def update_metadata(self, item_id: int, metadata: dict[str, Any]) -> ExpertAnswer:
+        existing = self.get(item_id)
+        if not existing:
+            raise KeyError(f"expert answer {item_id} not found")
+        merged = {**(existing.metadata or {}), **metadata}
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE expert_answers SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False, sort_keys=True), _now(), item_id),
+            )
+        updated = self.get(item_id)
+        if not updated:
+            raise KeyError(f"expert answer {item_id} not found after metadata update")
+        return updated
+
     def get(self, item_id: int) -> ExpertAnswer | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM expert_answers WHERE id = ?", (item_id,)).fetchone()

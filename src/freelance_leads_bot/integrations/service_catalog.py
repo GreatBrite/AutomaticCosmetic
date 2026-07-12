@@ -7,12 +7,49 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .expert_rag import APPROVED, ExpertAnswer, ExpertRagStore
+
 
 DEFAULT_SERVICE_CATALOG_PATH = Path("data/service_catalog.json")
 ACTIVE = "active"
 HIDDEN = "hidden"
 DEPRECATED = "deprecated"
 DELETED = "deleted"
+DEFAULT_CHANNEL_VISIBILITY = ("avito", "telegram_client", "vk")
+DEFAULT_SERVICE_CATALOG_SEED: tuple[dict[str, Any], ...] = (
+    {
+        "service_key": "guby",
+        "title": "Увеличение губ",
+        "aliases": ("губы", "увеличение губ", "контурная пластика губ"),
+        "products": ("Корея", "Juvederm", "Stylage", "Revolax"),
+    },
+    {
+        "service_key": "grud",
+        "title": "Коррекция/увеличение груди филлером",
+        "aliases": ("грудь", "увеличение груди", "коррекция груди", "асимметрия груди"),
+    },
+    {
+        "service_key": "yagodicy",
+        "title": "Увеличение ягодиц",
+        "aliases": ("ягодицы", "попа", "попе", "попу", "увеличение ягодиц"),
+        "products": ("Tesoro Body", "Тесоро Body"),
+    },
+    {
+        "service_key": "botoks",
+        "title": "Ботокс / ботулинотерапия",
+        "aliases": ("ботокс", "ботулинотерапия", "диспорт"),
+    },
+    {
+        "service_key": "kozha_golovy",
+        "title": "Процедуры для кожи головы",
+        "aliases": ("кожа головы", "волосы", "выпадение волос", "ломкость волос"),
+    },
+    {
+        "service_key": "online_consultation",
+        "title": "Онлайн-консультация с Ольгой",
+        "aliases": ("онлайн консультация", "онлайн-консультация", "онлайн разбор", "онлайн-разбор"),
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +157,61 @@ class ServiceCatalogStore:
         self._save([updated if row.service_key == item.service_key else row for row in items])
         return updated
 
+    def seed_defaults(self, *, overwrite: bool = False) -> list[ServiceCatalogItem]:
+        seeded: list[ServiceCatalogItem] = []
+        for row in DEFAULT_SERVICE_CATALOG_SEED:
+            service_key = str(row["service_key"])
+            if self.get(service_key) and not overwrite:
+                continue
+            seeded.append(
+                self.upsert(
+                    service_key=service_key,
+                    title=str(row["title"]),
+                    aliases=tuple(row.get("aliases") or ()),
+                    products=tuple(row.get("products") or ()),
+                    status=ACTIVE,
+                    visibility=DEFAULT_CHANNEL_VISIBILITY,
+                    metadata={"source": "default_seed"},
+                )
+            )
+        return seeded
+
+    def plan_expert_rag_service_key_migration(
+        self,
+        store: ExpertRagStore,
+        *,
+        status: str = APPROVED,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for item in store.list_answers(status=status, limit=limit):
+            current = service_catalog_from_rag_metadata(item.metadata or {})
+            resolved = self.resolve(_answer_service_text(item))
+            if not resolved or current == resolved.service_key:
+                continue
+            plan.append(
+                {
+                    "id": item.id,
+                    "question": item.question_canonical,
+                    "answer": item.answer_client,
+                    "old_service_key": current,
+                    "new_service_key": resolved.service_key,
+                    "service_title": resolved.title,
+                }
+            )
+        return plan
+
+    def apply_expert_rag_service_key_migration(self, store: ExpertRagStore, plan: list[dict[str, Any]]) -> list[int]:
+        updated_ids: list[int] = []
+        for row in plan:
+            item_id = int(row.get("id") or 0)
+            service_key = str(row.get("new_service_key") or "").strip()
+            if not item_id or not service_key:
+                continue
+            store.update_metadata(item_id, {"service_key": service_key, "service_catalog_migrated_at": _now()})
+            updated_ids.append(item_id)
+        return updated_ids
+
     def _load(self) -> list[ServiceCatalogItem]:
         if not self.path.exists():
             return []
@@ -161,6 +253,20 @@ def normalize_service_key(text: str) -> str:
 
 def service_catalog_from_rag_metadata(metadata: dict[str, Any]) -> str:
     return str(metadata.get("service_key") or "").strip()
+
+
+def _answer_service_text(item: ExpertAnswer) -> str:
+    metadata = item.metadata or {}
+    return " ".join(
+        str(part or "")
+        for part in (
+            metadata.get("service_key"),
+            item.service,
+            item.topic,
+            item.question_canonical,
+            item.answer_client,
+        )
+    )
 
 
 def _match_score(haystack: str, candidate: str) -> int:
