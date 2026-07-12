@@ -32,7 +32,9 @@ from .expert_rag_admin import (
     rag_admin_plan_from_dict,
     rag_admin_plan_keyboard,
 )
+from .rag_admin_intent import RagAdminIntentParser
 from .roles import CodexRole, conversation_key, role_profile, telegram_role_for_user
+from .service_catalog import ServiceCatalogStore
 from .yclients import DryRunYClientsGateway, LiveReadDryRunYClientsGateway, YClientsGateway, YClientsHttpGateway
 
 
@@ -492,7 +494,15 @@ def build_telegram_admin_transport(
     booking = booking or _booking_from_settings(settings)
     history_store = LeadStore(settings.telegram_admin_history_db_path)
     if settings.telegram_admin_codex_enabled:
-        expert_rag_admin = ExpertRagAdminService(ExpertRagStore(settings.rag_expert_db_path)) if settings.rag_retrieval_enabled else None
+        expert_rag_admin = (
+            ExpertRagAdminService(
+                ExpertRagStore(settings.rag_expert_db_path),
+                intent_parser=RagAdminIntentParser(enabled=settings.rag_dynamic_intent_enabled),
+                service_catalog=ServiceCatalogStore(settings.rag_service_catalog_path),
+            )
+            if settings.rag_retrieval_enabled
+            else None
+        )
         toolbox = AutomationToolbox(
             booking,
             avito=avito_read_client_from_settings(settings),

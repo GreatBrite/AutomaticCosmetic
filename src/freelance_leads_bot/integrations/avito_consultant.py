@@ -12,6 +12,7 @@ from .avito import avito_photo_handoff
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
 from .config import DEFAULT_CITIES
 from .expert_rag import ExpertRagStore
+from .rag_retrieval import RagRetrievalService
 from .models import Handoff, HandoffReason, InboundMessage, Service, Slot
 from .roles import CodexRole, RoleProfile, conversation_key, role_profile
 
@@ -220,6 +221,7 @@ class AvitoConsultant:
         planner: AvitoAgentPlanner | None = None,
         profile: RoleProfile | None = None,
         expert_rag: ExpertRagStore | None = None,
+        rag_retrieval: RagRetrievalService | None = None,
         rag_autoanswer_threshold: float = 0.82,
         rag_handoff_threshold: float = 0.65,
     ) -> None:
@@ -228,6 +230,7 @@ class AvitoConsultant:
         self.planner = planner
         self.profile = profile or role_profile(CodexRole.AVITO_CLIENT)
         self.expert_rag = expert_rag
+        self.rag_retrieval = rag_retrieval
         self.rag_autoanswer_threshold = rag_autoanswer_threshold
         self.rag_handoff_threshold = rag_handoff_threshold
         self.booking_flow = AvitoBookingFlow(toolbox.booking, cities=cities, allow_create=False)
@@ -371,6 +374,13 @@ class AvitoConsultant:
         return items
 
     def _retrieved_expert_answers(self, message: InboundMessage) -> list[dict[str, Any]]:
+        if self.rag_retrieval:
+            result = self.rag_retrieval.retrieve_for_message(
+                message,
+                min_score=max(0.0, self.rag_handoff_threshold * 0.75),
+                limit=5,
+            )
+            return list(result.answers)
         if not self.expert_rag:
             return []
         query = " ".join(part for part in (message.text, message.listing.title if message.listing else "") if part)
