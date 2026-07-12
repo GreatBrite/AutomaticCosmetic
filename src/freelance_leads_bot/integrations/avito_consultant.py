@@ -380,7 +380,7 @@ class AvitoConsultant:
             min_score=max(0.0, self.rag_handoff_threshold * 0.75),
             exclude_risk_levels=("high",),
         )
-        return [answer.to_dict(score=score) for answer, score in matches]
+        return [answer.to_dict(score=score) for answer, score in matches if _expert_answer_autoanswer_allowed(answer.to_dict())]
 
     def _answer_from_expert_rag(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
         if not context.retrieved_expert_answers:
@@ -390,6 +390,8 @@ class AvitoConsultant:
         answer = str(best.get("answer_client") or "").strip()
         risk_level = str(best.get("risk_level") or "").strip().lower()
         if risk_level == "high":
+            return None
+        if not _expert_answer_autoanswer_allowed(best):
             return None
         if not answer or score < self.rag_autoanswer_threshold:
             return None
@@ -739,6 +741,11 @@ def _normalize_handoff_summary(summary: str) -> str:
     for source, target in replacements.items():
         text = text.replace(source, target)
     return text
+
+
+def _expert_answer_autoanswer_allowed(answer: dict[str, Any]) -> bool:
+    metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
+    return metadata.get("autoanswer_allowed") is not False
 
 
 class _NoopBooking:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 from html import escape
@@ -24,6 +25,13 @@ from .config import IntegrationSettings
 from .handoff_notify import handoff_notifier_from_settings
 from .mentor_memory import MentorMemoryService
 from .expert_rag import ExpertRagStore
+from .expert_rag_admin import (
+    ExpertRagAdminService,
+    format_rag_admin_plan,
+    parse_rag_admin_callback,
+    rag_admin_plan_from_dict,
+    rag_admin_plan_keyboard,
+)
 from .roles import CodexRole, conversation_key, role_profile, telegram_role_for_user
 from .yclients import DryRunYClientsGateway, LiveReadDryRunYClientsGateway, YClientsGateway, YClientsHttpGateway
 
@@ -84,6 +92,12 @@ class TelegramAdminBotTransport:
         if command_result is not None:
             return command_result
 
+        reply_plan_id = _rag_plan_id_from_reply(message)
+        if reply_plan_id:
+            result = await self._handle_rag_plan_reply(reply_plan_id, text, chat_id, delivery_params)
+            if result is not None:
+                return result
+
         await self._send_chat_action(chat_id, delivery_params)
         live_drafts = TelegramLiveDraftStreamer(
             self.bot,
@@ -118,7 +132,17 @@ class TelegramAdminBotTransport:
                 "history_key": history_key,
                 "role": role.value,
             }
-        await self._send(chat_id, result.message, delivery_params)
+        rag_plan = _pending_rag_plan_from_result(result)
+        if rag_plan:
+            await asyncio.to_thread(
+                self.bot.send_message,
+                chat_id,
+                escape(format_rag_admin_plan(rag_plan, details=True)),
+                reply_markup=rag_admin_plan_keyboard(rag_plan.id),
+                **delivery_params,
+            )
+        else:
+            await self._send(chat_id, result.message, delivery_params)
         self._remember(history_key, "user", _history_user_content(text, attachments))
         self._remember(history_key, "assistant", _history_assistant_content(result))
         return {
@@ -132,6 +156,79 @@ class TelegramAdminBotTransport:
             "history_key": history_key,
             "role": role.value,
         }
+
+    async def handle_callback_update(self, update: dict[str, Any]) -> dict[str, Any]:
+        callback = update.get("callback_query") or {}
+        data = str(callback.get("data") or "")
+        parsed = parse_rag_admin_callback(data)
+        if not parsed:
+            return {"ok": True, "ignored": True, "reason": "not_rag_plan_callback"}
+        callback_id = str(callback.get("id") or "")
+        message = callback.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id") or "")
+        delivery_params = telegram_delivery_params(message, str(update.get("business_connection_id") or "").strip())
+        plan_id, action = parsed
+        user_id = _user_id(callback)
+        if not self._is_allowed(user_id):
+            if callback_id:
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Нет доступа")
+            return {"ok": False, "ignored": True, "reason": "forbidden", "user_id": user_id}
+        service = self._rag_admin_service()
+        if not service:
+            if callback_id:
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "RAG недоступен")
+            return {"ok": False, "action": "rag_plan_callback", "message": "Expert RAG admin is not configured"}
+        try:
+            if action == "apply":
+                plan = service.apply_plan(plan_id, actor="olga")
+                text = "Готово, применила изменения в RAG-памяти.\n\n" + format_rag_admin_plan(plan, details=True)
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Применено")
+                await self._send(chat_id, text, delivery_params)
+                return {"ok": True, "action": "rag_plan_apply", "plan_id": plan_id, "message": text}
+            if action == "cancel":
+                plan = service.cancel_plan(plan_id, actor="olga")
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Отменено")
+                text = "Ок, ничего не меняю в RAG-памяти."
+                await self._send(chat_id, text, delivery_params)
+                return {"ok": True, "action": "rag_plan_cancel", "plan_id": plan_id, "message": text, "plan": plan.to_dict() if plan else None}
+            if action == "details":
+                plan = service.get_plan(plan_id)
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Подробнее")
+                text = format_rag_admin_plan(plan, details=True) if plan else "План не найден."
+                await self._send(chat_id, text, delivery_params)
+                return {"ok": bool(plan), "action": "rag_plan_details", "plan_id": plan_id, "message": text}
+            if action == "edit":
+                await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Жду правку")
+                text = "Ответьте на эту карточку сообщением с правкой — я пересоберу план и снова попрошу подтверждение."
+                await self._send(chat_id, text, delivery_params)
+                return {"ok": True, "action": "rag_plan_edit_prompt", "plan_id": plan_id, "message": text}
+        except Exception as exc:
+            await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Не удалось")
+            text = f"Не удалось обработать RAG-план: {exc}"
+            await self._send(chat_id, text, delivery_params)
+            return {"ok": False, "action": "rag_plan_callback", "plan_id": plan_id, "message": text}
+        await asyncio.to_thread(self.bot.answer_callback_query, callback_id, "Неизвестное действие")
+        return {"ok": False, "action": "rag_plan_callback", "plan_id": plan_id, "message": "unknown action"}
+
+    async def _handle_rag_plan_reply(
+        self,
+        plan_id: str,
+        text: str,
+        chat_id: str,
+        delivery_params: dict[str, str],
+    ) -> dict[str, Any] | None:
+        service = self._rag_admin_service()
+        if not service:
+            return None
+        plan = service.update_plan_from_text(plan_id, text, actor="olga")
+        message = format_rag_admin_plan(plan, details=True)
+        await asyncio.to_thread(self.bot.send_message, chat_id, escape(message), reply_markup=rag_admin_plan_keyboard(plan.id), **delivery_params)
+        return {"ok": plan.status == "pending", "action": "rag_plan_revised", "plan_id": plan.id, "message": message}
+
+    def _rag_admin_service(self) -> ExpertRagAdminService | None:
+        if not isinstance(self.service, CodexTelegramAdminService):
+            return None
+        return self.service.toolbox.expert_rag_admin
 
     async def _send_deferred_result(
         self,
@@ -227,6 +324,19 @@ class TelegramAdminBotTransport:
                 return {"ok": False, "action": "mfa", "message": body}
             await self._send_html(chat_id, "<b>MFA:</b>\n" + telegram_markdown_to_html(body), delivery_params)
             return {"ok": True, "action": "mfa", "message": body}
+        if _looks_like_rag_admin_command(command):
+            service = self._rag_admin_service()
+            if service:
+                plan = service.plan_change(command, actor="olga")
+                body = format_rag_admin_plan(plan, details=True)
+                await asyncio.to_thread(
+                    self.bot.send_message,
+                    chat_id,
+                    escape(body),
+                    reply_markup=rag_admin_plan_keyboard(plan.id),
+                    **delivery_params,
+                )
+                return {"ok": plan.status == "pending", "action": "rag_plan_created", "message": body, "plan_id": plan.id}
         return None
 
     def _codex_message(
@@ -382,6 +492,7 @@ def build_telegram_admin_transport(
     booking = booking or _booking_from_settings(settings)
     history_store = LeadStore(settings.telegram_admin_history_db_path)
     if settings.telegram_admin_codex_enabled:
+        expert_rag_admin = ExpertRagAdminService(ExpertRagStore(settings.rag_expert_db_path)) if settings.rag_retrieval_enabled else None
         toolbox = AutomationToolbox(
             booking,
             avito=avito_read_client_from_settings(settings),
@@ -391,6 +502,7 @@ def build_telegram_admin_transport(
             enable_workspace_tools=True,
             history_store=history_store,
             operations_notifier=handoff_notifier_from_settings(settings),
+            expert_rag_admin=expert_rag_admin,
         )
         service = CodexTelegramAdminService(
             toolbox,
@@ -398,7 +510,7 @@ def build_telegram_admin_transport(
             trace_logger=JsonlAgentTraceLogger(),
             mentor_memory=MentorMemoryService(
                 toolbox.knowledge,
-                expert_rag=ExpertRagStore(settings.rag_expert_db_path) if settings.rag_retrieval_enabled else None,
+                expert_rag=expert_rag_admin.store if expert_rag_admin else None,
             ),
         )
     else:
@@ -417,7 +529,10 @@ async def run_telegram_admin_polling(settings: IntegrationSettings | None = None
             continue
         for update in updates:
             offset = int(update.get("update_id") or 0) + 1
-            await transport.handle_update(update)
+            if "callback_query" in update:
+                await transport.handle_callback_update(update)
+            else:
+                await transport.handle_update(update)
 
 
 async def _initial_admin_polling_offset(transport: TelegramAdminBotTransport) -> int | None:
@@ -518,6 +633,60 @@ def _history_assistant_content(result: Any) -> str:
             status = "ok" if entry.get("ok") else f"error={entry.get('error') or ''}"
             lines.append(f"- result {entry.get('tool')}: {status}; data={data[:1200]}")
     return "\n".join(lines)
+
+
+def _looks_like_rag_admin_command(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    if re.search(r"(?iu)(подним\w*|увелич\w*)[^\n]{0,80}\d+(?:[.,]\d+)?\s*%", lowered):
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "это устарело",
+            "цена устарела",
+            "цены устарели",
+            "больше не актуально",
+            "не говори про очную",
+            "не рекоменд",
+            "не склон",
+            "запомни вот так",
+        )
+    )
+
+
+def _rag_plan_id_from_reply(message: dict[str, Any]) -> str:
+    reply = message.get("reply_to_message") or {}
+    markup = reply.get("reply_markup") or {}
+    keyboard = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    if isinstance(keyboard, list):
+        for row in keyboard:
+            if not isinstance(row, list):
+                continue
+            for button in row:
+                data = str((button or {}).get("callback_data") or "")
+                parsed = parse_rag_admin_callback(data)
+                if parsed:
+                    return parsed[0]
+    text = str(reply.get("text") or reply.get("caption") or "")
+    match = re.search(r"(?im)^План:\s*([a-f0-9]{8,32})\b", text)
+    return match.group(1) if match else ""
+
+
+def _pending_rag_plan_from_result(result: Any) -> Any:
+    if str(getattr(result, "action", "") or "") == "rag_admin_plan":
+        plan = rag_admin_plan_from_dict((getattr(result, "metadata", None) or {}).get("plan"))
+        if plan and plan.status == "pending":
+            return plan
+    trace = (getattr(result, "metadata", None) or {}).get("trace") or []
+    for entry in reversed(trace):
+        if not isinstance(entry, dict) or entry.get("type") != "tool_result":
+            continue
+        if entry.get("tool") != "expert_rag.plan_change":
+            continue
+        plan = rag_admin_plan_from_dict((entry.get("data") or {}).get("plan"))
+        if plan and plan.status == "pending":
+            return plan
+    return None
 
 
 if __name__ == "__main__":

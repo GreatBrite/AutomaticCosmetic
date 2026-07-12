@@ -51,6 +51,12 @@ from .integrations.care_crm import (
 )
 from .integrations.config import IntegrationSettings
 from .integrations.expert_rag import APPROVED, ExpertRagStore
+from .integrations.expert_rag_admin import (
+    ExpertRagAdminService,
+    format_rag_admin_plan,
+    parse_rag_admin_callback,
+    rag_admin_plan_keyboard,
+)
 from .integrations.handoff_refs import (
     DEFAULT_HANDOFF_REFS_PATH,
     find_telegram_handoff_ref,
@@ -942,6 +948,7 @@ def remember_avito_draft_expert_answer(draft: dict, settings: IntegrationSetting
             "source": "telegram_avito_draft_button",
             "draft_id": str(draft.get("id") or ""),
             "handoff_id": str(draft.get("handoff_id") or ""),
+            "autoanswer_allowed": True,
         },
     )
     return True, f"Запомнила как approved knowledge #{item.id}."
@@ -1037,6 +1044,144 @@ def handle_avito_draft_callback(
     bot.send_message(
         telegram_chat_id,
         "Черновик отправлен клиенту." if result.get("sent") else "Черновик не отправлен: " + escape(str(result)),
+        **(topic_params or {}),
+    )
+    return True
+
+
+def handle_rag_plan_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    service: CodexTelegramAdminService | None,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+) -> bool:
+    parsed = parse_rag_admin_callback(data)
+    if not parsed:
+        return False
+    if not service or not service.toolbox.expert_rag_admin:
+        bot.answer_callback_query(callback_id, "RAG недоступен")
+        bot.send_message(telegram_chat_id, "RAG-память сейчас недоступна.", **(topic_params or {}))
+        return True
+    plan_id, action = parsed
+    admin = service.toolbox.expert_rag_admin
+    try:
+        if action == "apply":
+            plan = admin.apply_plan(plan_id, actor="olga")
+            bot.answer_callback_query(callback_id, "Применено")
+            bot.send_message(
+                telegram_chat_id,
+                "Готово, применила изменения в RAG-памяти.\n\n" + escape(format_rag_admin_plan(plan, details=True)),
+                **(topic_params or {}),
+            )
+            return True
+        if action == "cancel":
+            admin.cancel_plan(plan_id, actor="olga")
+            bot.answer_callback_query(callback_id, "Отменено")
+            bot.send_message(telegram_chat_id, "Ок, ничего не меняю в RAG-памяти.", **(topic_params or {}))
+            return True
+        if action == "details":
+            plan = admin.get_plan(plan_id)
+            bot.answer_callback_query(callback_id, "Подробнее")
+            bot.send_message(
+                telegram_chat_id,
+                escape(format_rag_admin_plan(plan, details=True) if plan else "План не найден."),
+                **(topic_params or {}),
+            )
+            return True
+        if action == "edit":
+            bot.answer_callback_query(callback_id, "Жду правку")
+            bot.send_message(
+                telegram_chat_id,
+                "Ответьте на карточку RAG-плана своей правкой — я пересоберу план и снова попрошу подтверждение.",
+                **(topic_params or {}),
+            )
+            return True
+    except Exception as exc:
+        bot.answer_callback_query(callback_id, "Не удалось")
+        bot.send_message(telegram_chat_id, "Не удалось обработать RAG-план: " + escape(str(exc)), **(topic_params or {}))
+        return True
+    bot.answer_callback_query(callback_id, "Неизвестное действие")
+    return True
+
+
+def find_rag_plan_id_for_reply(message: dict) -> str:
+    reply = message.get("reply_to_message") or {}
+    markup = reply.get("reply_markup") or {}
+    keyboard = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+    if isinstance(keyboard, list):
+        for row in keyboard:
+            if not isinstance(row, list):
+                continue
+            for button in row:
+                parsed = parse_rag_admin_callback(str((button or {}).get("callback_data") or ""))
+                if parsed:
+                    return parsed[0]
+    text = str(reply.get("text") or reply.get("caption") or "")
+    match = re.search(r"(?im)^План:\s*([a-f0-9]{8,32})\b", text)
+    return match.group(1) if match else ""
+
+
+def handle_rag_plan_text_reply(
+    *,
+    bot: TelegramBot,
+    message: dict,
+    text: str,
+    service: CodexTelegramAdminService | None,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+) -> bool:
+    plan_id = find_rag_plan_id_for_reply(message)
+    if not plan_id or not service or not service.toolbox.expert_rag_admin:
+        return False
+    plan = service.toolbox.expert_rag_admin.update_plan_from_text(plan_id, text, actor="olga")
+    bot.send_message(
+        telegram_chat_id,
+        escape(format_rag_admin_plan(plan, details=True)),
+        reply_markup=rag_admin_plan_keyboard(plan.id),
+        **(topic_params or {}),
+    )
+    return True
+
+
+def looks_like_rag_admin_command(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    if re.search(r"(?iu)(подним\w*|увелич\w*)[^\n]{0,80}\d+(?:[.,]\d+)?\s*%", lowered):
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "это устарело",
+            "цена устарела",
+            "цены устарели",
+            "больше не актуально",
+            "не говори про очную",
+            "не рекоменд",
+            "не склон",
+            "запомни вот так",
+            "tesoro теперь",
+            "тесоро теперь",
+        )
+    )
+
+
+def handle_rag_admin_freeform_command(
+    *,
+    bot: TelegramBot,
+    text: str,
+    service: CodexTelegramAdminService | None,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+) -> bool:
+    if not looks_like_rag_admin_command(text) or not service or not service.toolbox.expert_rag_admin:
+        return False
+    plan = service.toolbox.expert_rag_admin.plan_change(text, actor="olga")
+    bot.send_message(
+        telegram_chat_id,
+        escape(format_rag_admin_plan(plan, details=True)),
+        reply_markup=rag_admin_plan_keyboard(plan.id),
         **(topic_params or {}),
     )
     return True
@@ -2211,6 +2356,7 @@ def build_codex_tool_service(settings: IntegrationSettings) -> CodexTelegramAdmi
         enable_workspace_tools=True,
         history_store=history_store,
         operations_notifier=handoff_notifier_from_settings(settings),
+        expert_rag_admin=ExpertRagAdminService(ExpertRagStore(settings.rag_expert_db_path)) if settings.rag_retrieval_enabled else None,
     )
     return CodexTelegramAdminService(toolbox, settings, trace_logger=JsonlAgentTraceLogger())
 
@@ -2627,6 +2773,16 @@ def serve(settings: Settings) -> None:
                         topic_params=callback_topic_params,
                     ):
                         continue
+                if data.startswith("ragplan:"):
+                    if handle_rag_plan_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        service=codex_tool_service,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
                 if data.startswith("visitconfirm:"):
                     callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
                         callback,
@@ -2831,6 +2987,23 @@ def serve(settings: Settings) -> None:
                     source_message=message,
                     handoff_id=str(avito_draft.get("handoff_id") or ""),
                 )
+                continue
+            if has_codex_text and handle_rag_plan_text_reply(
+                bot=bot,
+                message=message,
+                text=raw_text,
+                service=codex_tool_service,
+                telegram_chat_id=reply_chat_id,
+                topic_params=topic_params,
+            ):
+                continue
+            if has_codex_text and handle_rag_admin_freeform_command(
+                bot=bot,
+                text=raw_text,
+                service=codex_tool_service,
+                telegram_chat_id=reply_chat_id,
+                topic_params=topic_params,
+            ):
                 continue
             if has_codex_text and handle_visit_confirmation_text_reply(
                 bot,
