@@ -10,6 +10,8 @@ from .agent_tools import AutomationToolbox
 from .agent_trace import JsonlAgentTraceLogger
 from .avito import avito_photo_handoff
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
+from .client_handlers import HandoffComposer, RagAnswerService
+from .client_router import ClientRoute, route_client_message
 from .config import DEFAULT_CITIES
 from .expert_rag import ExpertRagStore
 from .rag_retrieval import RagRetrievalService
@@ -71,28 +73,7 @@ class AvitoAgentContext:
             "tool_schemas": list(self.tool_schemas),
             "knowledge_items": list(self.knowledge_items),
             "retrieved_expert_answers": list(self.retrieved_expert_answers),
-            "reply_rules": [
-                *self.role_profile.reply_rules,
-                "conversation_history — это память именно этого клиента/чата; используй её для коротких ответов вроде 'да', 'завтра', 'на 30-е'.",
-                "Сначала используй инструменты и знания, потом отвечай клиенту.",
-                "Не жди заранее поставленного ярлыка: сам решай, какие tools нужны по контексту переписки.",
-                "Если сомневаешься, собери контекст через доступные tools/knowledge/историю; если всё ещё нет опоры — сделай внутренний handoff, а клиенту ответь без объяснения маршрута.",
-                "Если клиенту реально нужны материалы или решение специалиста (например фото до/после, пример результата на конкретный объём, подтверждённый контакт или файл), можно сделать handoff без клиентского ответа: не пиши клиенту пустое 'уточню', а в handoff_summary явно укажи, что клиенту пока ничего не писали и что нужно. Формулируй задачу нейтрально: 'Нужно: ...', без 'у Ольги', 'от Ольги' или 'от вас'.",
-                "Не объясняй клиенту, из какого внутреннего источника взят ответ; tools, knowledge и история — это твоя опора, не клиентский текст.",
-                "Ольгу упоминай клиенту только когда нужна её личная экспертная оценка; обычные проверки формулируй от лица сервиса.",
-                "Если просишь данные для записи, проси рабочие данные для оформления и связи, а не веди клиента как анкету.",
-                "Не отправляй клиента к специалисту словами, если вопрос уверенно покрыт контекстом, YCLIENTS, knowledge или экспертной правкой Ольги.",
-                "Если в истории/trace уже есть оценка Ольги или подтверждённое решение специалиста, дай клиенту итог без фраз 'на консультации подберём', 'окончательно индивидуально' и без нового предложения консультации.",
-                "retrieved_expert_answers — проверенные low-risk ответы Ольги из RAG-памяти. Если найденный ответ approved и score высокий, используй его как главный источник и отвечай клиенту сам. Если score средний или контекст отличается важной деталью — сделай handoff и приложи похожий ответ как подсказку, не выдумывай.",
-                "Отвечай коротко и по конкретному вопросу клиента.",
-                "Если клиент хочет записаться, сначала должна быть понятна конкретная процедура/услуга. Не превращай слова 'встреча', 'приём', 'лично', 'на следующей неделе' или присланный телефон в запись сами по себе.",
-                "Если клиент оставил телефон/имя и просит 'встречу' или 'на следующей неделе', но процедура не названа и не ясна из истории, не смотри слоты и не делай handoff Ольге; коротко спроси, какая процедура интересует.",
-                "Клиентский Avito-агент не создаёт, не переносит и не отменяет YCLIENTS-записи live. Он может читать услуги/слоты/адрес и подготовить клиенту следующий шаг; мутации делает админ/Ольга после явного подтверждения.",
-                "Город из объявления Avito — это контекст карточки, а не подтверждённый город клиента. Для записи, адреса и city-dependent tools используй только город, который клиент явно написал в текущей переписке/истории; если такого города нет, спроси город.",
-                "Если клиент прислал фото, передай Ольге на индивидуальную оценку, но не превращай каждый фотоответ в приглашение на консультацию.",
-                "Не склоняй клиента к очной консультации и не пиши, что итоговый подбор будет на очной консультации. Если для оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери одним сообщением только недостающие данные/фото.",
-                "После отмены записи возьми client_message из результата yclients.appointments.cancel и отправь его клиенту.",
-            ],
+            "reply_rules": _codex_payload_reply_rules(self.role_profile),
         }
 
 
@@ -233,6 +214,8 @@ class AvitoConsultant:
         self.rag_retrieval = rag_retrieval
         self.rag_autoanswer_threshold = rag_autoanswer_threshold
         self.rag_handoff_threshold = rag_handoff_threshold
+        self.rag_answer_service = RagAnswerService(autoanswer_threshold=rag_autoanswer_threshold)
+        self.handoff_composer = HandoffComposer()
         self.booking_flow = AvitoBookingFlow(toolbox.booking, cities=cities, allow_create=False)
 
     async def respond(
@@ -242,6 +225,9 @@ class AvitoConsultant:
         conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     ) -> AvitoConsultantReply:
         context = await self.build_context(message, conversation_history=conversation_history)
+        routed = await self._router_reply(context)
+        if routed:
+            return routed
         preflight = self._preflight_reply(context)
         if preflight:
             return preflight
@@ -250,6 +236,84 @@ class AvitoConsultant:
             if planned:
                 return planned
         return await self._fallback_response(context)
+
+    async def _router_reply(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
+        if context.role_profile.role not in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}:
+            return None
+        route = route_client_message(
+            context.message,
+            retrieved_expert_answers=context.retrieved_expert_answers,
+            conversation_history=context.conversation_history,
+            autoanswer_threshold=self.rag_autoanswer_threshold,
+        )
+        if route.route == "rag_answer":
+            draft = self.rag_answer_service.from_retrieved(context.retrieved_expert_answers)
+            if not draft:
+                return None
+            return AvitoConsultantReply(
+                action="expert_rag_answer",
+                reply=_with_next_step(draft.answer, context),
+                metadata={"planner": "client_router", "route": route.to_dict(), **draft.metadata},
+            )
+        if route.route == "ask_service":
+            return AvitoConsultantReply(
+                action="ask_procedure_for_booking",
+                reply="Подскажите, пожалуйста, какая процедура интересует? Тогда уже посмотрю по ней ближайшие варианты.",
+                metadata={"planner": "client_router", "route": route.to_dict()},
+            )
+        if route.route == "ask_city":
+            return AvitoConsultantReply(
+                action="ask_city",
+                reply="Подскажите, пожалуйста, в каком городе вам удобно? После этого сориентирую по адресу или ближайшим вариантам.",
+                metadata={"planner": "client_router", "route": route.to_dict()},
+            )
+        if route.route == "media_handoff":
+            return self._route_handoff_reply(
+                context,
+                route,
+                reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
+                reason=HandoffReason.PHOTO_CONSULTATION,
+            )
+        if route.route == "risk_handoff":
+            return self._route_handoff_reply(
+                context,
+                route,
+                reply=(
+                    "Если есть сильный отёк, затруднённое дыхание, резкое ухудшение или симптомы быстро усиливаются, "
+                    "пожалуйста, срочно обратитесь за медицинской помощью по 112 или 103. "
+                    "Напишите, какая процедура и когда была, что именно беспокоит, когда началось, есть ли боль или температура, "
+                    "и приложите фото при хорошем освещении."
+                ),
+                reason=HandoffReason.COMPLAINT_OR_RISK,
+            )
+        if route.route in {"booking_read", "address"}:
+            return await self._fallback_response(context)
+        return None
+
+    def _route_handoff_reply(
+        self,
+        context: AvitoAgentContext,
+        route: ClientRoute,
+        *,
+        reply: str,
+        reason: HandoffReason,
+    ) -> AvitoConsultantReply:
+        handoff = Handoff(
+            reason=reason,
+            message=context.message,
+            summary=self.handoff_composer.compose(
+                message=context.message,
+                route=route,
+                retrieved_answers=context.retrieved_expert_answers,
+                client_replied=bool(reply),
+            ),
+        )
+        return AvitoConsultantReply(
+            action="handoff",
+            reply=reply,
+            handoff=handoff,
+            metadata={"planner": "client_router", "route": route.to_dict()},
+        )
 
     async def build_context(
         self,
@@ -666,6 +730,28 @@ def _message_date(message: InboundMessage) -> str:
         except (OSError, OverflowError, ValueError):
             pass
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _codex_payload_reply_rules(profile: RoleProfile) -> list[str]:
+    if profile.role in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}:
+        return [
+            "Отвечай коротко, по-человечески и только по вопросу клиента.",
+            "conversation_history — память именно этого клиента/чата; используй её для коротких сообщений вроде 'да', 'завтра', 'на 30-е'.",
+            "Router уже отфильтровал простые случаи: high-confidence RAG, фото/видео, риск, личную встречу без процедуры и запрос города.",
+            "Если пришёл сюда, сначала используй доступные read-only tools/knowledge/историю; если опоры всё ещё нет — сделай внутренний handoff.",
+            "Клиентские роли не делают live-мутации: не создают, не переносят, не отменяют YCLIENTS-записи и не пишут notes.",
+            "Не раскрывай клиенту tools, trace, RAG ids, source, внутренние причины или слова handoff/эскалация.",
+            "Не предлагай очную консультацию как стандартный шаг; если реально нужна оценка, один раз предложи онлайн-разбор и собери недостающие данные.",
+            "Точный адрес называй только из yclients.company.address; цену — только из подтверждённого источника или YCLIENTS price_status='known'.",
+            "Если schedule_status='unknown', график неизвестен: не говори, что мест нет.",
+        ]
+    return [
+        *profile.reply_rules,
+        "conversation_history — память именно этого клиента/чата; используй её для коротких ответов вроде 'да', 'завтра', 'на 30-е'.",
+        "Сначала используй инструменты и знания, потом отвечай.",
+        "Если сомневаешься, собери контекст через доступные tools/knowledge/историю; если всё ещё нет опоры — сделай внутренний handoff.",
+        "Не показывай клиенту/Ольге внутренние trace/tool details без необходимости.",
+    ]
 
 
 def _message_payload(message: InboundMessage) -> dict[str, Any]:

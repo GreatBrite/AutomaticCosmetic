@@ -31,7 +31,21 @@ class RoleProfile:
         return name in self.allowed_tools
 
 
-CLIENT_TOOL_NAMES = frozenset(
+CLIENT_READONLY_TOOLS = frozenset(
+    {
+        "yclients.services.list",
+        "yclients.company.address",
+        "yclients.slots.list",
+        "yclients.appointments.list",
+        "yclients.clients.search",
+        "schedule.city.list",
+        "knowledge.list",
+        "knowledge.get",
+    }
+)
+
+
+CLIENT_MEMORY_SAFE_TOOLS = frozenset(
     {
         "care.crm.clients.search",
         "care.crm.client.memory.get",
@@ -42,24 +56,12 @@ CLIENT_TOOL_NAMES = frozenset(
         "care.learning.lessons.list",
         "care.learning.preference.upsert",
         "care.learning.outcome.record",
-        "yclients.services.list",
-        "yclients.company.address",
-        "yclients.slots.list",
-        "yclients.appointments.create",
-        "yclients.appointments.list",
-        "yclients.appointments.move",
-        "yclients.appointments.cancel",
-        "yclients.clients.search",
-        "yclients.clients.notes.update",
         "care.tasks.plan",
-        "schedule.city.list",
-        "knowledge.create",
-        "knowledge.list",
-        "knowledge.get",
-        "knowledge.update",
-        "knowledge.delete",
     }
 )
+
+
+CLIENT_TOOL_NAMES = CLIENT_READONLY_TOOLS | CLIENT_MEMORY_SAFE_TOOLS
 
 
 INTERNAL_CRM_TOOL_NAMES = frozenset(
@@ -76,14 +78,48 @@ INTERNAL_CRM_TOOL_NAMES = frozenset(
 )
 
 
-AVITO_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES - frozenset(
+ADMIN_MUTATION_TOOLS = frozenset(
     {
         "yclients.appointments.create",
         "yclients.appointments.move",
         "yclients.appointments.cancel",
         "yclients.clients.notes.update",
+        "knowledge.create",
+        "knowledge.update",
+        "knowledge.delete",
+        "schedule.city.set",
+        "schedule.city.delete",
+        "avito.messages.send",
+        "avito.messages.send_phone",
+        "avito.messages.send_image",
+        "avito.messages.send_file",
     }
 )
+
+
+RAG_ADMIN_TOOLS = frozenset(
+    {
+        "expert_rag.search",
+        "expert_rag.plan_change",
+        "expert_rag.apply_plan",
+        "expert_rag.deprecate",
+        "expert_rag.review.list",
+    }
+)
+
+
+WORKSPACE_DEBUG_TOOLS = frozenset(
+    {
+        "workspace.files.list",
+        "workspace.files.read",
+        "workspace.logs.tail",
+        "workspace.command.run",
+        "workspace.python.run",
+    }
+)
+
+
+AVITO_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 
 
 TELEGRAM_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
@@ -92,45 +128,18 @@ TELEGRAM_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 VK_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 
 
-ADMIN_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
+ADMIN_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | frozenset(
     {
         "avito.chats.list",
         "avito.messages.list",
-        "avito.messages.send",
-        "avito.messages.send_phone",
-        "avito.messages.send_image",
-        "avito.messages.send_file",
-        "schedule.city.set",
-        "schedule.city.delete",
-        "workspace.files.list",
-        "workspace.files.read",
-        "workspace.logs.tail",
-        "workspace.command.run",
-        "workspace.python.run",
-        "expert_rag.search",
-        "expert_rag.plan_change",
-        "expert_rag.apply_plan",
-        "expert_rag.deprecate",
-        "expert_rag.review.list",
     }
 )
 
 
-OLGA_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
+OLGA_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | frozenset(
     {
         "avito.chats.list",
         "avito.messages.list",
-        "avito.messages.send",
-        "avito.messages.send_phone",
-        "avito.messages.send_image",
-        "avito.messages.send_file",
-        "schedule.city.set",
-        "schedule.city.delete",
-        "expert_rag.search",
-        "expert_rag.plan_change",
-        "expert_rag.apply_plan",
-        "expert_rag.deprecate",
-        "expert_rag.review.list",
     }
 )
 
@@ -271,7 +280,7 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Если клиент уже был у Ольги, сначала используй подтверждённые CRM-факты визитов и interactions; не проси заново то, что уже известно.",
                 "Отдел заботы сначала заботится: спрашивает самочувствие/результат/удобство, а допродажу предлагает только мягко и по делу.",
                 "Не дави на повторную покупку и не обещай медицинский результат; при жалобах, риске или индивидуальной оценке делай handoff.",
-                "Если клиент просит записаться, проверь город, услугу, слоты и создай запись при наличии подтверждения и контакта.",
+                "Если клиент просит записаться, проверь город, услугу и слоты; клиентская роль не создаёт live-запись, а готовит следующий шаг для подтверждения админом/Ольгой.",
                 "Если нет телефона/имени для записи, попроси только недостающие рабочие данные и объясни зачем.",
                 "Не склоняй клиента к очной консультации. Если для индивидуальной оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери только недостающее: процедура/зона, цель или проблема, даты, симптомы, фото и телефон для связи.",
                 "Если оценка Ольги или подтверждённое решение уже есть в CRM/истории/trace, дай клиенту итог без нового предложения консультации.",
@@ -298,7 +307,7 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Цену клиенту называй только из подтверждённой knowledge или YCLIENTS-цены со статусом known; price_status=placeholder/unknown означает, что нужно спокойно уточнить стоимость.",
                 "Если график на дату неизвестен, скажи что проверишь эту дату; не говори, что мест нет.",
                 "Если график на дату известен и YCLIENTS вернул пустые слоты, можно сказать, что на этот день мест нет, и предложить другой день в том же городе.",
-                "Если клиент хочет записаться, проверь услуги/слоты и создай запись при наличии подтверждения и контакта.",
+                "Если клиент хочет записаться, проверь услуги/слоты; клиентская роль не создаёт live-запись, а готовит следующий шаг для подтверждения админом/Ольгой.",
                 "Если клиент прислал фото, Ольга должна посмотреть индивидуально, но не превращай каждый фотоответ в приглашение на консультацию.",
                 "Не склоняй клиента к очной консультации. Если для индивидуальной оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери только недостающее: зона/процедура, цель или проблема, даты, симптомы, фото и контакт.",
                 "Если оценка Ольги или подтверждённое решение уже есть в истории/trace, дай клиенту итог без нового предложения консультации.",

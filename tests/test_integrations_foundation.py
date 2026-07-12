@@ -31,6 +31,8 @@ from src.freelance_leads_bot.integrations.avito_consultant import (
     CodexAvitoPlanner,
     CodexToolLoopPlanner,
 )
+from src.freelance_leads_bot.integrations.client_handlers import RagAnswerService
+from src.freelance_leads_bot.integrations.client_router import route_client_message
 from src.freelance_leads_bot.integrations.booking_flow import AvitoBookingFlow, BookingRequest
 from src.freelance_leads_bot.integrations.avito_sender import AvitoSdkSender, PreviewAvitoSender
 from src.freelance_leads_bot.integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing
@@ -2016,7 +2018,10 @@ def test_telegram_client_role_is_care_consultant() -> None:
     assert profile.allows_tool("care.crm.clients.search")
     assert profile.allows_tool("care.crm.visits.list")
     assert not profile.allows_tool("care.crm.interactions.list")
-    assert profile.allows_tool("yclients.appointments.create")
+    assert not profile.allows_tool("yclients.appointments.create")
+    assert not profile.allows_tool("yclients.appointments.move")
+    assert not profile.allows_tool("yclients.appointments.cancel")
+    assert not profile.allows_tool("yclients.clients.notes.update")
     assert not profile.allows_tool("avito.messages.send")
     assert "отдел заботы" in profile.goal
     assert "новым, повторным" in rules
@@ -2035,6 +2040,128 @@ def test_avito_client_role_hides_live_yclients_mutations() -> None:
     assert not profile.allows_tool("yclients.appointments.cancel")
     assert not profile.allows_tool("yclients.clients.notes.update")
     assert "не превращай слова" in rules.casefold()
+
+
+def test_client_message_router_blocks_ambiguous_booking_before_llm() -> None:
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-route",
+        chat_id="chat-route",
+        text="На следующую неделю, 950-025-01-15 имя Галина, хочу личную встречу",
+    )
+
+    route = route_client_message(message)
+
+    assert route.route == "ask_service"
+    assert route.block_autoanswer_reason == "booking_without_service"
+
+
+def test_client_message_router_routes_high_confidence_rag_answer() -> None:
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-route-rag",
+        chat_id="chat-route-rag",
+        text="Сколько ягодицы 400 мл?",
+    )
+
+    route = route_client_message(
+        message,
+        retrieved_expert_answers=[
+            {
+                "answer_client": "400 мл Tesoro Body стоит 110 000.",
+                "score": 0.91,
+                "_retrieval_safe_for_autoanswer": True,
+            }
+        ],
+        autoanswer_threshold=0.82,
+    )
+
+    assert route.route == "rag_answer"
+    assert route.service_key == "yagodicy"
+
+
+def test_client_message_router_blocks_risk_address_and_media() -> None:
+    risk = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-risk-route",
+            chat_id="chat-risk-route",
+            text="После процедуры отёк и температура",
+        )
+    )
+    address = route_client_message(
+        InboundMessage(channel=Channel.AVITO, client_id="client-address-route", chat_id="chat-address-route", text="Какой адрес?")
+    )
+    media = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-media-route",
+            chat_id="chat-media-route",
+            text="Посмотрите фото",
+            has_photo=True,
+        )
+    )
+
+    assert risk.route == "risk_handoff"
+    assert risk.handoff_reason == HandoffReason.COMPLAINT_OR_RISK.value
+    assert address.route == "ask_city"
+    assert media.route == "media_handoff"
+
+
+def test_rag_answer_service_filters_unsafe_retrieval() -> None:
+    service = RagAnswerService(autoanswer_threshold=0.82)
+
+    safe = service.from_retrieved(
+        [
+            {
+                "id": 123,
+                "answer_client": "Tesoro Body держится до 4 лет.",
+                "score": 0.9,
+                "risk_level": "low",
+                "_retrieval_safe_for_autoanswer": True,
+            }
+        ]
+    )
+    low = service.from_retrieved([{"answer_client": "Ответ", "score": 0.4, "_retrieval_safe_for_autoanswer": True}])
+    high_risk = service.from_retrieved(
+        [{"answer_client": "Ответ", "score": 0.9, "risk_level": "high", "_retrieval_safe_for_autoanswer": True}]
+    )
+    unsafe = service.from_retrieved([{"answer_client": "Ответ", "score": 0.9, "_retrieval_safe_for_autoanswer": False}])
+
+    assert safe is not None
+    assert safe.answer == "Tesoro Body держится до 4 лет."
+    assert low is None
+    assert high_risk is None
+    assert unsafe is None
+
+
+def test_client_roles_share_readonly_tools_and_keep_rag_admin_private() -> None:
+    dangerous = {
+        "yclients.appointments.create",
+        "yclients.appointments.move",
+        "yclients.appointments.cancel",
+        "yclients.clients.notes.update",
+        "knowledge.create",
+        "knowledge.update",
+        "knowledge.delete",
+        "expert_rag.plan_change",
+        "expert_rag.apply_plan",
+    }
+    for role in (CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT):
+        profile = role_profile(role)
+        assert profile.allows_tool("yclients.services.list")
+        assert profile.allows_tool("yclients.slots.list")
+        assert profile.allows_tool("care.crm.interactions.create")
+        assert all(not profile.allows_tool(tool) for tool in dangerous)
+
+    for role in (CodexRole.ADMIN, CodexRole.OLGA_BOSS):
+        profile = role_profile(role)
+        assert profile.allows_tool("yclients.appointments.create")
+        assert profile.allows_tool("yclients.appointments.move")
+        assert profile.allows_tool("yclients.appointments.cancel")
+        assert profile.allows_tool("yclients.clients.notes.update")
+        assert profile.allows_tool("expert_rag.plan_change")
+        assert profile.allows_tool("expert_rag.apply_plan")
 
 
 def test_telegram_client_inbound_message_extracts_identity_and_photos() -> None:
@@ -2722,8 +2849,8 @@ async def test_avito_preflight_uses_history_service_before_booking(tmp_path) -> 
 
     reply = await consultant.respond(message, conversation_history=[{"role": "user", "content": "Интересует увеличение губ"}])
 
-    assert planner.called is True
-    assert reply.action == "planned"
+    assert planner.called is False
+    assert reply.action in {"ask_city", "slots", "booking_options", "booking_handoff"}
 
 
 @pytest.mark.anyio
@@ -2747,10 +2874,9 @@ async def test_avito_consultant_uses_knowledge_for_medical_questions_instead_of_
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "knowledge_answer"
-    assert reply.handoff is None
-    assert "беременности" in reply.reply
-    assert "передам" not in reply.reply.lower()
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.COMPLAINT_OR_RISK
 
 
 @pytest.mark.anyio
@@ -2844,8 +2970,8 @@ async def test_avito_consultant_can_delegate_decision_to_codex_planner(tmp_path)
     assert reply.action == "codex_reply"
     assert reply.metadata["planner"] == "codex"
     assert "yclients.services.list" in seen_payload["available_tools"]
-    assert "knowledge.create" in seen_payload["available_tools"]
-    assert any(tool["name"] == "knowledge.create" for tool in seen_payload["tool_schemas"])
+    assert "knowledge.create" not in seen_payload["available_tools"]
+    assert all(tool["name"] != "knowledge.create" for tool in seen_payload["tool_schemas"])
     assert seen_payload["role_name"] == "avito_client"
     assert seen_payload["conversation_key"] == "avito:client:chat-codex"
     assert "Самостоятельно помочь клиенту Avito" in seen_payload["goal"]
@@ -2939,6 +3065,29 @@ async def test_avito_consultant_payload_exposes_own_message_actor_metadata(tmp_p
 
 
 @pytest.mark.anyio
+async def test_client_codex_payload_is_compact_and_readonly(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "message_id": "m-compact",
+            "chat_id": "chat-compact",
+            "content": {"text": "Здравствуйте, сколько стоит увеличение ягодиц и когда можно?"},
+        }
+    )
+
+    context = await consultant.build_context(message)
+    payload = context.to_codex_payload()
+    prompt = build_codex_planner_prompt(payload, [])
+
+    assert len(prompt) < 18_000
+    assert len(payload["reply_rules"]) <= 10
+    assert "yclients.appointments.create" not in payload["available_tools"]
+    assert "expert_rag.plan_change" not in payload["available_tools"]
+
+
+@pytest.mark.anyio
 async def test_avito_consultant_filters_internal_handoff_knowledge_from_codex_payload(tmp_path) -> None:
     seen_payload = {}
 
@@ -2999,7 +3148,7 @@ async def test_avito_consultant_filters_unverified_imported_price_tables(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_avito_consultant_does_not_bypass_codex_for_photo_handoff() -> None:
+async def test_avito_consultant_routes_photo_handoff_before_codex() -> None:
     async def fake_codex_loop(payload, trace):
         assert payload["message"]["has_photo"] is True
         assert trace == []
@@ -3020,11 +3169,11 @@ async def test_avito_consultant_does_not_bypass_codex_for_photo_handoff() -> Non
 
     reply = await consultant.respond(message)
 
-    assert reply.metadata["planner"] == "codex_tool_loop"
+    assert reply.metadata["planner"] == "client_router"
     assert reply.action == "handoff"
     assert reply.handoff is not None
-    assert reply.handoff.reason == "photo_consultation"
-    assert "Codex решил" in reply.handoff.summary
+    assert reply.handoff.reason == HandoffReason.PHOTO_CONSULTATION
+    assert "Клиенту уже ответили" in reply.handoff.summary
 
 
 @pytest.mark.anyio
@@ -3106,7 +3255,9 @@ async def test_codex_tool_loop_planner_executes_multiple_tools_before_final_repl
     assert reply.metadata["trace"][0]["tool"] == "yclients.services.list"
     assert reply.metadata["trace"][1]["type"] == "tool_result"
     assert reply.metadata["trace"][2]["tool"] == "knowledge.create"
-    assert knowledge.list(query="ботокс")
+    assert reply.metadata["trace"][3]["ok"] is False
+    assert "not allowed" in reply.metadata["trace"][3]["error"]
+    assert not knowledge.list(query="ботокс")
     assert len(steps) == 3
 
 
@@ -3123,7 +3274,7 @@ async def test_codex_tool_loop_zero_max_steps_disables_step_cap(tmp_path) -> Non
         return {"action": "codex_reply", "reply": "Готово после расширенной проверки."}
 
     consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop, max_steps=0))
-    message = avito_inbound_message({"type": "message", "chat_id": "chat-unlimited", "content": {"text": "Проверь слоты"}})
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-unlimited", "content": {"text": "Расскажите про уход после ботокса"}})
 
     reply = await consultant.respond(message)
 
@@ -3145,7 +3296,7 @@ async def test_codex_tool_loop_default_disables_step_cap(tmp_path) -> None:
         return {"action": "codex_reply", "reply": "Готово без явного лимита."}
 
     consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop))
-    message = avito_inbound_message({"type": "message", "chat_id": "chat-default-unlimited", "content": {"text": "Проверь слоты"}})
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-default-unlimited", "content": {"text": "Расскажите про уход после ботокса"}})
 
     reply = await consultant.respond(message)
 
@@ -4035,8 +4186,63 @@ async def test_avito_tool_loop_rejects_tools_outside_role_even_with_unfiltered_t
             "type": "message",
             "message_id": "m-forbidden-tool",
             "chat_id": "chat-forbidden-tool",
-            "content": {"text": "Запишите меня на чистку лица, телефон +7 999 123-45-67"},
+            "content": {"text": "Здравствуйте, хочу уточнить детали ухода"},
         }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "codex_reply"
+    assert gateway.create_calls == 0
+    assert reply.metadata["trace"][1]["ok"] is False
+    assert "not allowed" in reply.metadata["trace"][1]["error"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("role", [CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT])
+async def test_telegram_and_vk_client_tool_loop_reject_yclients_mutations(tmp_path, role) -> None:
+    class RecordingGateway(DryRunYClientsGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.create_calls = 0
+
+        async def create_appointment(self, appointment):
+            self.create_calls += 1
+            return await super().create_appointment(appointment)
+
+    gateway = RecordingGateway()
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / f"{role.value}.json"))
+
+    async def fake_codex_loop(payload, trace):
+        if not trace:
+            assert "yclients.appointments.create" not in payload["available_tools"]
+            return {
+                "tool_calls": [
+                    {
+                        "name": "yclients.appointments.create",
+                        "arguments": {
+                            "city": "Москва",
+                            "service_id": 7,
+                            "datetime": "2026-06-01T10:00:00",
+                            "phone": "+7 999 123-45-67",
+                        },
+                    }
+                ]
+            }
+        assert trace[-1]["ok"] is False
+        assert "not allowed" in trace[-1]["error"]
+        return {"action": "codex_reply", "reply": "Передам на подтверждение, live-запись не создаю."}
+
+    consultant = AvitoConsultant(
+        toolbox,
+        planner=CodexToolLoopPlanner(fake_codex_loop),
+        profile=role_profile(role),
+    )
+    message = InboundMessage(
+        channel=Channel.TELEGRAM_CLIENT if role == CodexRole.TELEGRAM_CLIENT else Channel.VK,
+        client_id=f"client-{role.value}",
+        chat_id=f"chat-{role.value}",
+        text="Здравствуйте, хочу уточнить детали ухода",
     )
 
     reply = await consultant.respond(message)
@@ -5051,6 +5257,34 @@ def test_shared_rag_retrieval_filters_by_channel_visibility_and_policy(tmp_path)
     assert vk.answers == ()
 
 
+def test_shared_rag_retrieval_can_feed_avito_vk_and_telegram_clients(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(
+        service_key="yagodicy",
+        title="Ягодицы",
+        aliases=("ягодицы", "попа", "tesoro"),
+        visibility=("avito", "telegram_client", "vk"),
+    )
+    store.upsert_from_handoff(
+        question="Сколько держится Tesoro Body для ягодиц?",
+        answer_client="Tesoro Body для ягодиц держится до 4 лет.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "yagodicy", "autoanswer_allowed": True},
+    )
+    retrieval = RagRetrievalService(store, catalog)
+
+    results = [
+        retrieval.retrieve(RagRetrievalRequest(channel=channel, text="Сколько держится Tesoro Body для ягодиц?", min_score=0.1))
+        for channel in ("avito", "telegram_client", "vk")
+    ]
+
+    assert all(result.answers for result in results)
+    assert {result.answers[0]["answer_client"] for result in results} == {"Tesoro Body для ягодиц держится до 4 лет."}
+    assert all(result.safe_for_autoanswer for result in results)
+
+
 def test_shared_rag_retrieval_blocks_unsafe_autoanswer_but_keeps_similar_answers(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     catalog = ServiceCatalogStore(tmp_path / "services.json")
@@ -5195,6 +5429,42 @@ async def test_avito_consultant_answers_from_high_confidence_expert_rag(tmp_path
     assert reply.action == "expert_rag_answer"
     assert "Tesoro Body" in reply.reply
     assert reply.handoff is None
+
+
+@pytest.mark.anyio
+async def test_high_confidence_rag_bypasses_codex_planner(tmp_path) -> None:
+    class ExplodingPlanner:
+        async def respond(self, context, toolbox):
+            raise AssertionError("planner should not be called for safe high-confidence RAG")
+
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    store.upsert_from_handoff(
+        question="Сколько держится Tesoro Body для ягодиц?",
+        answer_client="Tesoro Body для ягодиц держится до 4 лет.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True, "service_key": "yagodicy"},
+    )
+    consultant = AvitoConsultant(
+        AutomationToolbox(DryRunYClientsGateway()),
+        planner=ExplodingPlanner(),
+        expert_rag=store,
+        rag_autoanswer_threshold=0.2,
+        rag_handoff_threshold=0.1,
+    )
+
+    reply = await consultant.respond(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-rag-bypass",
+            chat_id="chat-rag-bypass",
+            text="Сколько держится Tesoro Body для ягодиц?",
+        )
+    )
+
+    assert reply.action == "expert_rag_answer"
+    assert "до 4 лет" in reply.reply
+    assert reply.metadata["planner"] == "client_router"
 
 
 @pytest.mark.anyio
@@ -5966,7 +6236,7 @@ def test_avito_webhook_transcribes_voice_before_processing() -> None:
         response = client.post("/avito/webhook?token=webhook", json=event)
 
         assert response.status_code == 200
-        assert response.json()["action"] == "codex_reply"
+        assert response.json()["action"] == "ask_city"
         assert response.json()["send"]["reason"] == "preview_only"
     finally:
         avito_app.dependency_overrides.clear()
@@ -6646,17 +6916,15 @@ def test_codex_planner_prompt_and_json_parser() -> None:
     assert "knowledge.list" in prompt
     assert "handoff_reason" in prompt
     assert "Ольга — косметолог и владелец экспертного контекста" in prompt
-    assert "админским сообщением от Ольги" in prompt
-    assert "персональный ассистент владельца бизнеса" in prompt
     assert "живой ассистент записи" in prompt
-    assert "Город из объявления Avito" in prompt
-    assert "без объяснения внутреннего маршрута" in prompt
+    assert "Router уже обработал простые safety/RAG/media/city/procedure случаи" in prompt
+    assert "Слово handoff — только внутреннее поле JSON" in prompt
     assert "reply=''" in prompt
     assert "фото до/после" in prompt
     assert "тихую задачу" in prompt
-    assert "экспертной правке Ольги" in prompt
-    assert "Не спамь онлайн-консультацией" in prompt
-    assert "Если в conversation_history/trace/knowledge уже есть оценка Ольги" in prompt
+    assert "подтверждённое решение" in prompt
+    assert "Не предлагай очную консультацию" in prompt
+    assert "Если уже есть оценка Ольги/подтверждённое решение" in prompt
     assert "Нужно у Ольги:" not in prompt
     assert "Нужно: фото до/после" in prompt
     assert parsed is not None
