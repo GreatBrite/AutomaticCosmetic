@@ -99,6 +99,7 @@ class IntegrationSettings:
     rag_service_catalog_enabled: bool = True
     rag_shared_retrieval_enabled: bool = True
     rag_service_catalog_path: Path = ROOT / "data" / "service_catalog.json"
+    rag_intent_llm_timeout_seconds: int = 20
 
     @classmethod
     def from_env(cls, env_path: Path | None = None) -> "IntegrationSettings":
@@ -143,6 +144,7 @@ class IntegrationSettings:
             rag_handoff_threshold=_env_float("RAG_HANDOFF_THRESHOLD", 0.65),
             rag_expert_db_path=Path(_env("RAG_EXPERT_DB_PATH", str(ROOT / "data" / "expert_rag.sqlite3"))),
             rag_service_catalog_path=Path(_env("RAG_SERVICE_CATALOG_PATH", str(ROOT / "data" / "service_catalog.json"))),
+            rag_intent_llm_timeout_seconds=_env_int("RAG_INTENT_LLM_TIMEOUT_SECONDS", 20),
             yclients_api_key=_env("YCLIENTS_API_KEY"),
             yclients_user_token=_env("YCLIENTS_USER_TOKEN"),
             yclients_company_id=_env_int("YCLIENTS_COMPANY_ID"),

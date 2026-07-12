@@ -110,11 +110,21 @@ class ExpertRagAdminService:
         limit: int = 20,
     ) -> RagAdminPlan:
         command = str(command or "").strip()
-        intent = self.intent_parser.parse(command)
+        intent = self.intent_parser.parse(command, context=self._intent_context())
         query = str(query or "").strip() or _query_from_intent(intent) or _query_from_command(command)
         matched = self.search(query or command, status=status, limit=limit)
-        metadata = {"query": query, "matched_ids": [item.id for item in matched], "kind": intent.intent, "intent": intent.to_dict()}
+        metadata = {
+            "query": query,
+            "matched_ids": [item.id for item in matched],
+            "kind": intent.intent,
+            "intent": intent.to_dict(),
+            "parser_source": intent.parser_source,
+        }
         changes: list[RagAdminChange] = []
+
+        if intent.intent == "unknown" or intent.confidence < 0.55:
+            summary = intent.clarification_question or "Не смогла безопасно понять, какие знания нужно изменить. Нужна более конкретная формулировка."
+            return self._save_plan(command, "needs_clarification", summary, [], actor=actor, metadata=metadata)
 
         service_plan = self._service_plan_from_intent(command, intent, actor=actor, metadata=metadata)
         if service_plan:
@@ -305,6 +315,7 @@ class ExpertRagAdminService:
             return None
         cancelled = _replace_plan(plan, status="cancelled", metadata={**plan.metadata, "cancelled_by": actor})
         self._persist_plan(cancelled)
+        self._append_audit(plan, cancelled, actor=actor, action="cancel_plan")
         return cancelled
 
     def apply_plan(self, plan_id: str, *, actor: str = "olga") -> RagAdminPlan:
@@ -395,7 +406,7 @@ class ExpertRagAdminService:
             metadata={**plan.metadata, "applied_by": actor, "created_ids": created_ids},
         )
         self._persist_plan(applied)
-        self._append_audit(plan, applied, actor=actor)
+        self._append_audit(plan, applied, actor=actor, action="apply_plan")
         return applied
 
     def _deprecate_service_rag_if_needed(self, service_key: str, status: str) -> None:
@@ -444,11 +455,31 @@ class ExpertRagAdminService:
             return {}
         return raw if isinstance(raw, dict) else {}
 
-    def _append_audit(self, previous: RagAdminPlan, applied: RagAdminPlan, *, actor: str) -> None:
+    def _intent_context(self) -> dict[str, Any]:
+        return {
+            "services": [
+                {
+                    "service_key": item.service_key,
+                    "title": item.title,
+                    "aliases": list(item.aliases),
+                    "status": item.status,
+                    "cities": list(item.cities),
+                    "products": list(item.products),
+                    "visibility": list(item.visibility),
+                }
+                for item in self.service_catalog.list(include_deleted=True)
+            ][:80],
+            "safety": (
+                "LLM extracts intent only. Code validates and creates pending plans; "
+                "prices, duration, volume, medical and service lifecycle changes require confirmation."
+            ),
+        }
+
+    def _append_audit(self, previous: RagAdminPlan, applied: RagAdminPlan, *, actor: str, action: str = "apply_plan") -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "created_at": _now(),
-            "action": "apply_plan",
+            "action": action,
             "actor": actor,
             "plan_id": applied.id,
             "previous": previous.to_dict(),
@@ -459,7 +490,16 @@ class ExpertRagAdminService:
 
 
 def format_rag_admin_plan(plan: RagAdminPlan, *, details: bool = False) -> str:
-    lines = [plan.summary, "", f"План: {plan.id}", f"Статус: {plan.status}"]
+    intent = plan.metadata.get("intent") if isinstance(plan.metadata, dict) else {}
+    intent_name = str((intent or {}).get("intent") or plan.metadata.get("kind") or "unknown")
+    parser_source = str(plan.metadata.get("parser_source") or (intent or {}).get("parser_source") or "")
+    lines = [plan.summary, ""]
+    lines.append(f"Статус: {_human_plan_status(plan.status)}")
+    if details:
+        lines.append(f"План: {plan.id}")
+        lines.append(f"Поняла как: {intent_name}")
+        if parser_source:
+            lines.append(f"Источник понимания: {parser_source}")
     if plan.status == "needs_clarification":
         lines.append("Ничего не применяю. Напишите точнее: услуга/город/какое значение заменить.")
         return "\n".join(lines).strip()
@@ -469,13 +509,19 @@ def format_rag_admin_plan(plan: RagAdminPlan, *, details: bool = False) -> str:
     lines.append("")
     for index, change in enumerate(plan.changes[:10], start=1):
         if change.action == "replace":
-            lines.append(f"{index}. Заменить знание #{change.source_id}:")
+            lines.append(f"{index}. Обновить знание" + (f" #{change.source_id}" if details else "") + ":")
             lines.append(f"Было: {change.old_answer}")
             lines.append(f"Станет: {change.new_answer}")
         elif change.action == "deprecate":
-            lines.append(f"{index}. Пометить устаревшим знание #{change.source_id}: {change.old_answer}")
+            lines.append(f"{index}. Пометить устаревшим знание" + (f" #{change.source_id}" if details else "") + f": {change.old_answer}")
         elif change.action == "create":
             lines.append(f"{index}. Создать правило: {change.new_answer}")
+        elif change.action == "service_add":
+            lines.append(f"{index}. Добавить услугу: {change.new_answer}")
+        elif change.action == "service_update":
+            lines.append(f"{index}. Обновить услугу: {change.new_answer}")
+        elif change.action == "service_status":
+            lines.append(f"{index}. Изменить статус услуги «{change.old_answer}» → {change.new_answer}")
         if details and change.note:
             lines.append(f"Причина: {change.note}")
         lines.append("")
@@ -484,6 +530,15 @@ def format_rag_admin_plan(plan: RagAdminPlan, *, details: bool = False) -> str:
     if plan.status == "pending":
         lines.append("Применить изменения?")
     return "\n".join(lines).strip()
+
+
+def _human_plan_status(status: str) -> str:
+    return {
+        "pending": "ждёт подтверждения",
+        "applied": "применён",
+        "cancelled": "отменён",
+        "needs_clarification": "нужно уточнение",
+    }.get(status, status)
 
 
 def rag_admin_plan_keyboard(plan_id: str) -> dict[str, Any]:

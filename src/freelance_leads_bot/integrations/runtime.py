@@ -7,6 +7,8 @@ from .care_crm import CareCrmStore
 from .codex_planner import CodexPlannerRunner
 from .config import IntegrationSettings
 from .expert_rag import ExpertRagStore
+from .openrouter_intent import OpenRouterIntentClient
+from .rag_admin_intent import RagAdminIntentParser
 from .rag_retrieval import RagRetrievalService
 from .roles import CodexRole, RoleProfile, role_profile
 from .service_catalog import ServiceCatalogStore
@@ -58,3 +60,14 @@ def rag_retrieval_from_settings(settings: IntegrationSettings) -> RagRetrievalSe
         return None
     catalog = ServiceCatalogStore(settings.rag_service_catalog_path) if settings.rag_service_catalog_enabled else ServiceCatalogStore()
     return RagRetrievalService(ExpertRagStore(settings.rag_expert_db_path), service_catalog=catalog)
+
+
+def rag_admin_intent_parser_from_settings(settings: IntegrationSettings) -> RagAdminIntentParser:
+    llm = None
+    if settings.rag_dynamic_intent_enabled and settings.openrouter_api_key:
+        llm = OpenRouterIntentClient(
+            api_key=settings.openrouter_api_key,
+            model=settings.default_model,
+            timeout_seconds=settings.rag_intent_llm_timeout_seconds,
+        )
+    return RagAdminIntentParser(llm=llm, enabled=settings.rag_dynamic_intent_enabled)

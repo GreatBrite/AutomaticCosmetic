@@ -116,6 +116,38 @@ expert_rag_needs_review: N expert RAG items need review
 .venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review audit --limit 20
 ```
 
+## Dynamic RAG / каталог услуг
+
+Dynamic RAG включается флагами:
+
+```bash
+RAG_DYNAMIC_INTENT_ENABLED=true
+RAG_SERVICE_CATALOG_ENABLED=true
+RAG_SHARED_RETRIEVAL_ENABLED=true
+```
+
+Быстрый rollback без отката кода — выставить любой из этих флагов в `false`.
+
+Первичное заполнение каталога услуг:
+
+```bash
+.venv/bin/python scripts/service_catalog_admin.py seed
+```
+
+Dry-run миграции существующих approved RAG-знаний к `service_key`:
+
+```bash
+.venv/bin/python scripts/service_catalog_admin.py migration-plan > data/service_catalog_migration_plan.json
+```
+
+Применять только после просмотра JSON-плана:
+
+```bash
+.venv/bin/python scripts/service_catalog_admin.py migration-apply --plan data/service_catalog_migration_plan.json
+```
+
+LLM-понимание свободных команд Ольги использует `OPENROUTER_API_KEY`, `DEFAULT_MODEL` и `RAG_INTENT_LLM_TIMEOUT_SECONDS`. Если LLM недоступен или вернул невалидный JSON, бот автоматически использует безопасный fallback parser и пишет `parser_source=fallback` в metadata плана.
+
 ## Что делать при Avito warning/error
 
 ### `avito_unanswered_queue`

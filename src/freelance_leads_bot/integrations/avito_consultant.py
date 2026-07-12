@@ -380,7 +380,15 @@ class AvitoConsultant:
                 min_score=max(0.0, self.rag_handoff_threshold * 0.75),
                 limit=5,
             )
-            return list(result.answers)
+            return [
+                {
+                    **answer,
+                    "_retrieval_safe_for_autoanswer": result.safe_for_autoanswer,
+                    "_retrieval_handoff_reason": result.handoff_reason,
+                    "_retrieval_conflicts": list(result.conflicts),
+                }
+                for answer in result.answers
+            ]
         if not self.expert_rag:
             return []
         query = " ".join(part for part in (message.text, message.listing.title if message.listing else "") if part)
@@ -404,6 +412,8 @@ class AvitoConsultant:
         if not _expert_answer_autoanswer_allowed(best):
             return None
         if not answer or score < self.rag_autoanswer_threshold:
+            return None
+        if best.get("_retrieval_safe_for_autoanswer") is False:
             return None
         return AvitoConsultantReply(
             action="expert_rag_answer",

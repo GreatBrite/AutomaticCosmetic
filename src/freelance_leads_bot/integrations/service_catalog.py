@@ -7,12 +7,68 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .expert_rag import APPROVED, ExpertAnswer, ExpertRagStore
+
 
 DEFAULT_SERVICE_CATALOG_PATH = Path("data/service_catalog.json")
 ACTIVE = "active"
 HIDDEN = "hidden"
 DEPRECATED = "deprecated"
 DELETED = "deleted"
+DEFAULT_CHANNEL_VISIBILITY = ("avito", "telegram_client", "vk")
+MATCH_STOPWORDS = {
+    "для",
+    "как",
+    "что",
+    "это",
+    "или",
+    "при",
+    "про",
+    "если",
+    "можно",
+    "нужно",
+    "процедура",
+    "процедуры",
+    "коррекция",
+    "увеличение",
+    "онлайн",
+    "консультация",
+    "ольга",
+}
+DEFAULT_SERVICE_CATALOG_SEED: tuple[dict[str, Any], ...] = (
+    {
+        "service_key": "guby",
+        "title": "Увеличение губ",
+        "aliases": ("губы", "губ", "губки", "увеличение губ", "контурная пластика губ"),
+        "products": ("Корея", "Juvederm", "Stylage", "Revolax"),
+    },
+    {
+        "service_key": "grud",
+        "title": "Коррекция/увеличение груди филлером",
+        "aliases": ("грудь", "груд", "груди", "увеличение груди", "коррекция груди", "асимметрия груди"),
+    },
+    {
+        "service_key": "yagodicy",
+        "title": "Увеличение ягодиц",
+        "aliases": ("ягодицы", "ягодиц", "попа", "попе", "попу", "увеличение ягодиц"),
+        "products": ("Tesoro Body", "Тесоро Body"),
+    },
+    {
+        "service_key": "botoks",
+        "title": "Ботокс / ботулинотерапия",
+        "aliases": ("ботокс", "ботулинотерапия", "диспорт"),
+    },
+    {
+        "service_key": "kozha_golovy",
+        "title": "Процедуры для кожи головы",
+        "aliases": ("кожа головы", "волосы", "выпадение волос", "ломкость волос"),
+    },
+    {
+        "service_key": "online_consultation",
+        "title": "Онлайн-консультация с Ольгой",
+        "aliases": ("онлайн консультация", "онлайн-консультация", "онлайн разбор", "онлайн-разбор"),
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -47,7 +103,7 @@ class ServiceCatalogStore:
         key = normalize_service_key(service_key)
         return next((item for item in self._load() if item.service_key == key), None)
 
-    def resolve(self, text: str) -> ServiceCatalogItem | None:
+    def resolve(self, text: str, *, strict: bool = False) -> ServiceCatalogItem | None:
         lowered = _normalize(text)
         if not lowered:
             return None
@@ -59,7 +115,8 @@ class ServiceCatalogStore:
             if score > best_score:
                 best = item
                 best_score = score
-        return best if best_score > 0 else None
+        threshold = 3 if strict else 1
+        return best if best_score >= threshold else None
 
     def upsert(
         self,
@@ -120,6 +177,92 @@ class ServiceCatalogStore:
         self._save([updated if row.service_key == item.service_key else row for row in items])
         return updated
 
+    def seed_defaults(self, *, overwrite: bool = False) -> list[ServiceCatalogItem]:
+        seeded: list[ServiceCatalogItem] = []
+        for row in DEFAULT_SERVICE_CATALOG_SEED:
+            service_key = str(row["service_key"])
+            existing = self.get(service_key)
+            if existing and not overwrite:
+                seeded.append(
+                    self.upsert(
+                        service_key=existing.service_key,
+                        title=existing.title,
+                        aliases=tuple(row.get("aliases") or ()),
+                        products=tuple(row.get("products") or ()),
+                        status=existing.status,
+                        visibility=existing.visibility,
+                        metadata={"source": "default_seed"},
+                    )
+                )
+                continue
+            seeded.append(
+                self.upsert(
+                    service_key=service_key,
+                    title=str(row["title"]),
+                    aliases=tuple(row.get("aliases") or ()),
+                    products=tuple(row.get("products") or ()),
+                    status=ACTIVE,
+                    visibility=DEFAULT_CHANNEL_VISIBILITY,
+                    metadata={"source": "default_seed"},
+                )
+            )
+        return seeded
+
+    def plan_expert_rag_service_key_migration(
+        self,
+        store: ExpertRagStore,
+        *,
+        status: str = APPROVED,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        plan: list[dict[str, Any]] = []
+        for item in store.list_answers(status=status, limit=limit):
+            current = service_catalog_from_rag_metadata(item.metadata or {})
+            resolved = self._resolve_for_migration(_answer_service_text(item))
+            if not resolved or current == resolved.service_key:
+                continue
+            plan.append(
+                {
+                    "id": item.id,
+                    "question": item.question_canonical,
+                    "answer": item.answer_client,
+                    "old_service_key": current,
+                    "new_service_key": resolved.service_key,
+                    "service_title": resolved.title,
+                }
+            )
+        return plan
+
+    def apply_expert_rag_service_key_migration(self, store: ExpertRagStore, plan: list[dict[str, Any]]) -> list[int]:
+        updated_ids: list[int] = []
+        for row in plan:
+            item_id = int(row.get("id") or 0)
+            service_key = str(row.get("new_service_key") or "").strip()
+            if not item_id or not service_key:
+                continue
+            store.update_metadata(item_id, {"service_key": service_key, "service_catalog_migrated_at": _now()})
+            updated_ids.append(item_id)
+        return updated_ids
+
+    def _resolve_for_migration(self, text: str) -> ServiceCatalogItem | None:
+        lowered = _normalize(text)
+        scored: list[tuple[ServiceCatalogItem, int]] = []
+        for item in self._load():
+            names = (item.service_key, item.title, *item.aliases, *item.products)
+            score = max((_match_score(lowered, candidate) for candidate in names), default=0)
+            if score >= 3:
+                scored.append((item, score))
+        if not scored:
+            return None
+        best_score = max(score for _item, score in scored)
+        best = [item for item, score in scored if score == best_score]
+        non_consultation = [item for item in best if item.service_key != "online_consultation"]
+        if len(non_consultation) == 1:
+            return non_consultation[0]
+        if len(best) == 1:
+            return best[0]
+        return None
+
     def _load(self) -> list[ServiceCatalogItem]:
         if not self.path.exists():
             return []
@@ -163,6 +306,22 @@ def service_catalog_from_rag_metadata(metadata: dict[str, Any]) -> str:
     return str(metadata.get("service_key") or "").strip()
 
 
+def _answer_service_text(item: ExpertAnswer) -> str:
+    metadata = item.metadata or {}
+    # For bulk migration do not trust legacy inferred item.service/topic: early
+    # imports sometimes inferred a service from surrounding handoff context and
+    # attached it to generic follow-up answers like "phone" or "Ольга не смогла
+    # дозвониться". Use only explicit metadata plus the reusable Q/A text.
+    return " ".join(
+        str(part or "")
+        for part in (
+            metadata.get("service_key"),
+            item.question_canonical,
+            item.answer_client,
+        )
+    )
+
+
 def _match_score(haystack: str, candidate: str) -> int:
     needle = _normalize(candidate)
     if not needle:
@@ -171,7 +330,7 @@ def _match_score(haystack: str, candidate: str) -> int:
         return 4
     if needle in haystack:
         return 3
-    tokens = set(re.findall(r"[a-zа-я0-9]+", needle))
+    tokens = {token for token in re.findall(r"[a-zа-я0-9]+", needle) if token not in MATCH_STOPWORDS and len(token) >= 4}
     if tokens and tokens.intersection(re.findall(r"[a-zа-я0-9]+", haystack)):
         return 1
     return 0

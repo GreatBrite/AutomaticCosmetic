@@ -57,7 +57,6 @@ from .integrations.expert_rag_admin import (
     parse_rag_admin_callback,
     rag_admin_plan_keyboard,
 )
-from .integrations.rag_admin_intent import RagAdminIntentParser
 from .integrations.handoff_refs import (
     DEFAULT_HANDOFF_REFS_PATH,
     find_telegram_handoff_ref,
@@ -72,7 +71,7 @@ from .integrations.handoff_refs import (
 from .integrations.handoff_notify import handoff_notifier_from_settings
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
-from .integrations.runtime import booking_from_settings
+from .integrations.runtime import booking_from_settings, rag_admin_intent_parser_from_settings
 from .integrations.service_catalog import ServiceCatalogStore
 from .integrations.telegram_client_bot import CareFollowupDeliveryService
 from .integrations.telegram_admin_bot import (
@@ -2361,7 +2360,7 @@ def build_codex_tool_service(settings: IntegrationSettings) -> CodexTelegramAdmi
         expert_rag_admin=(
             ExpertRagAdminService(
                 ExpertRagStore(settings.rag_expert_db_path),
-                intent_parser=RagAdminIntentParser(enabled=settings.rag_dynamic_intent_enabled),
+                intent_parser=rag_admin_intent_parser_from_settings(settings),
                 service_catalog=ServiceCatalogStore(settings.rag_service_catalog_path),
             )
             if settings.rag_retrieval_enabled

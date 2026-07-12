@@ -8,6 +8,7 @@ from typing import Any
 
 
 IntentLLM = Callable[[str], str]
+LLM_MIN_CONFIDENCE = 0.55
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class RagAdminIntent:
     requires_confirmation: bool = True
     clarification_question: str = ""
     risk_flags: tuple[str, ...] = ()
+    parser_source: str = "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -42,10 +44,13 @@ class RagAdminIntentParser:
     def parse(self, text: str, *, context: dict[str, Any] | None = None) -> RagAdminIntent:
         command = str(text or "").strip()
         if self.enabled and self.llm:
-            parsed = _parse_llm_json(self.llm(_intent_prompt(command, context or {})))
-            if parsed and parsed.confidence >= 0.55 and parsed.intent != "unknown":
+            try:
+                parsed = _parse_llm_json(self.llm(_intent_prompt(command, context or {})), source="llm")
+            except (OSError, RuntimeError, TimeoutError, ValueError):
+                parsed = None
+            if parsed and parsed.confidence >= LLM_MIN_CONFIDENCE and parsed.intent != "unknown":
                 return parsed
-        return fallback_rag_admin_intent(command)
+        return _with_source(fallback_rag_admin_intent(command), "fallback")
 
 
 def fallback_rag_admin_intent(command: str) -> RagAdminIntent:
@@ -154,18 +159,22 @@ def fallback_rag_admin_intent(command: str) -> RagAdminIntent:
 
 def _intent_prompt(command: str, context: dict[str, Any]) -> str:
     return (
-        "Extract a strict JSON object for Olga's RAG/service admin command. "
-        "Do not perform actions. Return only JSON with keys: intent, confidence, scope, operation, "
-        "answer_text, requires_confirmation, clarification_question, risk_flags.\n"
+        "Ты извлекаешь structured intent из свободной команды Ольги для RAG-памяти косметологического бота. "
+        "Нельзя выполнять действия, менять базу или принимать решение за код. Верни только JSON.\n"
+        "JSON keys: intent, confidence, scope, operation, answer_text, requires_confirmation, clarification_question, risk_flags.\n"
         "Allowed intents: price_percent_change, price_exact_replace, effect_duration_update, "
         "policy_update, remember_answer, deprecate_knowledge, service_add, service_update, "
         "service_disable, service_delete, unknown.\n"
+        "scope may include: service, product, city, volume_ml, topic.\n"
+        "operation may include: type, value, old_value, new_value, title, status.\n"
+        "If the phrase is ambiguous, use intent='unknown', confidence<0.55 and write clarification_question.\n"
+        "Prices, effect duration, volume and medical claims must set requires_confirmation=true and suitable risk_flags.\n"
         f"Context: {json.dumps(context, ensure_ascii=False)}\n"
         f"Command: {command}"
     )
 
 
-def _parse_llm_json(raw: str) -> RagAdminIntent | None:
+def _parse_llm_json(raw: str, *, source: str = "llm") -> RagAdminIntent | None:
     try:
         payload = json.loads(str(raw or "").strip())
     except json.JSONDecodeError:
@@ -187,6 +196,21 @@ def _parse_llm_json(raw: str) -> RagAdminIntent | None:
         requires_confirmation=bool(payload.get("requires_confirmation", True)),
         clarification_question=str(payload.get("clarification_question") or ""),
         risk_flags=tuple(payload.get("risk_flags") or ()),
+        parser_source=source,
+    )
+
+
+def _with_source(intent: RagAdminIntent, source: str) -> RagAdminIntent:
+    return RagAdminIntent(
+        intent=intent.intent,
+        confidence=intent.confidence,
+        scope=intent.scope,
+        operation=intent.operation,
+        answer_text=intent.answer_text,
+        requires_confirmation=intent.requires_confirmation,
+        clarification_question=intent.clarification_question,
+        risk_flags=intent.risk_flags,
+        parser_source=source,
     )
 
 
