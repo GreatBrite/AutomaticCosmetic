@@ -36,6 +36,11 @@ SERVICE_HINT_RE = re.compile(
 BOOKING_RE = re.compile(r"(?iu)(запис|свобод|окош|время|слот|следующ|недел|при[её]м|встреч|личн|очно)")
 ADDRESS_RE = re.compile(r"(?iu)(адрес|метро|территориально|где|локац|как пройти|вход)")
 RISK_RE = re.compile(r"(?iu)(беремен|кормлен|гв\\b|аллерг|осложн|от[её]к|боль|температур|гной|инфекц|ожог|задыха|трудно дыш|плохо после|жалоб)")
+BOOKING_CRITICAL_RE = re.compile(
+    r"(?iu)(адрес|оплат|предоплат|запись актуальн|актуальна ли запись|точно.*жд|"
+    r"жд[уеё]т|я жду|вы забыли|забыли|не ответил|долго|что делать|отзыв|жалоб|"
+    r"сегодня.*приход|завтра.*приход|можно.*опозда|опозда)"
+)
 
 
 def route_client_message(
@@ -50,6 +55,17 @@ def route_client_message(
     city = _explicit_city(text, conversation_history)
     service_key = _service_key_from_text(text)
     has_service_hint = bool(SERVICE_HINT_RE.search(lowered) or _history_service_hint(conversation_history))
+
+    if _booking_critical(lowered, conversation_history):
+        return ClientRoute(
+            route="booking_critical_handoff",
+            city=city,
+            service_key=service_key,
+            risk_flags=("urgent", "booking_control"),
+            handoff_reason=HandoffReason.BOOKING_CRITICAL.value,
+            block_autoanswer_reason="booking_critical",
+            metadata={"urgent": True, "sla": "booking_critical"},
+        )
 
     if _has_media(message):
         return ClientRoute(
@@ -113,13 +129,30 @@ def route_client_message(
 
 def _has_media(message: InboundMessage) -> bool:
     metadata = message.metadata or {}
+    has_unresolved_voice = bool(metadata.get("voice_id") and not metadata.get("voice_transcribed"))
     return bool(
         message.has_photo
         or metadata.get("has_photo")
         or metadata.get("has_video")
         or metadata.get("has_file")
         or metadata.get("media_urls")
+        or has_unresolved_voice
+        or metadata.get("voice_transcription_error")
     )
+
+
+def _booking_critical(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
+    if not BOOKING_CRITICAL_RE.search(lowered):
+        return False
+    history_text = " ".join(str(item.get("content") or "") for item in conversation_history[-8:]).casefold().replace("ё", "е")
+    booking_context = bool(BOOKING_RE.search(history_text) or ADDRESS_RE.search(history_text) or SERVICE_HINT_RE.search(history_text))
+    if re.search(r"оплат|предоплат|запись актуальн|актуальна ли запись|точно.*жд|сегодня.*приход|завтра.*приход|опозда", lowered):
+        return True
+    if ADDRESS_RE.search(lowered) and re.search(r"записан|записана|записаны|запись|я к вам", lowered):
+        return True
+    if ADDRESS_RE.search(lowered):
+        return booking_context
+    return booking_context
 
 
 def _booking_without_service(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:

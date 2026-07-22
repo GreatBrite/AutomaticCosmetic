@@ -16,7 +16,7 @@ from ..storage import LeadStore
 from .avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
 from .care_crm import CareCrmStore, CareLearningService, ClientIdentityService, ClientMemoryService, VisitFactService
 from .models import Appointment, ClientProfile, Service, Slot, UpsellRule
-from .roles import RoleProfile
+from .roles import CodexRole, RoleProfile
 from .handoff_notify import HandoffNotifier
 from .upsell import CareUpsellPlanner, CareUpsellService, care_task_data
 from .yclients import YClientsGateway
@@ -745,6 +745,8 @@ class AutomationToolbox:
                 kind=str(args.get("kind") or ""),
                 tags=tuple(args.get("tags") or ()),
             )
+            if self.role_profile and self.role_profile.role in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}:
+                items = [item for item in items if _client_knowledge_allowed(item)]
             return ToolResult(ok=True, data={"items": [_knowledge_data(item) for item in items]})
         if name == "knowledge.get":
             item = self.knowledge.get(str(args["id"]))
@@ -867,7 +869,7 @@ class AutomationToolbox:
         message = text or f"Телефон для связи: {phone}"
         if phone not in message:
             message = f"{message}\n{phone}"
-        outgoing_text = prepare_avito_outgoing_text(self.history_store, chat_id, message)
+        outgoing_text = prepare_avito_outgoing_text(self.history_store, chat_id, message, mask_client_phone_echo=False)
         result = await self.avito_sender.send_message(account_id, chat_id, outgoing_text)
         if sent_successfully(result):
             remember_avito_outgoing(self.history_store, chat_id, outgoing_text)
@@ -1686,6 +1688,43 @@ def _cancellation_notification(appointment: Appointment) -> str:
 
 def _knowledge_data(item: KnowledgeItem) -> dict[str, Any]:
     return asdict(item)
+
+
+def _client_knowledge_allowed(item: KnowledgeItem) -> bool:
+    allowed_kinds = {
+        "faq",
+        "price",
+        "service_price",
+        "service_note",
+        "service_info",
+        "business_rule",
+        "listing_context",
+        "preparation",
+        "aftercare",
+        "contraindications",
+        "booking_rule",
+    }
+    if item.kind in {"avito_conversation_example", "location_policy"}:
+        return False
+    if item.kind and item.kind not in allowed_kinds:
+        return False
+    if item.metadata.get("client_autoanswer") is False or item.metadata.get("autoanswer_allowed") is False:
+        return False
+    tags = {tag.casefold() for tag in item.tags}
+    if "bad_example" in tags or "internal" in tags:
+        return False
+    text = f"{item.title}\n{item.content}".casefold()
+    blocked = (
+        "handoff:",
+        "handoff contexts",
+        "нужен ответ по avito",
+        "клиенту отправлено:",
+        "активные контексты:",
+        "ну вот цены в боте",
+        "webhook",
+        "secret123",
+    )
+    return not any(marker in text for marker in blocked)
 
 
 def _items(payload: Any, *keys: str) -> list[dict[str, Any]]:

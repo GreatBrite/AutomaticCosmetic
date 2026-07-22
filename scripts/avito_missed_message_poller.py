@@ -302,7 +302,6 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
                     "queue": queued,
                 }
             )
-            dedup.mark_once(key)
             continue
         try:
             result = await process_avito_message(

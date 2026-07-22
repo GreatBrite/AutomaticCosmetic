@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -65,6 +66,7 @@ def build_ops_status_report(
     data_entry_warning_bytes: int = DEFAULT_DATA_ENTRY_WARNING_BYTES,
     disk_free_warning_bytes: int = DEFAULT_DISK_FREE_WARNING_BYTES,
     disk_free_warning_ratio: float = DEFAULT_DISK_FREE_WARNING_RATIO,
+    overdue_followup_error_after_seconds: int | None = None,
     now: int | None = None,
 ) -> OpsStatusReport:
     settings = settings or IntegrationSettings.from_env()
@@ -97,6 +99,16 @@ def build_ops_status_report(
         stale_after_seconds=_unanswered_report_stale_after_seconds(settings),
     )
     actionable = int(unanswered.get("actionable_count") or 0)
+    critical_unanswered = int(unanswered.get("critical_unanswered_count") or 0)
+    pending_followups = int(unanswered.get("pending_followup_count") or 0)
+    overdue_followups = int(unanswered.get("overdue_followup_count") or 0)
+    max_overdue_followup_age = int(unanswered.get("max_overdue_followup_age_seconds") or 0)
+    overdue_error_after = (
+        _env_int("AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS", 3 * 60 * 60)
+        if overdue_followup_error_after_seconds is None
+        else max(0, int(overdue_followup_error_after_seconds))
+    )
+    overdue_followup_severity = "error" if overdue_followups > 0 and max_overdue_followup_age >= overdue_error_after else "warning"
     failed = int(unanswered.get("failed_count") or 0)
     report_is_stale = bool(unanswered.get("report_is_stale"))
     report_age = int(unanswered.get("report_age_seconds") or 0)
@@ -117,6 +129,24 @@ def build_ops_status_report(
             "Delayed Avito report is fresh."
             if not report_is_stale
             else f"Delayed Avito report is stale or missing; age={report_age}s.",
+            unanswered,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "avito_pending_followups",
+            overdue_followups == 0,
+            overdue_followup_severity,
+            "No overdue Avito bot promises."
+            if overdue_followups == 0
+            else (
+                f"{overdue_followups} Avito bot promises are overdue"
+                + (
+                    f" for up to {int(max_overdue_followup_age / 60)} min; exceeds error SLA {int(overdue_error_after / 60)} min."
+                    if overdue_followup_severity == "error"
+                    else "."
+                )
+            ),
             unanswered,
         )
     )
@@ -210,6 +240,10 @@ def build_ops_status_report(
     summary = {
         "services_active": not inactive,
         "avito_actionable": actionable,
+        "avito_critical_unanswered": critical_unanswered,
+        "avito_pending_followups": pending_followups,
+        "avito_overdue_followups": overdue_followups,
+        "avito_max_overdue_followup_age_seconds": max_overdue_followup_age,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
         "rag_approved": rag_approved,
@@ -258,6 +292,12 @@ def read_unanswered_status(
     state = _read_json(state_path)
     items = report.get("items") if isinstance(report.get("items"), list) else []
     actionable_count = int(report.get("actionable_count") or sum(1 for item in items if isinstance(item, dict) and item.get("needs_action")))
+    pending_followups = report.get("pending_followups") if isinstance(report.get("pending_followups"), list) else []
+    overdue_rows = [
+        row
+        for row in pending_followups
+        if isinstance(row, dict) and (row.get("overdue") or row.get("business_status") == "overdue")
+    ]
     failed = state.get("failed") if isinstance(state.get("failed"), dict) else {}
     handled = state.get("handled") if isinstance(state.get("handled"), dict) else {}
     report_created_at = str(report.get("created_at") or "")
@@ -274,6 +314,12 @@ def read_unanswered_status(
         "report_is_stale": report_is_stale,
         "total_count": int(report.get("count") or len(items)),
         "actionable_count": actionable_count,
+        "critical_unanswered_count": int(report.get("critical_unanswered_count") or 0),
+        "final_ack_count": int(report.get("final_ack_count") or 0),
+        "pending_followup_count": int(report.get("pending_followup_count") or len(pending_followups)),
+        "overdue_followup_count": int(report.get("overdue_followup_count") or 0),
+        "critical_followup_count": int(report.get("critical_followup_count") or 0),
+        "max_overdue_followup_age_seconds": max((int(row.get("age_seconds") or 0) for row in overdue_rows), default=0),
         "handled_count": len(handled),
         "failed_count": len(failed),
         "activated_at": int(state.get("activated_at") or 0),
@@ -372,6 +418,8 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             "Services: "
             + ("active" if summary.get("services_active") else "attention needed")
             + f" | Avito actionable={summary.get('avito_actionable', 0)}"
+            + f" critical={summary.get('avito_critical_unanswered', 0)}"
+            + f" overdue_promises={summary.get('avito_overdue_followups', 0)}"
             + f" failed_autoreplies={summary.get('avito_autoreply_failed', 0)}"
             + f" report_age={summary.get('avito_unanswered_report_age_seconds', 0)}s"
         ),
@@ -416,6 +464,16 @@ def _health_check(name: str, payload: dict[str, Any], *, required_flags: tuple[s
 
 def _on_off(value: Any) -> str:
     return "on" if bool(value) else "off"
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def read_data_footprint(

@@ -10,7 +10,8 @@ from typing import Any
 
 DEFAULT_HANDOFF_REFS_PATH = Path("data/telegram_handoff_refs.json")
 MAX_HANDOFF_REFS = 1000
-UNRESOLVED_HANDOFF_STATUSES = {"open", "draft_pending", "rejected"}
+UNRESOLVED_HANDOFF_STATUSES = {"open", "in_progress", "draft_pending", "rejected"}
+CLOSED_HANDOFF_STATUSES = {"answered", "closed", "expired"}
 
 
 def telegram_handoff_ref_key(telegram_chat_id: str, telegram_message_id: str | int) -> str:
@@ -57,6 +58,16 @@ def remember_telegram_handoff_ref(
     handoff_id: str = "",
     source_message_id: str = "",
     status: str = "open",
+    urgency: str = "",
+    deadline_at: int = 0,
+    escalation_at: int = 0,
+    phone: str = "",
+    city: str = "",
+    service: str = "",
+    booking_date: str = "",
+    booking_time: str = "",
+    confirmation_needed: str = "",
+    assignee: str = "",
     path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
 ) -> dict:
     telegram_chat_id = str(telegram_chat_id).strip()
@@ -80,6 +91,18 @@ def remember_telegram_handoff_ref(
         "client_name": str(client_name or "").strip(),
         "handoff_text": str(handoff_text or "").strip()[-3000:],
         "status": str(status or existing.get("status") or "open"),
+        "urgency": str(urgency or existing.get("urgency") or "").strip(),
+        "deadline_at": int(deadline_at or existing.get("deadline_at") or 0),
+        "escalation_at": int(escalation_at or existing.get("escalation_at") or 0),
+        "phone": str(phone or existing.get("phone") or "").strip(),
+        "city": str(city or existing.get("city") or "").strip(),
+        "service": str(service or existing.get("service") or "").strip(),
+        "booking_date": str(booking_date or existing.get("booking_date") or "").strip(),
+        "booking_time": str(booking_time or existing.get("booking_time") or "").strip(),
+        "confirmation_needed": str(confirmation_needed or existing.get("confirmation_needed") or "").strip(),
+        "assignee": str(assignee or existing.get("assignee") or "").strip(),
+        "reminder_sent_at": int(existing.get("reminder_sent_at") or 0),
+        "escalation_sent_at": int(existing.get("escalation_sent_at") or 0),
         "draft_id": str(existing.get("draft_id") or ""),
         "closed_at": int(existing.get("closed_at") or 0),
         "created_at": int(existing.get("created_at") or now),

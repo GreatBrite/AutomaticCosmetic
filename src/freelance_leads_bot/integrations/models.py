@@ -17,6 +17,7 @@ class HandoffReason(str, Enum):
     PHOTO_CONSULTATION = "photo_consultation"
     HUMAN_REQUESTED = "human_requested"
     BOOKING_AMBIGUOUS = "booking_ambiguous"
+    BOOKING_CRITICAL = "booking_critical"
     COMPLAINT_OR_RISK = "complaint_or_risk"
     MISSING_DATA = "missing_data"
 

@@ -162,6 +162,36 @@ LLM-понимание свободных команд Ольги использ
 
 Смотреть `checks[].name == "avito_unanswered_queue"` и `data.actionable_count`.
 
+В Telegram открыть рабочий список:
+
+```text
+/avito_followups
+```
+
+По каждой карточке нужно выбрать действие:
+
+- `Закрыто` — клиент уже получил финальный ответ.
+- `Не актуально` — обещание больше не требует ответа клиенту.
+- `Срочно` — поднять важность и показать выше в очереди.
+- `Напомнить позже` — временно убрать из повторных уведомлений.
+
+Если клиент пишет про запись, адрес, оплату, перенос или “я записана, всё в силе?”, это считается критичным: задачу нельзя закрывать обещанием “уточню”, нужен финальный ответ клиенту или явное решение Ольги.
+
+### `avito_pending_followups`
+
+Это зависшие обещания бота после фраз вроде “уточню”, “проверю”, “подтвержу”.
+
+Если обещание просрочено дольше `AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS`, `ops_status --strict` возвращает error. По умолчанию SLA — 3 часа.
+
+Проверить хвосты:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --json
+journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
+```
+
+После ручного ответа в Avito монитор должен запомнить исходящее сообщение и закрыть открытую задачу, если ответ похож на финальный.
+
 ### `avito_unanswered_report_fresh`
 
 Monitor может зависнуть или перестать обновлять отчёт.
@@ -183,6 +213,30 @@ journalctl -u yclients-avito-unanswered-monitor.service -n 100 --no-pager
 .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --json
 journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
 ```
+
+## Проверка визитов и допродажи
+
+Вечерние карточки визитов отправляет timer:
+
+```bash
+systemctl status yclients-visit-confirmations.timer --no-pager
+systemctl list-timers --all yclients-visit-confirmations.timer --no-pager
+```
+
+Ручной запуск:
+
+```bash
+.venv/bin/python scripts/send_visit_confirmations.py --date 2026-07-22 --force --no-quiet-empty
+```
+
+В Telegram можно запросить карточки командой:
+
+```text
+/visit_confirmations
+/care_followups
+```
+
+Follow-up клиентам отправляется только если включён `TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED`. До проверки черновиков держать этот флаг выключенным.
 
 ## Что делать при data/disk warning
 

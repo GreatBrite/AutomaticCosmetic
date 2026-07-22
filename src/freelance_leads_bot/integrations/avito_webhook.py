@@ -16,14 +16,22 @@ from .avito import avito_inbound_message, is_avito_message_event
 from .avito_consultant import AvitoAgentPlanner, AvitoConsultant, CodexToolLoopPlanner
 from .avito_dedup import PersistentProcessedEventStore
 from .avito_media import AvitoApiPhotoResolver, AvitoPhotoResolver, enrich_reply_handoff_photos
+from .avito_read import AvitoReadGateway, avito_read_client_from_settings
 from .avito_history import prepare_avito_outgoing_text, remember_avito_outgoing
 from .avito_sender import AvitoSender, avito_sender_from_settings
-from .avito_turn_buffer import batch_to_inbound_message, enqueue_avito_turn_message, pop_due_avito_turn_batches
+from .avito_turn_buffer import (
+    batch_to_inbound_message,
+    enqueue_avito_turn_message,
+    mark_avito_turn_batch_failed,
+    mark_avito_turn_batch_processed,
+    pop_due_avito_turn_batches,
+)
 from .avito_voice import AvitoApiVoiceResolver, AvitoVoiceResolver
 from .config import IntegrationSettings
 from .codex_planner import CodexPlannerRunner
 from .codex_review import AvitoDraftReviewer, CodexDraftReviewer
 from .handoff_notify import HandoffNotifier, handoff_notifier_from_settings
+from .handoff_refs import update_latest_handoff_for_chat
 from .mentor_memory import MentorMemoryService
 from .expert_rag import ExpertRagStore
 from .runtime import booking_from_settings, rag_retrieval_from_settings
@@ -56,6 +64,12 @@ def get_booking(settings: IntegrationSettings = Depends(get_settings)) -> YClien
 
 def get_sender(settings: IntegrationSettings = Depends(get_settings)) -> AvitoSender:
     return avito_sender_from_settings(settings)
+
+
+def get_avito_reader(settings: IntegrationSettings = Depends(get_settings)) -> AvitoReadGateway | None:
+    if not settings.avito_send_enabled:
+        return None
+    return avito_read_client_from_settings(settings)
 
 
 def get_handoff_notifier(settings: IntegrationSettings = Depends(get_settings)) -> HandoffNotifier:
@@ -191,6 +205,7 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
     )
     planner = get_planner(settings)
     sender = avito_sender_from_settings(settings)
+    avito_reader = get_avito_reader(settings)
     photo_resolver = AvitoApiPhotoResolver(settings) if settings.avito_ready else None
     history_store = LeadStore(settings.telegram_admin_history_db_path)
     reviewer = get_reviewer(settings)
@@ -205,6 +220,7 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
                 toolbox=toolbox,
                 planner=planner,
                 sender=sender,
+                avito_reader=avito_reader,
                 handoff_notifier=handoff_notifier,
                 photo_resolver=photo_resolver,
                 history_store=history_store,
@@ -229,6 +245,11 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
                     "handoff_notify": result.get("handoff_notify"),
                 }
             )
+        if result.get("ok"):
+            _mark_batch_messages_processed(message)
+            mark_avito_turn_batch_processed(batch)
+        else:
+            mark_avito_turn_batch_failed(batch, str(result.get("error") or "unknown_error"))
         results.append(result)
     return results
 
@@ -240,6 +261,7 @@ async def avito_webhook(
     toolbox: AutomationToolbox = Depends(get_toolbox),
     planner: AvitoAgentPlanner | None = Depends(get_planner),
     sender: AvitoSender = Depends(get_sender),
+    avito_reader: AvitoReadGateway | None = Depends(get_avito_reader),
     handoff_notifier: HandoffNotifier = Depends(get_handoff_notifier),
     photo_resolver: AvitoPhotoResolver | None = Depends(get_photo_resolver),
     voice_resolver: AvitoVoiceResolver | None = Depends(get_voice_resolver),
@@ -260,6 +282,7 @@ async def avito_webhook(
     message = await transcribe_avito_voice_message(message, voice_resolver=voice_resolver)
     ignore_reason = _ignore_reason(event, message, settings)
     if ignore_reason:
+        manual_outgoing = _remember_manual_avito_outgoing_if_needed(message, settings, history_store, ignore_reason)
         _log_webhook(
             {
                 "event": "ignored",
@@ -270,12 +293,13 @@ async def avito_webhook(
                 "text_preview": _text_preview(message.text),
                 "voice_id": message.metadata.get("voice_id"),
                 "voice_transcription_error": message.metadata.get("voice_transcription_error"),
+                "manual_outgoing": manual_outgoing,
             }
         )
-        return {"ok": True, "ignored": True, "reason": ignore_reason, "message_id": message.message_id}
+        return {"ok": True, "ignored": True, "reason": ignore_reason, "message_id": message.message_id, "manual_outgoing": manual_outgoing}
 
     dedup_key = f"{message.chat_id}:{message.message_id}" if message.message_id else ""
-    if not processed_events.mark_once(dedup_key):
+    if processed_events.contains(dedup_key):
         _log_webhook({"event": "ignored", "reason": "duplicate", "chat_id": message.chat_id, "message_id": message.message_id})
         return {"ok": True, "ignored": True, "reason": "duplicate", "message_id": message.message_id}
 
@@ -303,6 +327,7 @@ async def avito_webhook(
         toolbox=toolbox,
         planner=planner,
         sender=sender,
+        avito_reader=avito_reader,
         handoff_notifier=handoff_notifier,
         photo_resolver=photo_resolver,
         history_store=history_store,
@@ -322,7 +347,92 @@ async def avito_webhook(
             "handoff_notify": result.get("handoff_notify"),
         }
     )
+    if result.get("ok"):
+        processed_events.mark_once(dedup_key)
     return result
+
+
+def _mark_batch_messages_processed(message: Any) -> None:
+    chat_id = str(message.chat_id or "")
+    if not chat_id:
+        return
+    raw_messages = message.metadata.get("raw_messages") if isinstance(message.metadata, dict) else None
+    if isinstance(raw_messages, list) and raw_messages:
+        for raw in raw_messages:
+            if isinstance(raw, dict):
+                message_id = str(raw.get("message_id") or raw.get("id") or "").strip()
+                if message_id:
+                    processed_events.mark_once(f"{chat_id}:{message_id}")
+        return
+    for message_id in str(message.message_id or "").split(","):
+        message_id = message_id.strip()
+        if message_id:
+            processed_events.mark_once(f"{chat_id}:{message_id}")
+
+
+def _remember_manual_avito_outgoing_if_needed(
+    message: Any,
+    settings: IntegrationSettings,
+    history_store: LeadStore | None,
+    ignore_reason: str,
+) -> dict[str, Any]:
+    if ignore_reason not in {"own_message", "not_incoming"}:
+        return {}
+    if not _is_avito_outgoing_from_business(message, settings):
+        return {}
+    text = str(message.text or "").strip()
+    if not text:
+        return {}
+    remember_avito_outgoing(history_store, message.chat_id, text)
+    close_status = ""
+    if _looks_like_final_outgoing_after_handoff(text):
+        close_status = "closed" if update_latest_handoff_for_chat(message.chat_id, "closed") else ""
+    return {"remembered": bool(history_store), "closed_handoff": bool(close_status), "status": close_status}
+
+
+def _is_avito_outgoing_from_business(message: Any, settings: IntegrationSettings) -> bool:
+    direction = str((message.metadata or {}).get("direction") or "").lower()
+    author_id = (message.metadata or {}).get("author_id")
+    return direction == "out" or bool((message.metadata or {}).get("is_own_account")) or _is_own_message(author_id, settings)
+
+
+def _looks_like_final_outgoing_after_handoff(text: str) -> bool:
+    normalized = " ".join(str(text or "").casefold().replace("ё", "е").split())
+    if not normalized:
+        return False
+    promise_markers = (
+        "уточню",
+        "уточним",
+        "проверю",
+        "проверим",
+        "вернусь с ответом",
+        "вернемся с ответом",
+        "напишу точн",
+        "подтвержу",
+        "подтвердим",
+        "сверю",
+        "сверим",
+        "передам",
+    )
+    if any(marker in normalized for marker in promise_markers):
+        return False
+    final_markers = (
+        "адрес",
+        "ближайшее время",
+        "есть на",
+        "можете приходить",
+        "записала",
+        "записали",
+        "запись подтвержд",
+        "все в силе",
+        "всё в силе",
+        "прием",
+        "приём",
+        "стоимость",
+        "предоплат",
+        "оплат",
+    )
+    return any(marker in normalized for marker in final_markers)
 
 
 async def transcribe_avito_voice_message(message: Any, *, voice_resolver: AvitoVoiceResolver | None) -> Any:
@@ -351,6 +461,7 @@ async def process_avito_message(
     toolbox: AutomationToolbox,
     planner: AvitoAgentPlanner | None,
     sender: AvitoSender,
+    avito_reader: AvitoReadGateway | None = None,
     handoff_notifier: HandoffNotifier,
     photo_resolver: AvitoPhotoResolver | None,
     history_store: LeadStore | None = None,
@@ -382,12 +493,14 @@ async def process_avito_message(
     if _is_ack_after_pending_reply(message, conversation_history):
         if history_store:
             history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
+        mark_read = await _mark_avito_chat_read(avito_reader, _account_id(message.metadata.get("account_id"), settings), message.chat_id)
         return {
             "ok": True,
             "ignored": True,
             "reason": "client_ack_after_pending_reply",
             "message_id": message.message_id,
             "conversation_key": conversation_key,
+            "mark_read": mark_read,
         }
     if _looks_like_own_echo(conversation_history, message):
         return {
@@ -403,6 +516,7 @@ async def process_avito_message(
         if history_store:
             history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
             remember_avito_outgoing(history_store, message.chat_id, reply)
+        mark_read = await _mark_avito_chat_read(avito_reader, _account_id(message.metadata.get("account_id"), settings), message.chat_id)
         return {
             "ok": True,
             "action": "empty_chat_greeting",
@@ -417,6 +531,7 @@ async def process_avito_message(
             "planner": None,
             "draft_review": None,
             "conversation_key": conversation_key,
+            "mark_read": mark_read,
         }
     decision = await consultant.respond(message, conversation_history=conversation_history)
     account_id = _account_id(message.metadata.get("account_id"), settings)
@@ -430,6 +545,7 @@ async def process_avito_message(
     if history_store:
         history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
         remember_avito_outgoing(history_store, message.chat_id, outgoing_reply or decision.reply)
+    mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id)
     return {
         "ok": True,
         "action": decision.action,
@@ -444,7 +560,18 @@ async def process_avito_message(
         "planner": decision.metadata.get("planner"),
         "draft_review": decision.metadata.get("draft_review"),
         "conversation_key": decision.metadata.get("conversation_key") or conversation_key,
+        "mark_read": mark_read,
     }
+
+
+async def _mark_avito_chat_read(avito_reader: AvitoReadGateway | None, account_id: int, chat_id: str) -> dict[str, Any]:
+    if not avito_reader or not account_id or not chat_id:
+        return {"ok": False, "reason": "mark_read_not_configured"}
+    try:
+        result = await avito_reader.mark_chat_read(account_id, chat_id)
+    except Exception as exc:
+        return {"ok": False, "error": repr(exc)}
+    return result if isinstance(result, dict) else {"ok": True}
 
 
 def _history_user_content(message: Any) -> str:
@@ -577,8 +704,16 @@ def _is_empty_chat_prompt(message: Any) -> bool:
 
 
 def _is_ack_after_pending_reply(message: Any, history: list[dict[str, Any]]) -> bool:
+    raw_text = str(message.text or "").casefold()
+    if "?" in raw_text or any(marker in raw_text for marker in ("жду", "адрес", "где", "когда", "запиш", "гелендж", "моск", "ростов", "краснодар", "питер", "спб")):
+        return False
     text = _normalize_ack_text(message.text)
-    if not text or not any(ack == text or text.startswith(ack + " ") for ack in ("хорошо", "жду", "ок", "окей", "ладно", "спасибо", "спасибо жду")):
+    if not (
+        text in {"хорошо", "хорошо спасибо", "ок", "окей", "ладно", "спасибо", "спасибо большое", "благодарю", "поняла", "понял"}
+        or text.startswith("спасибо не надо")
+        or text.startswith("не надо")
+        or text.startswith("не нужно")
+    ):
         return False
     for item in history[-6:]:
         if str(item.get("role") or "") != "assistant":
@@ -591,6 +726,6 @@ def _is_ack_after_pending_reply(message: Any, history: list[dict[str, Any]]) -> 
 
 def _normalize_ack_text(text: str) -> str:
     normalized = _normalize_echo_text(text)
-    for char in ",.!?;:…":
+    for char in ",.!?;:…🌸🙏👍❤❤️":
         normalized = normalized.replace(char, "")
     return " ".join(normalized.split())

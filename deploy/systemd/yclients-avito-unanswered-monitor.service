@@ -1,5 +1,5 @@
 [Unit]
-Description=AutomaticCosmetic Avito unanswered monitor with delayed autoreply
+Description=AutomaticCosmetic Avito unanswered monitor with delayed autoreply and Olga alerts
 After=network-online.target yclients-avito-webhook.service
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/AutomaticCosmetic
 Environment=PATH=/root/.local/bin:/root/AutomaticCosmetic/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/root/AutomaticCosmetic/.venv/bin/python /root/AutomaticCosmetic/scripts/avito_unanswered_monitor.py --autoreply
+ExecStart=/root/AutomaticCosmetic/.venv/bin/python /root/AutomaticCosmetic/scripts/avito_unanswered_monitor.py --autoreply --notify
 Restart=always
 RestartSec=10
 

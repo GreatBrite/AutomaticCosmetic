@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .expert_rag import APPROVED, ExpertRagStore, infer_metadata
@@ -46,7 +46,9 @@ class RagRetrievalService:
         self.service_catalog = service_catalog or ServiceCatalogStore()
 
     def retrieve(self, request: RagRetrievalRequest) -> RagRetrievalResult:
-        query = " ".join(part for part in (request.text, request.service_hint, request.service_key) if part)
+        text = _strip_batch_system_text(request.text)
+        request = replace(request, text=text)
+        query = " ".join(part for part in (text, request.service_hint, request.service_key) if part)
         service_filter = self._service_filter(request)
         request_blocker = _request_autoanswer_blocker(request, service_filter)
         matches = self.store.search(
@@ -136,6 +138,10 @@ class RagRetrievalService:
 def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
     return answer.get("status") == APPROVED and metadata.get("autoanswer_allowed") is not False
+
+
+def _strip_batch_system_text(text: str) -> str:
+    return re.sub(r"(?iu)\bклиент прислал несколько сообщений подряд:?\s*", " ", str(text or "")).strip()
 
 
 def _price_conflict(answers: list[dict[str, Any]]) -> bool:

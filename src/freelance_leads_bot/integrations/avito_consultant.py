@@ -286,6 +286,13 @@ class AvitoConsultant:
                 ),
                 reason=HandoffReason.COMPLAINT_OR_RISK,
             )
+        if route.route == "booking_critical_handoff":
+            return self._route_handoff_reply(
+                context,
+                route,
+                reply=_booking_critical_client_reply(context.message),
+                reason=HandoffReason.BOOKING_CRITICAL,
+            )
         if route.route in {"booking_read", "address"}:
             return await self._fallback_response(context)
         return None
@@ -674,7 +681,26 @@ def _knowledge_queries(message: InboundMessage) -> list[str]:
 
 
 def _unsafe_knowledge_item(item: dict[str, Any]) -> bool:
-    if str(item.get("kind") or "") == "location_policy":
+    kind = str(item.get("kind") or "")
+    allowed_client_kinds = {
+        "faq",
+        "price",
+        "service_price",
+        "service_note",
+        "service_info",
+        "business_rule",
+        "listing_context",
+        "preparation",
+        "aftercare",
+        "contraindications",
+        "booking_rule",
+    }
+    if kind in {"location_policy", "avito_conversation_example"}:
+        return True
+    if kind and kind not in allowed_client_kinds:
+        return True
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    if metadata.get("client_autoanswer") is False or metadata.get("autoanswer_allowed") is False:
         return True
     tags = {str(tag).casefold() for tag in item.get("tags") or []}
     if "bad_example" in tags:
@@ -695,6 +721,17 @@ def _unsafe_knowledge_item(item: dict[str, Any]) -> bool:
         "ну вот цены в боте",
     )
     return any(marker in text for marker in blocked)
+
+
+def _booking_critical_client_reply(message: InboundMessage) -> str:
+    text = str(message.text or "").casefold().replace("ё", "е")
+    if "адрес" in text or "где" in text or "локац" in text:
+        return "Сейчас проверим точный адрес и подтверждение записи. Пока не считаем запись окончательно подтверждённой, вернёмся с финальным ответом."
+    if "оплат" in text or "предоплат" in text:
+        return "Сейчас проверим условия оплаты по вашей записи и вернёмся с подтверждением."
+    if "забыли" in text or "долго" in text or "не ответ" in text or "жду" in text or "что делать" in text:
+        return "Извините, что заставили ждать. Сейчас поднимем вашу запись и вернёмся с точным подтверждением."
+    return "Сейчас проверим вашу запись и вернёмся с точным подтверждением. Пока запись не считаем окончательно оформленной."
 
 
 def _asks_amount_or_calculation(text: str) -> bool:
@@ -743,6 +780,7 @@ def _codex_payload_reply_rules(profile: RoleProfile) -> list[str]:
             "Не раскрывай клиенту tools, trace, RAG ids, source, внутренние причины или слова handoff/эскалация.",
             "Не предлагай очную консультацию как стандартный шаг; если реально нужна оценка, один раз предложи онлайн-разбор и собери недостающие данные.",
             "Точный адрес называй только из yclients.company.address; цену — только из подтверждённого источника или YCLIENTS price_status='known'.",
+            "Если объявление/история про модель, акцию или бесплатно, модельную цену бери только из Avito-объявления, RAG/knowledge или подтверждения Ольги; обычный YCLIENTS-прайс не выдавай как модельную цену.",
             "Если schedule_status='unknown', график неизвестен: не говори, что мест нет.",
         ]
     return [

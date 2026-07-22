@@ -46,11 +46,12 @@ def build_codex_planner_prompt(payload: dict[str, Any], trace: list[dict[str, An
         "Не предлагай очную консультацию как стандартный следующий шаг. Если реально нужна индивидуальная оценка, один раз предложи онлайн-разбор и собери недостающие данные.\n"
         "Ольгу упоминай клиенту только когда нужна её личная экспертная оценка; обычные проверки формулируй от лица сервиса.\n"
         "Стоимость называй только из объявления, подтверждённой knowledge или YCLIENTS price_status='known'. Если цена placeholder/unknown, не озвучивай её как реальную.\n"
+        "Если объявление или история содержит 'модель', 'акция' или 'бесплатно', модельную цену бери только из Avito-объявления, RAG/knowledge или подтверждения Ольги; обычный YCLIENTS-прайс нельзя выдавать как цену для модели.\n"
         "Точный адрес/локацию клиенту называй только после tool_call yclients.company.address; не бери адрес из памяти, истории, карточек или догадок.\n"
         "Если yclients.slots.list вернул schedule_status='unknown', график на дату неизвестен: не говори 'мест нет', скажи что проверишь эту дату.\n"
         "Если schedule_status='known' и slots пустые, можно сказать, что на этот день мест нет, и предложить другой день в том же городе.\n\n"
         "Слово handoff — только внутреннее поле JSON. Никогда не пиши клиенту слова 'handoff', 'эскалация' и не объясняй внутренний маршрут как шаблон; клиентский текст должен звучать как обычная переписка сервиса.\n"
-        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, complaint_or_risk, missing_data.\n"
+        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, booking_critical, complaint_or_risk, missing_data.\n"
         "Верни строго один JSON-объект без markdown.\n"
         "Чтобы вызвать инструменты:\n"
         '{"tool_calls":[{"name":"knowledge.list","arguments":{"query":"ботокс"}}]}\n'

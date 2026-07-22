@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -21,13 +22,19 @@ from src.freelance_leads_bot.integrations.agent_tools import AutomationToolbox
 from src.freelance_leads_bot.integrations.agent_trace import JsonlAgentTraceLogger
 from src.freelance_leads_bot.integrations.avito_consultant import CodexToolLoopPlanner
 from src.freelance_leads_bot.integrations.avito_media import AvitoApiPhotoResolver
-from src.freelance_leads_bot.integrations.avito_read import AvitoReadClient
+from src.freelance_leads_bot.integrations.avito_read import AvitoReadClient, AvitoReadGateway
 from src.freelance_leads_bot.integrations.avito_sender import avito_sender_from_settings
 from src.freelance_leads_bot.integrations.avito_webhook import process_avito_message
 from src.freelance_leads_bot.integrations.codex_planner import CodexPlannerRunner
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import ExpertRagStore
-from src.freelance_leads_bot.integrations.handoff_notify import handoff_notifier_from_settings
+from src.freelance_leads_bot.integrations.avito_followup_admin import (
+    apply_pending_followup_action,
+    pending_followup_card_text,
+    pending_followup_keyboard,
+    pending_followup_token,
+)
+from src.freelance_leads_bot.integrations.handoff_notify import handoff_notifier_from_settings, process_handoff_sla
 from src.freelance_leads_bot.integrations.models import AvitoListingContext, Channel, InboundMessage
 from src.freelance_leads_bot.integrations.roles import CodexRole, role_profile
 from src.freelance_leads_bot.integrations.runtime import booking_from_settings
@@ -38,6 +45,21 @@ DEFAULT_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
 DEFAULT_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_LOG_PATH = Path("data/avito_unanswered_monitor.log")
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
+FINAL_ACK_RE = re.compile(
+    r"(?iu)^\s*(хорошо|ок|окей|спасибо|спасибо большое|спасибо[, ]+не надо.*|не надо.*|не нужно.*|"
+    r"благодарю|поняла|понял|да|нет|👍|🙏|🌸)[.!?\s🙏👍🌸]*$"
+)
+CLIENT_CRITICAL_RE = re.compile(
+    r"(?iu)(жду|адрес|запиш|запись актуальн|актуальна ли запись|что делать|вы забыли|забыли|"
+    r"долго|отзыв|жалоб|оплат|предоплат|время|точно.*жд|сегодня.*приход|завтра.*приход|опозда|"
+    r"гелендж|моск|ростов|краснодар|питер|спб)"
+)
+CLIENT_ACTION_RE = re.compile(r"(?iu)(\?|как|где|когда|можно|сколько|подскаж|уточн|провер|гелендж|моск|ростов|краснодар|питер|спб)")
+BOT_PROMISE_RE = re.compile(
+    r"(?iu)(уточн(?:ю|им)|провер(?:ю|им)|верн[уеё]сь с ответом|верн[её]мся с ответом|"
+    r"напишу точн(?:ый|ую)|подтверж(?:у|дим)|свер(?:ю|им)|передам|сейчас проверим)"
+)
+BOT_FINAL_RE = re.compile(r"(?iu)(подтвержден[ао]?|записал[аи]?|адрес[:\s]|принимаем по адресу|можете приходить|оплата|предоплата|стоимость)")
 
 
 @dataclass(frozen=True)
@@ -54,6 +76,9 @@ class UnansweredChat:
     listing_city: str = ""
     raw_chat: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     raw_message: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    needs_action: bool = True
+    severity: str = "action"
+    reason: str = "latest_client_message"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,6 +94,9 @@ class UnansweredChat:
             "age_minutes": round(self.age_seconds / 60, 1),
             "listing_title": self.listing_title,
             "listing_city": self.listing_city,
+            "needs_action": self.needs_action,
+            "severity": self.severity,
+            "reason": self.reason,
         }
 
 
@@ -175,6 +203,7 @@ def _find_unanswered(
         return None
 
     listing_title, listing_city = _listing(chat)
+    classification = _classify_client_message(_message_text(latest_incoming))
     return UnansweredChat(
         account_id=account_id,
         chat_id=str(chat.get("id") or ""),
@@ -188,7 +217,211 @@ def _find_unanswered(
         listing_city=listing_city,
         raw_chat=chat,
         raw_message=latest_incoming,
+        needs_action=classification["needs_action"],
+        severity=classification["severity"],
+        reason=classification["reason"],
     )
+
+
+def _classify_client_message(text: str) -> dict[str, Any]:
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return {"needs_action": True, "severity": "action", "reason": "empty_or_media_message"}
+    if FINAL_ACK_RE.fullmatch(normalized):
+        return {"needs_action": False, "severity": "low", "reason": "final_ack"}
+    if CLIENT_CRITICAL_RE.search(normalized):
+        return {"needs_action": True, "severity": "critical", "reason": "critical_client_message"}
+    if CLIENT_ACTION_RE.search(normalized):
+        return {"needs_action": True, "severity": "action", "reason": "question_or_action_request"}
+    return {"needs_action": True, "severity": "action", "reason": "latest_client_message"}
+
+
+def _looks_like_bot_promise(text: str) -> bool:
+    return bool(BOT_PROMISE_RE.search(" ".join(str(text or "").split())))
+
+
+def _looks_like_bot_final_answer(text: str) -> bool:
+    normalized = " ".join(str(text or "").split())
+    return bool(normalized and not _looks_like_bot_promise(normalized))
+
+
+def _followup_key(*, account_id: int, chat_id: str, message_id: str) -> str:
+    return f"{account_id}:{chat_id}:{message_id}"
+
+
+def _message_id(message: dict[str, Any]) -> str:
+    return str(message.get("id") or message.get("message_id") or "").strip()
+
+
+def _latest_client_message_before(
+    messages: list[dict[str, Any]], *, account_id: int, created_before: int
+) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    for message in messages:
+        created = int(message.get("created") or 0)
+        if created > created_before:
+            continue
+        if _is_relevant_incoming(message, account_id=account_id):
+            latest = message
+    return latest
+
+
+def _active_pending_followups(state: dict[str, Any]) -> dict[str, Any]:
+    pending = state.setdefault("pending_followups", {})
+    if not isinstance(pending, dict):
+        pending = {}
+        state["pending_followups"] = pending
+    return pending
+
+
+def sync_pending_followups(
+    *,
+    account_id: int,
+    chat: dict[str, Any],
+    messages: list[dict[str, Any]],
+    state: dict[str, Any],
+    now: int,
+    reminder_seconds: int = 3600,
+    escalation_seconds: int = 10800,
+) -> None:
+    ordered = sorted(messages, key=lambda item: int(item.get("created") or 0))
+    pending = _active_pending_followups(state)
+    chat_id = str(chat.get("id") or "")
+    if not chat_id:
+        return
+    listing_title, listing_city = _listing(chat)
+    active_keys = {
+        key
+        for key, row in pending.items()
+        if isinstance(row, dict)
+        and int(row.get("account_id") or 0) == int(account_id)
+        and str(row.get("chat_id") or "") == chat_id
+        and not row.get("business_resolved")
+    }
+
+    for message in ordered:
+        created = int(message.get("created") or 0)
+        text = _message_text(message)
+        if _is_relevant_incoming(message, account_id=account_id):
+            for key in active_keys:
+                row = pending.get(key)
+                if not isinstance(row, dict) or row.get("business_resolved"):
+                    continue
+                promised_at = int(row.get("promised_at") or 0)
+                if created >= promised_at:
+                    row["client_ack_after_promise"] = True
+                    row["last_client_message"] = text
+                    row["last_client_message_at"] = created
+            continue
+
+        if not _is_outgoing_reply(message, account_id=account_id):
+            continue
+
+        message_id = _message_id(message) or str(created)
+        if _looks_like_bot_promise(text):
+            for key in list(active_keys):
+                row = pending.get(key)
+                if not isinstance(row, dict) or row.get("business_resolved"):
+                    continue
+                if created >= int(row.get("promised_at") or 0):
+                    row.update(
+                        {
+                            "business_status": "superseded_by_new_promise",
+                            "business_resolved": True,
+                            "closed_at": created,
+                            "closed_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else "",
+                            "final_answer": text,
+                            "overdue": False,
+                        }
+                    )
+                    active_keys.discard(key)
+            client_message = _latest_client_message_before(ordered, account_id=account_id, created_before=created)
+            client_text = _message_text(client_message) if client_message else ""
+            classification = _classify_client_message(client_text)
+            key = _followup_key(account_id=account_id, chat_id=chat_id, message_id=message_id)
+            row = pending.get(key) if isinstance(pending.get(key), dict) else {}
+            row.update(
+                {
+                    "account_id": account_id,
+                    "chat_id": chat_id,
+                    "client_name": client_name_from_chat(chat, account_id=account_id),
+                    "message_id": message_id,
+                    "bot_promise": text,
+                    "promised_at": created,
+                    "promised_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else "",
+                    "deadline_at": created + reminder_seconds,
+                    "escalation_at": created + escalation_seconds,
+                    "business_status": "awaiting_olga",
+                    "business_resolved": False,
+                    "client_replied": True,
+                    "client_replied_at": created,
+                    "client_ack_after_promise": bool(client_message and int(client_message.get("created") or 0) >= created),
+                    "last_client_message": client_text,
+                    "last_client_message_at": int(client_message.get("created") or 0) if client_message else 0,
+                    "listing_title": listing_title,
+                    "listing_city": listing_city,
+                    "severity": "critical" if classification["severity"] == "critical" or CLIENT_CRITICAL_RE.search(text) else "action",
+                    "reason": "bot_promised_followup",
+                }
+            )
+            pending[key] = row
+            active_keys.add(key)
+            continue
+
+        if _looks_like_bot_final_answer(text):
+            for key in list(active_keys):
+                row = pending.get(key)
+                if not isinstance(row, dict) or row.get("business_resolved"):
+                    continue
+                if created >= int(row.get("promised_at") or 0):
+                    row.update(
+                        {
+                            "business_status": "business_resolved",
+                            "business_resolved": True,
+                            "closed_at": created,
+                            "closed_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else "",
+                            "final_answer": text,
+                            "overdue": False,
+                        }
+                    )
+                    active_keys.discard(key)
+
+    for key in list(active_keys):
+        row = pending.get(key)
+        if not isinstance(row, dict) or row.get("business_resolved"):
+            continue
+        promised_at = int(row.get("promised_at") or 0)
+        deadline_at = int(row.get("deadline_at") or 0)
+        escalation_at = int(row.get("escalation_at") or 0)
+        row["age_seconds"] = max(0, now - promised_at)
+        row["age_minutes"] = round(row["age_seconds"] / 60, 1)
+        row["overdue"] = bool(deadline_at and now >= deadline_at)
+        row["urgent"] = bool(row.get("urgent")) or bool(escalation_at and now >= escalation_at)
+        row["business_status"] = "urgent" if row.get("urgent") else ("overdue" if row["overdue"] else "awaiting_olga")
+
+
+def pending_followup_rows(state: dict[str, Any], *, now: int, include_resolved: bool = False) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, row in _active_pending_followups(state).items():
+        if not isinstance(row, dict):
+            continue
+        if row.get("business_resolved") and not include_resolved:
+            continue
+        item = dict(row)
+        item["key"] = key
+        promised_at = int(item.get("promised_at") or 0)
+        if promised_at:
+            item["age_seconds"] = max(0, now - promised_at)
+            item["age_minutes"] = round(item["age_seconds"] / 60, 1)
+        deadline_at = int(item.get("deadline_at") or 0)
+        escalation_at = int(item.get("escalation_at") or 0)
+        item["overdue"] = bool(deadline_at and now >= deadline_at and not item.get("business_resolved"))
+        item["urgent"] = bool(item.get("urgent")) or bool(escalation_at and now >= escalation_at and not item.get("business_resolved"))
+        if not item.get("business_resolved"):
+            item["business_status"] = "urgent" if item.get("urgent") else ("overdue" if item["overdue"] else "awaiting_olga")
+        rows.append(item)
+    rows.sort(key=lambda item: (0 if item.get("business_status") == "overdue" else 1, -int(item.get("urgent") is True), int(item.get("promised_at") or 0)))
+    return rows
 
 
 def _state_key(item: UnansweredChat) -> str:
@@ -204,18 +437,19 @@ def _report_item(item: UnansweredChat, state: dict[str, Any]) -> dict[str, Any]:
     failed_row = failed.get(key) if isinstance(failed, dict) else None
     if isinstance(handled_row, dict):
         result = handled_row.get("result") if isinstance(handled_row.get("result"), dict) else {}
-        data["autoreply_state"] = "handled"
+        stale_ack = item.needs_action and result.get("ignored") and result.get("reason") == "client_ack_after_pending_reply"
+        data["autoreply_state"] = "pending" if stale_ack else "handled"
         data["handled_at"] = handled_row.get("handled_at")
         data["handled_action"] = result.get("action")
         data["ignored_reason"] = result.get("reason") if result.get("ignored") else ""
-        data["needs_action"] = False
+        data["needs_action"] = item.needs_action if stale_ack else False
     elif isinstance(failed_row, dict):
         data["autoreply_state"] = "failed"
         data["last_attempt_at"] = failed_row.get("last_attempt_at")
         data["needs_action"] = True
     else:
         data["autoreply_state"] = "pending"
-        data["needs_action"] = True
+        data["needs_action"] = item.needs_action
     return data
 
 
@@ -246,20 +480,47 @@ def _safe_avito_error(exc: AvitoApiError) -> dict[str, Any]:
 
 
 def _format_alert(items: list[UnansweredChat], *, max_items: int) -> str:
-    lines = ["Avito: есть неотвеченные входящие"]
+    critical = sum(1 for item in items if item.severity == "critical")
+    action = sum(1 for item in items if item.needs_action)
+    lines = [f"Avito: есть неотвеченные входящие | требуют действия: {action}, критичных: {critical}"]
     for index, item in enumerate(items[:max_items], start=1):
         age_min = int(item.age_seconds / 60)
         label = item.client_name or item.chat_id
         text = item.text.replace("\n", " ").strip()
         if len(text) > 180:
             text = text[:177] + "..."
-        lines.append(f"{index}. {label} — {age_min} мин без ответа")
+        marker = "КРИТИЧНО" if item.severity == "critical" else ("нужно действие" if item.needs_action else "похоже на финальное спасибо/ок")
+        lines.append(f"{index}. {label} — {age_min} мин без ответа ({marker})")
         if item.listing_city or item.listing_title:
             lines.append(f"   Объявление: {item.listing_city} {item.listing_title}".strip())
         lines.append(f"   Сообщение: {text}")
         lines.append(f"   chat_id: {item.chat_id}")
     if len(items) > max_items:
         lines.append(f"…и ещё {len(items) - max_items}")
+    return "\n".join(lines)
+
+
+def _format_followup_alert(rows: list[dict[str, Any]], *, max_items: int) -> str:
+    overdue = sum(1 for row in rows if row.get("overdue") or row.get("business_status") == "overdue")
+    critical = sum(1 for row in rows if row.get("severity") == "critical")
+    lines = [f"Avito: зависшие обещания бота | просрочено: {overdue}, критичных: {critical}"]
+    for index, row in enumerate(rows[:max_items], start=1):
+        age_min = int(row.get("age_seconds") or 0) // 60
+        text = " ".join(str(row.get("bot_promise") or "").split())
+        if len(text) > 150:
+            text = text[:147] + "..."
+        lines.append(f"{index}. {row.get('client_name') or row.get('chat_id')} — {age_min} мин, {row.get('business_status')}")
+        listing = " | ".join(str(row.get(key) or "").strip() for key in ("listing_city", "listing_title") if row.get(key))
+        if listing:
+            lines.append(f"   Объявление: {listing}")
+        lines.append(f"   Обещал бот: {text}")
+        last_client = " ".join(str(row.get("last_client_message") or "").split())
+        if last_client:
+            lines.append(f"   Последнее от клиента: {last_client[:150]}")
+        lines.append("   Нужно сделать: дать клиенту финальный ответ или закрыть обещание как неактуальное.")
+        lines.append(f"   chat_id: {row.get('chat_id')}")
+    if len(rows) > max_items:
+        lines.append(f"…и ещё {len(rows) - max_items}")
     return "\n".join(lines)
 
 
@@ -347,6 +608,7 @@ async def autoreply_once(
     items: list[UnansweredChat],
     state: dict[str, Any],
     state_path: Path,
+    avito_reader: AvitoReadGateway | None = None,
 ) -> dict[str, Any]:
     now = int(time.time())
     if not state.get("activated_at"):
@@ -394,6 +656,7 @@ async def autoreply_once(
                 photo_resolver=photo_resolver,
                 history_store=history_store,
                 expert_rag=expert_rag,
+                avito_reader=avito_reader,
                 force_unanswered_autoreply=True,
             )
         except Exception as exc:
@@ -419,6 +682,7 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
         "action": result.get("action"),
         "handoff": result.get("handoff"),
         "send": result.get("send"),
+        "mark_read": result.get("mark_read"),
     }
 
 
@@ -429,16 +693,28 @@ async def audit_once(
     messages_per_chat: int,
     min_age_seconds: int,
     lookback_seconds: int,
+    state: dict[str, Any] | None = None,
+    reader: AvitoReadGateway | None = None,
 ) -> list[UnansweredChat]:
-    reader = AvitoReadClient(settings)
+    reader = reader or AvitoReadClient(settings)
     account_ids = list(dict.fromkeys([settings.avito_account_id, *settings.avito_account_ids]))
     account_ids = [account_id for account_id in account_ids if account_id]
     now = int(time.time())
     result: list[UnansweredChat] = []
 
     for account_id in account_ids:
-        chats_payload = await reader.list_chats(account_id, limit=chat_limit)
-        chats = _items(chats_payload, "chats", "items")
+        chats: list[dict[str, Any]] = []
+        offset = 0
+        remaining = max(0, chat_limit)
+        while remaining > 0:
+            page_limit = min(remaining, 100)
+            chats_payload = await reader.list_chats(account_id, limit=page_limit, offset=offset)
+            page = _items(chats_payload, "chats", "items")
+            chats.extend(page)
+            if len(page) < page_limit:
+                break
+            offset += page_limit
+            remaining -= page_limit
         update_client_name_cache({str(chat.get("id") or ""): client_name_from_chat(chat, account_id=account_id) for chat in chats})
         for chat in chats:
             chat_id = str(chat.get("id") or "")
@@ -446,6 +722,8 @@ async def audit_once(
                 continue
             messages_payload = await reader.get_chat_messages(account_id, chat_id, limit=messages_per_chat)
             messages = _items(messages_payload, "messages", "items")
+            if state is not None:
+                sync_pending_followups(account_id=account_id, chat=chat, messages=messages, state=state, now=now)
             item = _find_unanswered(
                 account_id=account_id,
                 chat=chat,
@@ -466,68 +744,146 @@ async def main() -> None:
     parser.add_argument("--once", action="store_true", help="Run one audit and exit.")
     parser.add_argument("--notify", action="store_true", help="Send Telegram notification for newly detected unanswered chats.")
     parser.add_argument("--autoreply", action="store_true", help="Run delayed Avito autoreply for new unanswered chats.")
-    parser.add_argument("--chat-limit", type=int, default=_env_int("AVITO_UNANSWERED_CHAT_LIMIT", 50))
-    parser.add_argument("--messages-per-chat", type=int, default=_env_int("AVITO_UNANSWERED_MESSAGES_PER_CHAT", 50))
-    parser.add_argument("--min-age-seconds", type=int, default=_env_int("AVITO_UNANSWERED_MIN_AGE_SECONDS", 900))
-    parser.add_argument("--lookback-seconds", type=int, default=_env_int("AVITO_UNANSWERED_LOOKBACK_SECONDS", 172800))
-    parser.add_argument("--interval-seconds", type=int, default=_env_int("AVITO_UNANSWERED_INTERVAL_SECONDS", 300))
-    parser.add_argument("--repeat-alert-seconds", type=int, default=_env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600))
-    parser.add_argument("--max-alert-items", type=int, default=_env_int("AVITO_UNANSWERED_MAX_ALERT_ITEMS", 10))
+    parser.add_argument("--chat-limit", type=int, default=None)
+    parser.add_argument("--messages-per-chat", type=int, default=None)
+    parser.add_argument("--min-age-seconds", type=int, default=None)
+    parser.add_argument("--lookback-seconds", type=int, default=None)
+    parser.add_argument("--interval-seconds", type=int, default=None)
+    parser.add_argument("--repeat-alert-seconds", type=int, default=None)
+    parser.add_argument("--max-alert-items", type=int, default=None)
+    parser.add_argument("--followup-token", default="", help="Apply an admin action to a pending followup by token, or pass the full state key.")
+    parser.add_argument("--followup-action", choices=("done", "stale", "urgent", "later"), default="done")
+    parser.add_argument("--followup-actor", default="cli")
     parser.add_argument("--state-path", type=Path, default=Path(os.getenv("AVITO_UNANSWERED_STATE_PATH", str(DEFAULT_STATE_PATH))))
     parser.add_argument("--report-path", type=Path, default=Path(os.getenv("AVITO_UNANSWERED_REPORT_PATH", str(DEFAULT_REPORT_PATH))))
     parser.add_argument("--log-path", type=Path, default=Path(os.getenv("AVITO_UNANSWERED_LOG_PATH", str(DEFAULT_LOG_PATH))))
     args = parser.parse_args()
 
     settings = IntegrationSettings.from_env()
+    chat_limit = args.chat_limit if args.chat_limit is not None else _env_int("AVITO_UNANSWERED_CHAT_LIMIT", 50)
+    messages_per_chat = args.messages_per_chat if args.messages_per_chat is not None else _env_int("AVITO_UNANSWERED_MESSAGES_PER_CHAT", 50)
+    min_age_seconds = args.min_age_seconds if args.min_age_seconds is not None else settings.avito_unanswered_min_age_seconds
+    lookback_seconds = args.lookback_seconds if args.lookback_seconds is not None else settings.avito_unanswered_lookback_seconds
+    interval_seconds = args.interval_seconds if args.interval_seconds is not None else settings.avito_unanswered_interval_seconds
+    repeat_alert_seconds = args.repeat_alert_seconds if args.repeat_alert_seconds is not None else _env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600)
+    max_alert_items = args.max_alert_items if args.max_alert_items is not None else _env_int("AVITO_UNANSWERED_MAX_ALERT_ITEMS", 10)
     notify_enabled = args.notify or _env_bool("AVITO_UNANSWERED_NOTIFY_ENABLED")
     autoreply_enabled = args.autoreply or _env_bool("AVITO_UNANSWERED_AUTOREPLY_ENABLED")
     notifier = handoff_notifier_from_settings(settings) if notify_enabled else None
+    if args.followup_token:
+        token = pending_followup_token(args.followup_token) if ":" in args.followup_token else args.followup_token
+        result = apply_pending_followup_action(
+            state_path=args.state_path,
+            token=token,
+            action=args.followup_action,
+            actor=args.followup_actor,
+        )
+        print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+        return
 
     while True:
         try:
+            state = _load_state(args.state_path)
             items = await audit_once(
                 settings=settings,
-                chat_limit=args.chat_limit,
-                messages_per_chat=args.messages_per_chat,
-                min_age_seconds=args.min_age_seconds,
-                lookback_seconds=args.lookback_seconds,
+                chat_limit=chat_limit,
+                messages_per_chat=messages_per_chat,
+                min_age_seconds=min_age_seconds,
+                lookback_seconds=lookback_seconds,
+                state=state,
             )
             now = int(time.time())
+            followups = pending_followup_rows(state, now=now)
+            overdue_followups = [row for row in followups if row.get("overdue")]
+            critical_followups = [row for row in followups if row.get("severity") == "critical"]
             report = {
                 "ok": True,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "count": len(items),
                 "actionable_count": 0,
+                "critical_unanswered_count": 0,
+                "final_ack_count": 0,
+                "pending_followup_count": len(followups),
+                "overdue_followup_count": len(overdue_followups),
+                "critical_followup_count": len(critical_followups),
                 "items": [],
+                "pending_followups": followups,
             }
-            report_state = _load_state(args.state_path)
-            report["items"] = [_report_item(item, report_state) for item in items]
+            report["items"] = [_report_item(item, state) for item in items]
             report["actionable_count"] = sum(1 for item in report["items"] if item.get("needs_action"))
+            report["critical_unanswered_count"] = sum(
+                1 for item in report["items"] if item.get("needs_action") and item.get("severity") == "critical"
+            )
+            report["final_ack_count"] = sum(1 for item in report["items"] if item.get("reason") == "final_ack")
             args.report_path.parent.mkdir(parents=True, exist_ok=True)
             args.report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
             notified = 0
+            followup_notified = 0
             autoreply = {}
-            if notifier and items:
-                state = _load_state(args.state_path)
+            actionable_items = [item for item in items if item.needs_action]
+            if notifier and actionable_items:
                 alerts = state.setdefault("alerts", {})
                 fresh: list[UnansweredChat] = []
-                for item in items:
+                for item in actionable_items:
                     key = _state_key(item)
                     previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
-                    if now - previous >= args.repeat_alert_seconds:
+                    if now - previous >= repeat_alert_seconds:
                         fresh.append(item)
                         alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
                 if fresh:
-                    await notifier.notify_text(_format_alert(fresh, max_items=args.max_alert_items))
+                    await notifier.notify_text(_format_alert(fresh, max_items=max_alert_items))
                     notified = len(fresh)
-                _save_state(args.state_path, state)
+
+            followup_alert_rows = [row for row in followups if row.get("overdue") or row.get("severity") == "critical"]
+            followup_alert_rows = [row for row in followup_alert_rows if int(row.get("snoozed_until") or 0) <= now]
+            if notifier and followup_alert_rows:
+                alerts = state.setdefault("followup_alerts", {})
+                fresh_rows: list[dict[str, Any]] = []
+                for row in followup_alert_rows:
+                    key = str(row.get("key") or "")
+                    if not key:
+                        continue
+                    previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
+                    if now - previous >= repeat_alert_seconds:
+                        fresh_rows.append(row)
+                        alerts[key] = {"last_alerted_at": now, "chat_id": row.get("chat_id"), "message_id": row.get("message_id")}
+                if fresh_rows:
+                    for row in fresh_rows[:max_alert_items]:
+                        key = str(row.get("key") or "")
+                        await notifier.notify_text(pending_followup_card_text(row), reply_markup=pending_followup_keyboard(key))
+                    followup_notified = min(len(fresh_rows), max_alert_items)
 
             if autoreply_enabled and settings.avito_unanswered_autoreply_enabled:
-                state = _load_state(args.state_path)
-                autoreply = await autoreply_once(settings=settings, items=items, state=state, state_path=args.state_path)
+                avito_reader = AvitoReadClient(settings) if settings.avito_ready and settings.avito_send_enabled else None
+                autoreply = await autoreply_once(
+                    settings=settings,
+                    items=actionable_items,
+                    state=state,
+                    state_path=args.state_path,
+                    avito_reader=avito_reader,
+                )
+            else:
+                _save_state(args.state_path, state)
 
-            summary = {"ok": True, "count": len(items), "notified": notified, "autoreply": autoreply, "report_path": str(args.report_path)}
+            handoff_sla = {}
+            if settings.handoff_notify_enabled:
+                sla_notifier = notifier or handoff_notifier_from_settings(settings)
+                handoff_sla = await process_handoff_sla(sla_notifier)
+
+            summary = {
+                "ok": True,
+                "count": len(items),
+                "actionable_count": report["actionable_count"],
+                "critical_unanswered_count": report["critical_unanswered_count"],
+                "pending_followup_count": len(followups),
+                "overdue_followup_count": len(overdue_followups),
+                "notified": notified,
+                "followup_notified": followup_notified,
+                "autoreply": autoreply,
+                "handoff_sla": handoff_sla,
+                "report_path": str(args.report_path),
+            }
             _append_log(args.log_path, {"event": "summary", **summary})
             print(json.dumps(summary, ensure_ascii=False), flush=True)
         except AvitoApiError as exc:
@@ -541,7 +897,7 @@ async def main() -> None:
 
         if args.once:
             return
-        await asyncio.sleep(args.interval_seconds)
+        await asyncio.sleep(interval_seconds)
 
 
 if __name__ == "__main__":

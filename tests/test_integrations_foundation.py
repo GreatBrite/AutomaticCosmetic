@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import time
 import zipfile
 
 import httpx
@@ -33,7 +34,7 @@ from src.freelance_leads_bot.integrations.avito_consultant import (
 )
 from src.freelance_leads_bot.integrations.client_handlers import RagAnswerService
 from src.freelance_leads_bot.integrations.client_router import route_client_message
-from src.freelance_leads_bot.integrations.booking_flow import AvitoBookingFlow, BookingRequest
+from src.freelance_leads_bot.integrations.booking_flow import AvitoBookingFlow, BookingRequest, extract_date
 from src.freelance_leads_bot.integrations.avito_sender import AvitoSdkSender, PreviewAvitoSender
 from src.freelance_leads_bot.integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing
 from src.freelance_leads_bot.integrations.avito_turn_buffer import batch_to_inbound_message
@@ -53,6 +54,8 @@ from src.freelance_leads_bot.integrations.care_crm import (
 from src.freelance_leads_bot.integrations.avito_turn_buffer import (
     batch_to_inbound_message,
     enqueue_avito_turn_message,
+    mark_avito_turn_batch_failed,
+    mark_avito_turn_batch_processed,
     pop_due_avito_turn_batches,
 )
 from src.freelance_leads_bot.integrations.avito_webhook import (
@@ -61,6 +64,7 @@ from src.freelance_leads_bot.integrations.avito_webhook import (
     get_booking,
     get_handoff_notifier,
     get_history_store,
+    get_avito_reader,
     get_photo_resolver,
     get_planner,
     get_reviewer,
@@ -71,6 +75,12 @@ from src.freelance_leads_bot.integrations.avito_webhook import (
     processed_events,
 )
 from src.freelance_leads_bot.integrations.avito_media import enrich_reply_handoff_photos
+from src.freelance_leads_bot.integrations.avito_followup_admin import (
+    apply_pending_followup_action,
+    parse_pending_followup_callback,
+    pending_followup_keyboard,
+    pending_followup_token,
+)
 from src.freelance_leads_bot.integrations.codex_planner import build_codex_planner_prompt, parse_codex_step
 from src.freelance_leads_bot.integrations.codex_review import (
     apply_review_outcome,
@@ -78,12 +88,14 @@ from src.freelance_leads_bot.integrations.codex_review import (
     sanitize_consultation_language,
 )
 from src.freelance_leads_bot.integrations.avito_history_import import import_telegram_zip_to_knowledge, parse_telegram_html_export
-from src.freelance_leads_bot.integrations.handoff_notify import PreviewHandoffNotifier, format_handoff_message
+from src.freelance_leads_bot.integrations.handoff_notify import PreviewHandoffNotifier, format_handoff_message, process_handoff_sla
 from src.freelance_leads_bot.integrations.handoff_refs import (
     find_telegram_handoff_ref,
     latest_unresolved_handoff_ref_for_chat,
+    load_telegram_handoff_refs,
     open_handoff_refs,
     remember_telegram_handoff_ref,
+    save_telegram_handoff_refs,
     update_handoff_status,
 )
 from src.freelance_leads_bot.integrations.mentor_memory import MentorMemoryService
@@ -144,8 +156,13 @@ from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalReque
 from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
 from scripts.avito_unanswered_monitor import (
     _find_unanswered as find_unanswered_avito_chat,
+    _format_alert as format_unanswered_alert,
+    _format_followup_alert as format_pending_followup_alert,
     _report_item as report_unanswered_item,
+    audit_once as audit_unanswered_once,
     autoreply_once as autoreply_unanswered_once,
+    pending_followup_rows,
+    sync_pending_followups,
 )
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.avito_live_telegram_relay import (
@@ -201,6 +218,15 @@ def test_prepare_avito_outgoing_text_removes_second_greeting_today(tmp_path) -> 
     text = prepare_avito_outgoing_text(store, "chat-1", "Добрый день! Продолжаем обсуждение.")
 
     assert text == "Продолжаем обсуждение."
+
+
+def test_prepare_avito_outgoing_text_masks_client_phone_echo(tmp_path) -> None:
+    store = LeadStore(tmp_path / "history.sqlite3")
+
+    text = prepare_avito_outgoing_text(store, "chat-1", "Записала ваш номер +7 999 123-45-67, сейчас проверю.")
+
+    assert "+7 999 123-45-67" not in text
+    assert "[телефон]" in text
 
 
 def test_telegram_handoff_preview_detects_new_and_legacy_card_headers() -> None:
@@ -495,6 +521,84 @@ def test_care_crm_applies_olga_text_reply_and_logs_interaction(tmp_path) -> None
     assert "Juvederm" in interaction["body"]
 
 
+@pytest.mark.anyio
+async def test_daily_visit_confirmation_sender_sends_cards_and_remembers_message(monkeypatch) -> None:
+    import scripts.send_visit_confirmations as sender
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages) + 100}}
+
+    class FakeStore:
+        remembered = []
+
+        def remember_confirmation_card(self, appointment_id, *, chat_id, message_id):
+            self.remembered.append((appointment_id, chat_id, message_id))
+
+    async def fake_rows(settings, day):
+        return [
+            {
+                "id": 42,
+                "client_name": "Анна",
+                "client_phone": "79990000000",
+                "scheduled_at": f"{day}T17:30:00",
+                "city": "Москва",
+                "booked_service_title": "Губы 1 мл",
+            }
+        ]
+
+    monkeypatch.setattr(sender, "_visit_confirmation_rows", fake_rows)
+    monkeypatch.setattr(sender, "CareCrmStore", FakeStore)
+    bot = FakeBot()
+
+    result = await sender.send_visit_confirmations_once(
+        settings=object(),
+        bot=bot,
+        chat_id="admin-chat",
+        day="2026-07-22",
+    )
+
+    assert result == {"ok": True, "day": "2026-07-22", "sent": 1, "empty": False}
+    assert len(bot.messages) == 2
+    assert "Проверка визитов за 2026-07-22" in bot.messages[0][1]
+    assert "Клиент: <b>Анна</b>" in bot.messages[1][1]
+    assert bot.messages[1][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "visitconfirm:42:yes"
+    assert FakeStore.remembered == [(42, "admin-chat", "102")]
+
+
+@pytest.mark.anyio
+async def test_daily_visit_confirmation_sender_is_quiet_when_empty(monkeypatch) -> None:
+    import scripts.send_visit_confirmations as sender
+
+    class FakeBot:
+        messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True}
+
+    async def fake_rows(settings, day):
+        return []
+
+    monkeypatch.setattr(sender, "_visit_confirmation_rows", fake_rows)
+    bot = FakeBot()
+
+    result = await sender.send_visit_confirmations_once(
+        settings=object(),
+        bot=bot,
+        chat_id="admin-chat",
+        day="2026-07-22",
+        quiet_empty=True,
+    )
+
+    assert result == {"ok": True, "day": "2026-07-22", "sent": 0, "empty": True}
+    assert bot.messages == []
+
+
 def test_actual_visit_details_parser_asks_for_clarification_when_unclear() -> None:
     assert parse_actual_visit_details("1 мл", booked_service_title="Увеличение ягодиц")["understood"] is False
     details = parse_actual_visit_details("по факту губы 0,7 мл")
@@ -775,6 +879,30 @@ async def test_visit_confirmation_service_syncs_yclients_day_and_formats_card(tm
     assert keyboard["inline_keyboard"][0][0]["callback_data"] == f"visitconfirm:{rows[0]['id']}:yes"
     assert "Проверка визита" in card
     assert "Биоревитализация" in card
+
+
+@pytest.mark.anyio
+async def test_booking_flow_exposes_explicit_state_for_slot_lifecycle() -> None:
+    service = Service(id=4, title="Губы", price=9000, duration_minutes=45)
+    message = InboundMessage(channel=Channel.AVITO, client_id="client-1", chat_id="chat-1", text="Москва губы 02.06 в 12:00 +7 999 000 00 00")
+    slots = [Slot(city="Москва", starts_at=datetime(2026, 6, 2, 12, 0), service_id=4)]
+
+    created = await AvitoBookingFlow(DryRunYClientsGateway(services=[service], slots=slots), allow_create=True).process(
+        BookingRequest(message=message, city="Москва", service_query="губы", preferred_date="2026-06-02", preferred_time="12:00", phone="+79990000000")
+    )
+    offered = await AvitoBookingFlow(DryRunYClientsGateway(services=[service], slots=slots), allow_create=True).process(
+        BookingRequest(message=message, city="Москва", service_query="губы", preferred_date="2026-06-02")
+    )
+    awaiting = await AvitoBookingFlow(DryRunYClientsGateway(services=[service], slots=slots), allow_create=False).process(
+        BookingRequest(message=message, city="Москва", service_query="губы", preferred_date="2026-06-02", preferred_time="12:00", phone="+79990000000")
+    )
+
+    assert created.action == "created"
+    assert created.state == "confirmed"
+    assert offered.action == "offer_slots"
+    assert offered.state == "offered_slot"
+    assert awaiting.action == "booking_confirmation_required"
+    assert awaiting.state == "awaiting_olga"
 
 
 def test_codex_logout_reset_moves_auth_json_to_backup(tmp_path, monkeypatch) -> None:
@@ -1880,6 +2008,62 @@ async def test_telegram_admin_context_is_persisted_per_thread(tmp_path) -> None:
 
 
 @pytest.mark.anyio
+async def test_telegram_admin_history_is_capped_with_summary_even_when_config_unlimited(tmp_path) -> None:
+    class FakeBot:
+        def send_message(self, chat_id, text, **delivery_params):
+            return None
+
+        def send_message_draft(self, chat_id, draft_id, text=None, message_thread_id=None):
+            return None
+
+        def send_chat_action(self, chat_id, action="typing", **delivery_params):
+            return None
+
+    payloads = []
+
+    async def fake_runner(payload, trace, progress_callback=None):
+        payloads.append(payload)
+        return {"action": "codex_admin_reply", "ok": True, "reply": "Готово."}
+
+    settings = replace(
+        _settings(),
+        telegram_admin_live_drafts_enabled=False,
+        telegram_admin_history_limit=0,
+        telegram_admin_history_db_path=tmp_path / "admin.sqlite3",
+    )
+    service = CodexTelegramAdminService(
+        AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")),
+        settings,
+        runner=fake_runner,
+    )
+    store = LeadStore(settings.telegram_admin_history_db_path)
+    history_key = "telegram:admin:admin-chat:thread:42"
+    for index in range(25):
+        store.add_codex_chat_message("user" if index % 2 == 0 else "assistant", f"old message {index}", history_key)
+    transport = TelegramAdminBotTransport(FakeBot(), service, settings, history_store=store)
+
+    await transport.handle_update(
+        {
+            "update_id": 7,
+            "message": {
+                "chat": {"id": "admin-chat"},
+                "from": {"id": 1},
+                "message_id": 17,
+                "message_thread_id": 42,
+                "text": "Продолжи задачу",
+            },
+        }
+    )
+
+    history = payloads[0]["message"]["conversation_history"]
+    assert len(history) == 21
+    assert history[0]["role"] == "system"
+    assert "Краткое резюме памяти" in history[0]["content"]
+    assert "old message 4" not in json.dumps(history, ensure_ascii=False)
+    assert "old message 24" in json.dumps(history, ensure_ascii=False)
+
+
+@pytest.mark.anyio
 async def test_telegram_admin_history_keeps_tool_trace_for_non_linear_followups(tmp_path) -> None:
     class FakeBot:
         def send_message(self, chat_id, text, **delivery_params):
@@ -2106,6 +2290,153 @@ def test_client_message_router_blocks_risk_address_and_media() -> None:
     assert risk.handoff_reason == HandoffReason.COMPLAINT_OR_RISK.value
     assert address.route == "ask_city"
     assert media.route == "media_handoff"
+
+
+def test_client_message_router_routes_booking_critical_context_to_urgent_handoff() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-booking-critical",
+            chat_id="chat-booking-critical",
+            text="Вы про меня забыли? Мне завтра приходить? Адрес?",
+        ),
+        conversation_history=(
+            {"role": "user", "content": "Хочу записаться на грудь в Краснодаре"},
+            {"role": "assistant", "content": "Подберем время записи."},
+        ),
+    )
+
+    assert route.route == "booking_critical_handoff"
+    assert route.handoff_reason == HandoffReason.BOOKING_CRITICAL.value
+    assert route.metadata["urgent"] is True
+    assert route.metadata["sla"] == "booking_critical"
+
+
+def test_client_message_router_treats_booked_address_without_history_as_critical() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-booked-address",
+            chat_id="chat-booked-address",
+            text="Я к вам записана, адрес не напишите?",
+        ),
+        conversation_history=(),
+    )
+
+    assert route.route == "booking_critical_handoff"
+    assert route.handoff_reason == HandoffReason.BOOKING_CRITICAL.value
+    assert route.metadata["urgent"] is True
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_creates_booking_critical_handoff(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {"type": "message", "chat_id": "chat-critical", "content": {"text": "Вы про меня забыли? Что делать, адрес?"}}
+    )
+
+    reply = await consultant.respond(
+        message,
+        conversation_history=({"role": "user", "content": "Хочу записаться на грудь в Краснодаре"},),
+    )
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.BOOKING_CRITICAL
+    assert "подтверж" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, monkeypatch) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+    import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.edits = []
+            self.photos = []
+
+        def send_message(self, chat_id, text):
+            message_id = len(self.messages) + 1
+            self.messages.append((chat_id, text))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def edit_message_text(self, chat_id, message_id, text):
+            self.edits.append((chat_id, message_id, text))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def send_photo(self, chat_id, path, caption=None):
+            self.photos.append((chat_id, str(path), caption))
+            return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
+
+    async def direct_retry(func, *args, **kwargs):
+        return func(*args)
+
+    def download_photo(url, media_dir):
+        path = tmp_path / "elena-photo.jpg"
+        path.write_bytes(b"image")
+        return path
+
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    knowledge.create(
+        kind="service_note",
+        title="Объем для увеличения груди",
+        content="Объём подбирается индивидуально по фото и желаемому результату.",
+        tags=("объем", "грудь"),
+    )
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), knowledge))
+    monkeypatch.setattr(handoff_notify, "_to_thread_retry", direct_retry)
+    monkeypatch.setattr(handoff_notify, "_download_photo_url", download_photo)
+    ref_path = tmp_path / "handoff_refs.json"
+    bot = FakeTelegramBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=ref_path)
+    history: list[dict[str, str]] = []
+
+    events = [
+        {"id": "elena-1", "text": "Можно записаться на увеличение груди 15 июля в 10:00?", "item": {"title": "Увеличение груди", "city": "Краснодар"}},
+        {"id": "elena-2", "text": "Фото отправила", "image": {"url": "https://img.example/elena.jpg"}},
+        {"id": "elena-3", "text": "Какой объем нужен?"},
+        {"id": "elena-4", "text": "Как оплатить?"},
+        {"id": "elena-5", "text": "Какой адрес?"},
+        {"id": "elena-6", "text": "Вы про меня забыли?"},
+        {"id": "elena-7", "text": "Что делать?"},
+    ]
+    replies: list[AvitoConsultantReply] = []
+    for event in events:
+        content = {"text": event["text"]}
+        if event.get("item"):
+            content["item"] = event["item"]
+        if event.get("image"):
+            content["image"] = event["image"]
+        message = avito_inbound_message({"type": "message", "id": event["id"], "chat_id": "chat-elena", "content": content})
+        reply = await consultant.respond(message, conversation_history=tuple(history))
+        replies.append(reply)
+        history.append({"role": "user", "content": event["text"]})
+        if reply.reply:
+            history.append({"role": "assistant", "content": reply.reply})
+        if reply.handoff:
+            await notifier.notify(reply.handoff)
+
+    refs = load_telegram_handoff_refs(ref_path)
+    urgent_refs = [ref for ref in refs.values() if ref.get("urgency") == "critical"]
+    unsafe_reply_text = "\n".join(reply.reply for reply in replies if reply.reply).casefold()
+    now = max(int(ref.get("created_at") or 0) for ref in refs.values()) + 4 * 60 * 60
+    for ref in refs.values():
+        ref["created_at"] = now - 4 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    sla = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+
+    assert len(urgent_refs) >= 4
+    assert len(bot.edits) <= 1
+    assert all("СРОЧНО" in ref["handoff_text"] for ref in urgent_refs)
+    assert "приходите" not in unsafe_reply_text
+    assert "запись актуальна" not in unsafe_reply_text
+    assert "можем предложить" not in unsafe_reply_text
+    assert all(ref.get("deadline_at") for ref in urgent_refs)
+    assert sla["reminders"] >= len(refs)
+    assert sla["escalations"] >= len(urgent_refs)
 
 
 def test_rag_answer_service_filters_unsafe_retrieval() -> None:
@@ -2641,6 +2972,34 @@ async def test_automation_toolbox_exposes_yclients_crud_and_knowledge_crud(tmp_p
     assert listed.data["items"][0]["id"] == item_id
     assert updated.data["item"]["content"] == "Расчет по зонам и единицам."
     assert deleted.ok is True
+
+
+@pytest.mark.anyio
+async def test_client_role_knowledge_list_filters_internal_avito_examples(tmp_path) -> None:
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    knowledge.create(
+        kind="avito_conversation_example",
+        title="Avito webhook debug",
+        content="handoff contexts, webhook secret123, клиенту отправлено: технический ответ",
+        tags=("avito", "internal"),
+    )
+    safe = knowledge.create(
+        kind="faq",
+        title="Ботокс",
+        content="Ботокс рассчитывается по зонам и единицам.",
+        tags=("avito", "ботокс"),
+    )
+    toolbox = AutomationToolbox(
+        DryRunYClientsGateway(),
+        knowledge,
+        role_profile=roles_module.role_profile(roles_module.CodexRole.AVITO_CLIENT),
+    )
+
+    result = await toolbox.execute("knowledge.list", {"query": "ботокс"})
+
+    assert result.ok is True
+    assert [item["id"] for item in result.data["items"]] == [safe.id]
+    assert "secret123" not in json.dumps(result.data, ensure_ascii=False)
 
 
 @pytest.mark.anyio
@@ -4827,6 +5186,43 @@ def test_avito_webhook_processes_booking_decision_and_deduplicates() -> None:
         processed_events.seen.clear()
 
 
+def test_avito_webhook_marks_chat_read_after_handling() -> None:
+    class FakeAvitoReader:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, str]] = []
+
+        async def list_chats(self, account_id: int, *, limit: int = 20, offset: int = 0) -> dict[str, object]:
+            return {"chats": []}
+
+        async def get_chat_messages(self, account_id: int, chat_id: str, *, limit: int = 30, offset: int = 0) -> dict[str, object]:
+            return {"messages": []}
+
+        async def mark_chat_read(self, account_id: int, chat_id: str) -> dict[str, object]:
+            self.calls.append((account_id, chat_id))
+            return {"ok": True, "account_id": account_id, "chat_id": chat_id}
+
+    processed_events.seen.clear()
+    settings = _settings()
+    reader = FakeAvitoReader()
+    avito_app.dependency_overrides[get_settings] = lambda: settings
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    avito_app.dependency_overrides[get_avito_reader] = lambda: reader
+    try:
+        client = TestClient(avito_app)
+        response = client.post(
+            "/avito/webhook?token=webhook",
+            json={"type": "message", "message_id": "read-1", "chat_id": "chat-read", "user_id": 1, "author_id": 123, "text": "Здравствуйте"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["mark_read"]["ok"] is True
+        assert reader.calls == [(1, "chat-read")]
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
 def test_avito_webhook_ignores_own_messages() -> None:
     processed_events.seen.clear()
     avito_app.dependency_overrides[get_settings] = lambda: _settings()
@@ -4879,6 +5275,86 @@ def test_avito_webhook_ignores_outgoing_messages_without_author_id() -> None:
         assert response.status_code == 200
         assert response.json()["ignored"] is True
         assert response.json()["reason"] == "not_incoming"
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
+def test_avito_webhook_outgoing_final_answer_closes_open_handoff(tmp_path, monkeypatch) -> None:
+    import src.freelance_leads_bot.integrations.avito_webhook as avito_webhook_module
+
+    closed: list[tuple[str, str]] = []
+
+    def fake_update_latest_handoff_for_chat(chat_id: str, status: str) -> str:
+        closed.append((chat_id, status))
+        return "handoff-1"
+
+    history_store = LeadStore(tmp_path / "history.sqlite3")
+    monkeypatch.setattr(avito_webhook_module, "update_latest_handoff_for_chat", fake_update_latest_handoff_for_chat)
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    avito_app.dependency_overrides[get_history_store] = lambda: history_store
+    event = {
+        "payload": {
+            "type": "message_created",
+            "value": {
+                "id": "out-final-1",
+                "chat_id": "chat-handoff",
+                "direction": "out",
+                "content": {"text": "Ближайшее время есть на 29, 30 и 31 июля. Адрес отправлю после записи."},
+            },
+        }
+    }
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json=event)
+
+        assert response.status_code == 200
+        assert response.json()["ignored"] is True
+        assert response.json()["reason"] == "not_incoming"
+        assert response.json()["manual_outgoing"]["remembered"] is True
+        assert response.json()["manual_outgoing"]["closed_handoff"] is True
+        assert closed == [("chat-handoff", "closed")]
+        history = history_store.recent_codex_chat(5, "avito:client:chat-handoff")
+        assert history[-1]["role"] == "assistant"
+        assert "29, 30 и 31 июля" in history[-1]["content"]
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
+def test_avito_webhook_outgoing_promise_does_not_close_handoff(tmp_path, monkeypatch) -> None:
+    import src.freelance_leads_bot.integrations.avito_webhook as avito_webhook_module
+
+    closed: list[tuple[str, str]] = []
+    history_store = LeadStore(tmp_path / "history.sqlite3")
+    monkeypatch.setattr(avito_webhook_module, "update_latest_handoff_for_chat", lambda chat_id, status: closed.append((chat_id, status)) or "handoff-1")
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    avito_app.dependency_overrides[get_history_store] = lambda: history_store
+    event = {
+        "payload": {
+            "type": "message_created",
+            "value": {
+                "id": "out-promise-1",
+                "chat_id": "chat-handoff",
+                "direction": "out",
+                "content": {"text": "Уточню свободное время и напишу вам."},
+            },
+        }
+    }
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json=event)
+
+        assert response.status_code == 200
+        assert response.json()["manual_outgoing"]["remembered"] is True
+        assert response.json()["manual_outgoing"]["closed_handoff"] is False
+        assert closed == []
     finally:
         avito_app.dependency_overrides.clear()
         processed_events.seen.clear()
@@ -5952,6 +6428,411 @@ def test_unanswered_monitor_report_marks_handled_items() -> None:
     assert row["ignored_reason"] == "client_ack_after_pending_reply"
 
 
+def test_unanswered_monitor_report_reopens_stale_ack_for_actionable_text() -> None:
+    chat = {"id": "chat-wait-address", "users": [{"id": 10, "name": "Анна"}]}
+    message = {"id": "m1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "Жду адрес"}}
+    item = find_unanswered_avito_chat(
+        account_id=1,
+        chat=chat,
+        messages=[message],
+        now=2000,
+        min_age_seconds=1200,
+        lookback_seconds=5000,
+    )
+    assert item is not None
+    state = {
+        "handled": {
+            "1:chat-wait-address:m1": {
+                "handled_at": 1500,
+                "result": {"ok": True, "ignored": True, "reason": "client_ack_after_pending_reply"},
+            }
+        }
+    }
+
+    row = report_unanswered_item(item, state)
+
+    assert row["autoreply_state"] == "pending"
+    assert row["needs_action"] is True
+    assert row["severity"] == "critical"
+
+
+def test_unanswered_monitor_classifies_final_ack_as_not_actionable() -> None:
+    chat = {"id": "chat-ack", "users": [{"id": 10, "name": "Анна"}]}
+    for text in ("Спасибо большое", "Хорошо 🌸", "Спасибо не надо я хотела первый раз попробовать"):
+        message = {"id": f"m-ack-{text}", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": text}}
+
+        item = find_unanswered_avito_chat(
+            account_id=1,
+            chat=chat,
+            messages=[message],
+            now=2000,
+            min_age_seconds=1200,
+            lookback_seconds=5000,
+        )
+
+        assert item is not None
+        assert item.needs_action is False
+        assert item.severity == "low"
+        assert item.reason == "final_ack"
+
+
+def test_unanswered_monitor_flags_named_live_critical_cases() -> None:
+    cases = {
+        "u2i-GZU5PbnrTmNYotE_UZq1Cw": "Запишите, пожалуйста, на 15.00. Одного часа нам хватит? По какому адресу Вы принимаете?",
+        "u2i-xVYkKKUHGevcp6wMOLrE2Q": "Жду адрес",
+        "u2i-~gs~jkteogGr8oUFac9TEQ": "Жду",
+        "u2i-CbskqJzftz74sTOVCg9atA": "Спасибо большое вы же в Геленджике?",
+    }
+
+    for chat_id, text in cases.items():
+        item = find_unanswered_avito_chat(
+            account_id=1,
+            chat={"id": chat_id, "users": [{"id": 10, "name": "Клиент"}]},
+            messages=[{"id": f"{chat_id}:m1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": text}}],
+            now=2000,
+            min_age_seconds=1200,
+            lookback_seconds=5000,
+        )
+
+        assert item is not None
+        assert item.needs_action is True
+        assert item.severity == "critical"
+
+
+def test_unanswered_alert_mentions_actionable_and_critical_counts() -> None:
+    chat = {"id": "chat-critical", "users": [{"id": 10, "name": "Анна"}]}
+    message = {"id": "m-critical", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "Жду адрес"}}
+    item = find_unanswered_avito_chat(
+        account_id=1,
+        chat=chat,
+        messages=[message],
+        now=2000,
+        min_age_seconds=1200,
+        lookback_seconds=5000,
+    )
+    assert item is not None
+
+    alert = format_unanswered_alert([item], max_items=10)
+
+    assert "требуют действия: 1" in alert
+    assert "критичных: 1" in alert
+    assert "КРИТИЧНО" in alert
+
+
+@pytest.mark.anyio
+async def test_unanswered_monitor_paginates_chat_list_over_avito_limit() -> None:
+    class FakeAvitoReader:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        async def list_chats(self, account_id: int, *, limit: int = 20, offset: int = 0) -> dict[str, object]:
+            self.calls.append((limit, offset))
+            chats = [{"id": f"chat-{index}", "users": [{"id": 10, "name": "Анна"}]} for index in range(offset, min(offset + limit, 150))]
+            return {"chats": chats}
+
+        async def get_chat_messages(self, account_id: int, chat_id: str, *, limit: int = 30, offset: int = 0) -> dict[str, object]:
+            created = int(time.time()) - 2000
+            return {
+                "messages": [
+                    {
+                        "id": f"{chat_id}:m1",
+                        "author_id": 10,
+                        "direction": "in",
+                        "type": "text",
+                        "created": created,
+                        "content": {"text": "Жду адрес"},
+                    }
+                ]
+            }
+
+        async def mark_chat_read(self, account_id: int, chat_id: str) -> dict[str, object]:
+            return {"ok": True}
+
+    reader = FakeAvitoReader()
+
+    items = await audit_unanswered_once(
+        settings=replace(_settings(), avito_account_ids=()),
+        chat_limit=150,
+        messages_per_chat=50,
+        min_age_seconds=1200,
+        lookback_seconds=5000,
+        reader=reader,
+    )
+
+    assert reader.calls == [(100, 0), (50, 100)]
+    assert len(items) == 150
+
+
+def test_pending_followup_stays_open_after_client_ack_and_closes_on_final_answer() -> None:
+    chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Анна"}]}
+    state: dict[str, object] = {}
+    base_messages = [
+        {"id": "m-client-1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "По какому адресу вы принимаете?"}},
+        {"id": "m-bot-1", "author_id": 1, "direction": "out", "type": "text", "created": 160, "content": {"text": "Уточню точный адрес и вернусь с ответом."}},
+        {"id": "m-client-2", "author_id": 10, "direction": "in", "type": "text", "created": 220, "content": {"text": "Хорошо, спасибо"}},
+    ]
+
+    sync_pending_followups(account_id=1, chat=chat, messages=base_messages, state=state, now=4000, reminder_seconds=1800, escalation_seconds=7200)
+    rows = pending_followup_rows(state, now=4000)
+
+    assert len(rows) == 1
+    assert rows[0]["business_status"] == "overdue"
+    assert rows[0]["business_resolved"] is False
+    assert rows[0]["client_replied"] is True
+    assert rows[0]["client_ack_after_promise"] is True
+    assert rows[0]["last_client_message"] == "Хорошо, спасибо"
+
+    resolved_messages = [
+        *base_messages,
+        {"id": "m-bot-2", "author_id": 1, "direction": "out", "type": "text", "created": 5000, "content": {"text": "Адрес: Геленджик, ул. Морская, 10. Можете приходить к 15:00."}},
+    ]
+    sync_pending_followups(account_id=1, chat=chat, messages=resolved_messages, state=state, now=5100, reminder_seconds=1800, escalation_seconds=7200)
+
+    assert pending_followup_rows(state, now=5100) == []
+    all_rows = pending_followup_rows(state, now=5100, include_resolved=True)
+    assert all_rows[0]["business_status"] == "business_resolved"
+    assert all_rows[0]["final_answer"].startswith("Адрес:")
+
+
+def test_pending_followup_alert_includes_business_context_and_action() -> None:
+    text = format_pending_followup_alert(
+        [
+            {
+                "chat_id": "chat-followup",
+                "client_name": "Анна",
+                "business_status": "overdue",
+                "severity": "critical",
+                "age_seconds": 5400,
+                "listing_city": "Геленджик",
+                "listing_title": "Увеличение губ",
+                "bot_promise": "Уточню точный адрес и напишу вам.",
+                "last_client_message": "Жду адрес",
+            }
+        ],
+        max_items=10,
+    )
+
+    assert "Анна" in text
+    assert "Геленджик | Увеличение губ" in text
+    assert "Обещал бот: Уточню точный адрес" in text
+    assert "Последнее от клиента: Жду адрес" in text
+    assert "Нужно сделать: дать клиенту финальный ответ" in text
+    assert "chat_id: chat-followup" in text
+
+
+def test_pending_followup_admin_action_closes_state_and_writes_audit(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    audit_path = tmp_path / "audit.jsonl"
+    key = "1:chat-followup:m-bot-1"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    key: {
+                        "account_id": 1,
+                        "chat_id": "chat-followup",
+                        "message_id": "m-bot-1",
+                        "client_name": "Анна",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    token = pending_followup_token(key)
+
+    result = apply_pending_followup_action(
+        state_path=state_path,
+        token=token,
+        action="stale",
+        actor="olga",
+        now=1780000000,
+        audit_path=audit_path,
+    )
+    updated = json.loads(state_path.read_text(encoding="utf-8"))
+    audit = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+
+    assert result["ok"] is True
+    assert updated["pending_followups"][key]["business_resolved"] is True
+    assert updated["pending_followups"][key]["business_status"] == "not_relevant"
+    assert updated["pending_followups"][key]["closed_by"] == "olga"
+    assert audit[0]["action"] == "stale"
+    assert audit[0]["chat_id"] == "chat-followup"
+    assert parse_pending_followup_callback(f"avfu:{token}:done") == (token, "done")
+    assert pending_followup_keyboard(key)["inline_keyboard"][0][0]["callback_data"] == f"avfu:{token}:done"
+
+
+def test_pending_followup_admin_can_mark_urgent_and_snooze(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    key = "1:chat-followup:m-bot-1"
+    state_path.write_text(
+        json.dumps({"pending_followups": {key: {"chat_id": "chat-followup", "business_status": "overdue", "business_resolved": False}}}),
+        encoding="utf-8",
+    )
+    token = pending_followup_token(key)
+
+    urgent = apply_pending_followup_action(state_path=state_path, token=token, action="urgent", now=1780000000, audit_path=tmp_path / "audit.jsonl")
+    later = apply_pending_followup_action(state_path=state_path, token=token, action="later", now=1780000100, audit_path=tmp_path / "audit.jsonl")
+    updated = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+
+    assert urgent["ok"] is True
+    assert later["ok"] is True
+    assert updated["severity"] == "critical"
+    assert updated["snoozed_until"] == 1780000100 + 2 * 60 * 60
+
+
+def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    report_path = tmp_path / "report.json"
+    key = "1:chat-followup:m-bot-1"
+    report_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": [
+                    {
+                        "key": key,
+                        "chat_id": "chat-followup",
+                        "client_name": "Анна",
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "age_seconds": 3600,
+                        "listing_city": "Геленджик",
+                        "listing_title": "Увеличение губ",
+                        "bot_promise": "Уточню адрес и напишу.",
+                        "last_client_message": "Жду адрес",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bot = FakeBot()
+
+    main_module.send_avito_followup_cards(bot, "admin-chat", report_path=report_path)
+
+    assert len(bot.messages) == 2
+    assert "Зависшие Avito-обещания" in bot.messages[0][1]
+    assert "Жду адрес" in bot.messages[1][1]
+    assert bot.messages[1][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"avfu:{pending_followup_token(key)}:done"
+
+
+def test_avito_followup_callback_updates_report_immediately(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.answers = []
+            self.messages = []
+
+        def answer_callback_query(self, callback_id, text):
+            self.answers.append((callback_id, text))
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True}
+
+    key = "1:chat-followup:m-bot-1"
+    row = {
+        "key": key,
+        "account_id": 1,
+        "chat_id": "chat-followup",
+        "message_id": "m-bot-1",
+        "client_name": "Анна",
+        "business_status": "overdue",
+        "business_resolved": False,
+        "overdue": True,
+        "severity": "critical",
+    }
+    state_path = tmp_path / "state.json"
+    report_path = tmp_path / "report.json"
+    state_path.write_text(json.dumps({"pending_followups": {key: dict(row, key=None)}}, ensure_ascii=False), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(
+            {
+                "pending_followup_count": 1,
+                "overdue_followup_count": 1,
+                "critical_followup_count": 1,
+                "pending_followups": [row],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bot = FakeBot()
+
+    handled = main_module.handle_avito_followup_callback(
+        bot=bot,
+        callback_id="cb-1",
+        data=f"avfu:{pending_followup_token(key)}:done",
+        telegram_chat_id="admin-chat",
+        state_path=state_path,
+        report_path=report_path,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert handled is True
+    assert bot.answers == [("cb-1", "Закрыто")]
+    assert report["pending_followup_count"] == 0
+    assert report["overdue_followup_count"] == 0
+    assert report["critical_followup_count"] == 0
+    assert report["pending_followups"][0]["business_status"] == "manual_closed"
+    assert report["pending_followups"][0]["business_resolved"] is True
+
+
+def test_care_followup_send_is_blocked_by_feature_flag(monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.answers = []
+            self.messages = []
+
+        def answer_callback_query(self, callback_id, text):
+            self.answers.append((callback_id, text))
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True}
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.updates = []
+
+        def update_followup_task(self, task_id, **kwargs):
+            self.updates.append((task_id, kwargs))
+            return {"id": task_id, **kwargs}
+
+    stores = []
+
+    def fake_store_factory():
+        store = FakeStore()
+        stores.append(store)
+        return store
+
+    monkeypatch.setattr(main_module, "CareCrmStore", fake_store_factory)
+    bot = FakeBot()
+
+    handled = main_module.handle_care_followup_callback(
+        bot=bot,
+        callback_id="cb-care",
+        data="carefu:42:send",
+        settings=_settings(),
+        telegram_chat_id="admin-chat",
+    )
+
+    assert handled is True
+    assert bot.answers == [("cb-care", "Отправка выключена")]
+    assert "TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED" in bot.messages[0][1]
+    assert stores[0].updates == [(42, {"outcome": "send_blocked_by_feature_flag"})]
+
+
 def test_avito_live_telegram_relay_builds_one_card_with_client_and_bot_messages() -> None:
     chat = {
         "id": "chat-live",
@@ -6130,6 +7011,40 @@ def test_avito_turn_buffer_batches_multiple_messages_for_one_codex_turn(tmp_path
     assert "1. Здравствуйте" in batched.text
     assert "2. А губы сколько?" in batched.text
     assert batched.message_id == "m1,m2"
+
+
+def test_avito_turn_buffer_retries_failed_batch_before_removing_it(tmp_path) -> None:
+    buffer_path = tmp_path / "turn_buffer.json"
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-retry",
+        chat_id="chat-retry",
+        message_id="m-retry",
+        text="Нужна запись",
+        created_at=1780000001,
+        metadata={"account_id": 1},
+    )
+
+    queued = enqueue_avito_turn_message(message, debounce_seconds=0, max_wait_seconds=0, path=buffer_path)
+    due = pop_due_avito_turn_batches(now=queued["process_after"] + 1, path=buffer_path, lease_seconds=60)
+    leased_again = pop_due_avito_turn_batches(now=queued["process_after"] + 2, path=buffer_path, lease_seconds=60)
+    mark_avito_turn_batch_failed(due[0], "temporary failure", now=queued["process_after"] + 3, path=buffer_path)
+    before_retry = pop_due_avito_turn_batches(now=queued["process_after"] + 10, path=buffer_path, lease_seconds=60)
+    retry = pop_due_avito_turn_batches(now=queued["process_after"] + 40, path=buffer_path, lease_seconds=60)
+    mark_avito_turn_batch_processed(retry[0], path=buffer_path)
+    after_processed = pop_due_avito_turn_batches(now=queued["process_after"] + 500, path=buffer_path, lease_seconds=60)
+
+    assert len(due) == 1
+    assert leased_again == []
+    assert before_retry == []
+    assert len(retry) == 1
+    assert retry[0]["attempts"] == 1
+    assert after_processed == []
+
+
+def test_extract_date_ignores_invalid_dates() -> None:
+    assert extract_date("Запишите на 15.99", today=date(2026, 7, 1)) == ""
+    assert extract_date("Запишите на 2026-99-15", today=date(2026, 7, 1)) == ""
 
 
 def test_avito_webhook_greets_empty_created_chat() -> None:
@@ -6391,6 +7306,30 @@ def test_avito_webhook_skips_waiting_ack_after_pending_reply(tmp_path) -> None:
         assert response.status_code == 200
         assert response.json()["ignored"] is True
         assert response.json()["reason"] == "client_ack_after_pending_reply"
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
+def test_avito_webhook_does_not_skip_waiting_address_after_pending_reply(tmp_path) -> None:
+    processed_events.seen.clear()
+    settings = replace(_settings(), telegram_admin_history_db_path=tmp_path / "history.sqlite3")
+    store = LeadStore(settings.telegram_admin_history_db_path)
+    store.add_codex_chat_message("assistant", "Уточню точный адрес и напишу вам.", "avito:client:chat-address-wait")
+    avito_app.dependency_overrides[get_settings] = lambda: settings
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    avito_app.dependency_overrides[get_history_store] = lambda: store
+    try:
+        client = TestClient(avito_app)
+        response = client.post(
+            "/avito/webhook?token=webhook",
+            json={"type": "message", "message_id": "wait-address-1", "chat_id": "chat-address-wait", "text": "Жду адрес"},
+        )
+
+        assert response.status_code == 200
+        assert response.json().get("ignored") is not True
+        assert response.json().get("reason") != "client_ack_after_pending_reply"
     finally:
         avito_app.dependency_overrides.clear()
         processed_events.seen.clear()
@@ -6728,6 +7667,135 @@ async def test_telegram_handoff_notifier_merges_repeated_avito_chat_card(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_telegram_handoff_notifier_does_not_merge_booking_critical_card(tmp_path, monkeypatch) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+    import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.edits = []
+
+        def send_message(self, chat_id, text):
+            message_id = len(self.messages) + 1
+            self.messages.append((chat_id, text))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def edit_message_text(self, chat_id, message_id, text):
+            self.edits.append((chat_id, message_id, text))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+    async def direct_retry(func, *args, **kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(handoff_notify, "_to_thread_retry", direct_retry)
+    bot = FakeTelegramBot()
+    ref_path = tmp_path / "handoff_refs.json"
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=ref_path)
+    first = Handoff(
+        reason=HandoffReason.MISSING_DATA,
+        message=avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-critical", "text": "Нужен метод"}),
+        summary="Обычная открытая задача.",
+    )
+    critical = Handoff(
+        reason=HandoffReason.BOOKING_CRITICAL,
+        message=avito_inbound_message({"type": "message", "id": "m2", "chat_id": "chat-critical", "text": "Мне завтра приходить? Адрес?"}),
+        summary="Клиент ждёт подтверждение записи и адрес.",
+    )
+
+    await notifier.notify(first)
+    result = await notifier.notify(critical)
+    ref = find_telegram_handoff_ref("admin-chat", 2, ref_path)
+
+    assert result["sent"] is True
+    assert "merged" not in result
+    assert len(bot.messages) == 2
+    assert bot.edits == []
+    assert "СРОЧНО" in bot.messages[1][1]
+    assert ref is not None
+    assert ref["urgency"] == "critical"
+    assert int(ref["deadline_at"]) > 0
+    assert int(ref["escalation_at"]) > int(ref["deadline_at"])
+    assert ref["city"] == "Краснодар" or ref["city"] == ""
+    assert ref["confirmation_needed"] == "точный адрес и подтверждение записи"
+    assert ref["assignee"] == "Ольга/админ"
+
+
+@pytest.mark.anyio
+async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_path) -> None:
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.texts = []
+
+        async def notify(self, handoff):
+            raise AssertionError("SLA processing sends text notifications only")
+
+        async def notify_text(self, text):
+            self.texts.append(text)
+            return {"sent": True, "text": text}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    reminder = remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-reminder",
+        handoff_text="Нужна ручная проверка",
+        path=ref_path,
+    )
+    critical = remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=2,
+        avito_chat_id="chat-critical",
+        client_name="Алена",
+        handoff_text=(
+            "СРОЧНО: клиент ждёт подтверждение записи/адрес\n"
+            "Причина: booking_critical\n"
+            "Клиент: Алена\n"
+            "Объявление: Увеличение губ | Краснодар\n"
+            "Сообщение: Я не получила ответ по записи\n"
+            "Контекст: Нужно проверить наличие записи клиента, дату/время и адрес, затем ответить с точным подтверждением."
+        ),
+        urgency="critical",
+        city="Краснодар",
+        service="Увеличение губ",
+        confirmation_needed="актуальность записи и время прихода",
+        assignee="Ольга/админ",
+        path=ref_path,
+    )
+    stale = remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=3,
+        avito_chat_id="chat-stale",
+        handoff_text="Старая карточка",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs[f"admin-chat:1"]["created_at"] = now - 61 * 60
+    refs[f"admin-chat:2"]["created_at"] = now - 4 * 60 * 60
+    refs[f"admin-chat:3"]["created_at"] = now - 8 * 24 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    notifier = FakeNotifier()
+
+    result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    updated = load_telegram_handoff_refs(ref_path)
+
+    assert result["reminders"] == 2
+    assert result["escalations"] == 1
+    assert result["expired"] == 1
+    assert updated[f"admin-chat:1"]["reminder_sent_at"] == now
+    assert updated[f"admin-chat:2"]["escalation_sent_at"] == now
+    assert updated[f"admin-chat:3"]["status"] == "expired"
+    assert any("Напоминание" in text for text in notifier.texts)
+    assert any("Критично" in text for text in notifier.texts)
+    assert any("Клиент: Алена" in text for text in notifier.texts)
+    assert any("Объявление: Увеличение губ | Краснодар" in text for text in notifier.texts)
+    assert any("Последнее от клиента: Я не получила ответ по записи" in text for text in notifier.texts)
+    assert any("Контекст: Нужно проверить наличие записи клиента" in text for text in notifier.texts)
+    assert any("Детали записи: Увеличение губ | Краснодар" in text for text in notifier.texts)
+
+
+@pytest.mark.anyio
 async def test_telegram_handoff_notifier_sends_photos_when_merging_existing_card(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
@@ -6797,9 +7865,11 @@ async def test_telegram_handoff_notifier_keeps_sending_after_one_photo_fails(tmp
 
     class FakeTelegramBot:
         def __init__(self) -> None:
+            self.messages = []
             self.photos = []
 
         def send_message(self, chat_id, text):
+            self.messages.append((chat_id, text))
             return {"ok": True, "result": {"message_id": 1}}
 
         def send_photo(self, chat_id, path, caption=None):
@@ -6838,11 +7908,18 @@ async def test_telegram_handoff_notifier_keeps_sending_after_one_photo_fails(tmp
     notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=tmp_path / "refs.json")
 
     result = await notifier.notify(handoff)
+    ref = find_telegram_handoff_ref("admin-chat", 1, tmp_path / "refs.json")
 
     assert result["photos_sent"] == 2
     assert result["photos_failed"] == 1
     assert len(result["photo_errors"]) == 1
+    assert [status["status"] for status in result["media_statuses"]] == ["sent_to_telegram", "failed", "sent_to_telegram"]
+    assert ref is not None
+    assert [status["status"] for status in ref["media_statuses"]] == ["sent_to_telegram", "failed", "sent_to_telegram"]
+    assert result["media_failure_notify"]["sent"] is True
+    assert "не удалось переслать вложение" in result["media_failure_notify"]["text"]
     assert len(bot.photos) == 2
+    assert len(bot.messages) == 2
 
 
 @pytest.mark.anyio
@@ -7202,6 +8279,101 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
     assert "avito_unanswered_queue" in text
     assert "avito_unanswered_report_fresh" in text
     assert "No immediate action required" not in text
+
+
+def test_ops_status_warns_on_overdue_avito_promises(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "critical_unanswered_count": 0,
+                "pending_followup_count": 2,
+                "overdue_followup_count": 2,
+                "items": [],
+                "pending_followups": [{"business_status": "overdue"}, {"business_status": "overdue"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    check = next(check for check in report.checks if check.name == "avito_pending_followups")
+    text = format_ops_status_report(report)
+
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert report.summary["avito_pending_followups"] == 2
+    assert report.summary["avito_overdue_followups"] == 2
+    assert "overdue_promises=2" in text
+
+
+def test_ops_status_errors_when_overdue_avito_promises_exceed_sla(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "pending_followup_count": 1,
+                "overdue_followup_count": 1,
+                "items": [],
+                "pending_followups": [{"business_status": "overdue", "overdue": True, "age_seconds": 7200}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        overdue_followup_error_after_seconds=3600,
+        now=200,
+    )
+    check = next(check for check in report.checks if check.name == "avito_pending_followups")
+
+    assert report.ok is False
+    assert check.ok is False
+    assert check.severity == "error"
+    assert report.summary["avito_max_overdue_followup_age_seconds"] == 7200
+    assert ops_status_exit_code(report, strict=True) == 1
 
 
 def test_ops_status_human_summary_marks_high_risk_rag_as_excluded_from_avito_autoanswer(tmp_path) -> None:

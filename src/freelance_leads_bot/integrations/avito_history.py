@@ -18,14 +18,17 @@ GREETING_RE = re.compile(
     r"(?:\s*[!,.🤍🫶😊]*)\s*",
     re.IGNORECASE,
 )
+CLIENT_PHONE_RE = re.compile(r"(?<!\d)(?:\+7|8)?[\s().-]*9\d{2}(?:[\s().-]*\d){7}(?!\d)")
 
 
 def avito_history_key(chat_id: str) -> str:
     return f"avito:client:{str(chat_id or '').strip()}"
 
 
-def prepare_avito_outgoing_text(store: LeadStore | None, chat_id: str, text: str) -> str:
+def prepare_avito_outgoing_text(store: LeadStore | None, chat_id: str, text: str, *, mask_client_phone_echo: bool = True) -> str:
     clean = str(text or "").strip()
+    if mask_client_phone_echo:
+        clean = CLIENT_PHONE_RE.sub("[телефон]", clean)
     if not clean or store is None:
         return clean
     history = store.recent_codex_chat(0, avito_history_key(chat_id))
