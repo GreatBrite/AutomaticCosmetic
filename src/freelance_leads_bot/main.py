@@ -1247,12 +1247,19 @@ def send_visit_confirmation_cards(
     except Exception as exc:
         bot.send_message(chat_id, "Не смогла получить записи YCLIENTS: " + escape(str(exc)), **(topic_params or {}))
         return
+    summary = store.visit_confirmation_summary(day)
     if not rows:
-        bot.send_message(chat_id, f"На {escape(day)} не нашла записей для проверки визитов.", **(topic_params or {}))
+        bot.send_message(
+            chat_id,
+            f"На {escape(day)} не нашла записей для проверки визитов.\n"
+            f"Статусы CRM: confirmed={summary['confirmed']}, no_show={summary['no_show']}, needs_details={summary['needs_details']}.",
+            **(topic_params or {}),
+        )
         return
     bot.send_message(
         chat_id,
-        f"<b>Проверка визитов за {escape(day)}</b>\nКарточек: {len(rows)}.",
+        f"<b>Проверка визитов за {escape(day)}</b>\n"
+        f"Карточек: {len(rows)}. Уже confirmed={summary['confirmed']}, no_show={summary['no_show']}, needs_details={summary['needs_details']}.",
         **(topic_params or {}),
     )
     for row in rows:
@@ -1477,6 +1484,9 @@ def format_care_followup_card(task: dict) -> str:
     city = escape(str(task.get("city") or ""))
     draft = escape(str(task.get("message_draft") or ""))
     reason = escape(str(task.get("reason") or "Причина не записана."))
+    gate = task.get("send_gate") if isinstance(task.get("send_gate"), dict) else {}
+    gate_status = escape(str(gate.get("status") or "unknown"))
+    gate_reason = escape(str(gate.get("reason") or task.get("blocked_reason") or ""))
     confidence = escape(str(round(float(task.get("confidence") or 0), 2)))
     risk_level = escape(str(task.get("risk_level") or "unknown"))
     links = CareCrmStore().list_client_links(int(task.get("client_id") or 0), channel="telegram_client") if task.get("client_id") else []
@@ -1488,11 +1498,12 @@ def format_care_followup_card(task: dict) -> str:
         status_bits.append("риск/жалоба")
     status_line = "\nСтоп-флаги: <b>" + escape(", ".join(status_bits)) + "</b>" if status_bits else ""
     city_line = f"\nГород визита: <b>{city}</b>" if city else ""
+    gate_line = f"\nGate: <b>{gate_status}</b>" + (f" — {gate_reason}" if gate_reason else "")
     return (
         "<b>Задача отдела заботы</b>\n"
         f"Клиент: <b>{client}</b>\n"
         f"После визита: <b>{service}</b>{city_line}\n"
-        f"Срок: <b>{due_at}</b>{status_line}\n"
+        f"Срок: <b>{due_at}</b>{status_line}{gate_line}\n"
         f"Риск: <b>{risk_level}</b>, уверенность: <b>{confidence}</b>, Telegram: <b>{telegram_link}</b>\n"
         f"Причина: {reason}\n\n"
         f"Черновик клиенту:\n<blockquote>{draft}</blockquote>"
@@ -1506,7 +1517,19 @@ def send_care_followup_cards(
     topic_params: dict[str, str] | None = None,
 ) -> None:
     store = CareCrmStore()
-    tasks = store.list_followup_tasks(status="planned", due_before=datetime.now().isoformat(), limit=20)
+    tasks = [
+        task
+        for task in store.list_followup_tasks(status="", due_before=datetime.now().isoformat(), limit=50)
+        if str(task.get("status") or "") in {"planned", "needs_olga"}
+    ]
+    tasks.sort(
+        key=lambda task: (
+            0 if task.get("complaint_risk") or str(task.get("risk_level") or "").casefold() in {"blocked", "high"} else 1,
+            str(task.get("due_at") or ""),
+            int(task.get("id") or 0),
+        )
+    )
+    tasks = tasks[:20]
     if not tasks:
         bot.send_message(chat_id, "Due-задач отдела заботы сейчас нет.", **(topic_params or {}))
         return
@@ -1514,6 +1537,20 @@ def send_care_followup_cards(
     for task in tasks:
         task_id = int(task["id"])
         enriched = FollowupBrainService(store).enrich_task(task_id) or task
+        gate = store.followup_send_gate(task_id)
+        if gate["status"] == "needs_channel":
+            enriched = store.update_followup_task(
+                task_id,
+                requires_channel_resolution=True,
+                outcome="needs_channel_resolution",
+            ) or enriched
+        elif gate["status"] == "blocked":
+            enriched = store.update_followup_task(
+                task_id,
+                blocked_reason=str(gate.get("reason") or "blocked"),
+                risk_level="blocked" if "risk" in str(gate.get("reason") or "") or "complaint" in str(gate.get("reason") or "") else None,
+            ) or enriched
+        enriched = {**enriched, "send_gate": gate}
         response = bot.send_message(
             chat_id,
             format_care_followup_card(enriched),
@@ -1554,7 +1591,7 @@ def handle_care_followup_callback(
         )
         return True
     if action == "ask":
-        store.update_followup_task(task_id, outcome="ask_olga")
+        store.update_followup_task(task_id, status="needs_olga", outcome="ask_olga")
         bot.answer_callback_query(callback_id, "Оставила как вопрос")
         bot.send_message(telegram_chat_id, "Ок, эту задачу оставила как требующую решения Ольги.", **(topic_params or {}))
         return True
@@ -1562,9 +1599,24 @@ def handle_care_followup_callback(
         task = store.get_followup_task(task_id)
         if task:
             store.update_client_flags(int(task["client_id"]), do_not_contact=True, consent_status="denied")
-            store.update_followup_task(task_id, status="blocked", outcome="do_not_contact_by_olga")
+            store.update_followup_task(task_id, status="blocked", blocked_reason="do_not_contact_by_olga", outcome="do_not_contact_by_olga")
         bot.answer_callback_query(callback_id, "Не писать")
         bot.send_message(telegram_chat_id, "Отметила клиента как «не писать» и заблокировала задачу.", **(topic_params or {}))
+        return True
+    gate = store.followup_send_gate(task_id)
+    if gate["status"] == "needs_channel":
+        store.update_followup_task(task_id, requires_channel_resolution=True, outcome="needs_channel_resolution")
+        bot.answer_callback_query(callback_id, "Нет канала")
+        bot.send_message(
+            telegram_chat_id,
+            "У клиента нет подтверждённой Telegram-связки. Создала задачу: найти канал связи или не писать.",
+            **(topic_params or {}),
+        )
+        return True
+    if not gate.get("allowed"):
+        store.update_followup_task(task_id, status="blocked", blocked_reason=str(gate.get("reason") or "blocked"))
+        bot.answer_callback_query(callback_id, "Заблокировано")
+        bot.send_message(telegram_chat_id, f"Не отправляю клиенту: {escape(str(gate.get('reason') or 'задача заблокирована'))}.", **(topic_params or {}))
         return True
     if not settings.telegram_client_followup_send_enabled:
         store.update_followup_task(task_id, outcome="send_blocked_by_feature_flag")

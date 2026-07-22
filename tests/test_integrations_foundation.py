@@ -444,6 +444,9 @@ def test_care_crm_upserts_appointments_and_marks_visit(tmp_path) -> None:
         visit = conn.execute("SELECT * FROM crm_visits WHERE appointment_id = ?", (row["id"],)).fetchone()
     assert visit["actually_attended"] == 1
     assert visit["actual_service_title"] == "Увеличение губ 1 мл"
+    assert visit["actual_service_category"] == "lips"
+    assert visit["actual_amount_value"] == "1"
+    assert visit["actual_amount_unit"] == "мл"
     assert visit["source_text"] == "по факту губы 1 мл"
 
 
@@ -517,8 +520,51 @@ def test_care_crm_applies_olga_text_reply_and_logs_interaction(tmp_path) -> None
         visit = conn.execute("SELECT * FROM crm_visits WHERE appointment_id = ?", (row["id"],)).fetchone()
         interaction = conn.execute("SELECT * FROM crm_interactions WHERE appointment_id = ?", (row["id"],)).fetchone()
     assert visit["actual_service_title"] == "губы"
+    assert visit["actual_amount_value"] == "1"
+    assert visit["actual_amount_unit"] == "мл"
+    assert visit["product_or_drug"] == "Juvederm"
     assert interaction["intent"] == "visit_fact_update"
     assert "Juvederm" in interaction["body"]
+
+
+def test_care_crm_unclear_visit_details_need_more_info_and_do_not_plan_followups(tmp_path) -> None:
+    store = CareCrmStore(tmp_path / "care.sqlite3")
+    row = store.upsert_appointment(
+        Appointment(
+            id=7791,
+            client=ClientProfile(name="Елена", phone="+7 900 111 22 34", external_id="61"),
+            service=Service(id=8, title="Увеличение ягодиц", price=18000, duration_minutes=60),
+            city="Москва",
+            starts_at=datetime(2026, 6, 2, 18, 30),
+        )
+    )
+
+    updated = store.apply_visit_details_from_text(int(row["id"]), "да", confirmed_by="telegram_reply")
+
+    assert updated["confirmation_status"] == "needs_details"
+    assert store.list_followup_tasks(client_id=int(row["client_id"]), status="") == []
+
+
+def test_care_crm_no_show_blocks_existing_followups(tmp_path) -> None:
+    store = CareCrmStore(tmp_path / "care.sqlite3")
+    row = store.upsert_appointment(
+        Appointment(
+            id=7792,
+            client=ClientProfile(name="Елена", phone="+7 900 111 22 35", external_id="62"),
+            service=Service(id=8, title="Увеличение губ", price=12000, duration_minutes=60),
+            city="Москва",
+            starts_at=datetime(2026, 6, 2, 18, 30),
+        )
+    )
+    store.mark_visit(int(row["id"]), attended=True, actual_service_title="Губы 1 мл", confirmed_by="test")
+
+    updated = store.mark_visit(int(row["id"]), attended=False, confirmed_by="telegram_button")
+    tasks = store.list_followup_tasks(client_id=int(row["client_id"]), status="")
+
+    assert updated["confirmation_status"] == "no_show"
+    assert tasks
+    assert {task["status"] for task in tasks} == {"blocked"}
+    assert {task["blocked_reason"] for task in tasks} == {"no_show"}
 
 
 @pytest.mark.anyio
@@ -816,6 +862,64 @@ async def test_followup_delivery_sends_due_task_to_linked_telegram_client(tmp_pa
     assert result["blocked"] == []
     assert any(task["status"] == "sent" and task["kind"] == "care_checkin_1d" for task in tasks)
     assert any(item["direction"] == "outbound_bot" and item["intent"] == "care_checkin_1d" for item in interactions)
+    assert crm.get_client(int(row["client_id"]))["last_contacted_at"]
+
+
+@pytest.mark.anyio
+async def test_followup_delivery_requires_verified_telegram_channel(tmp_path) -> None:
+    class FakeBot:
+        def send_message(self, chat_id, text, **kwargs):
+            raise AssertionError("should not send without verified link")
+
+    crm = CareCrmStore(tmp_path / "care.sqlite3")
+    row = crm.upsert_appointment(
+        Appointment(
+            id=7821,
+            client=ClientProfile(name="Елена", phone="+7 922 111 22 34", external_id="921"),
+            service=Service(id=9, title="Чистка лица", price=5000, duration_minutes=60),
+            city="Краснодар",
+            starts_at=datetime(2026, 6, 2, 12, 0),
+        )
+    )
+    crm.mark_visit(int(row["id"]), attended=True, actual_service_title="Чистка лица", confirmed_by="test")
+    task_id = int(crm.list_followup_tasks(client_id=int(row["client_id"]))[0]["id"])
+
+    gate = crm.followup_send_gate(task_id)
+    result = await CareFollowupDeliveryService(crm, FakeBot()).send_task(task_id)
+
+    assert gate["status"] == "needs_channel"
+    assert result["status"] == "needs_channel"
+    assert crm.get_followup_task(task_id)["requires_channel_resolution"] == 1
+
+
+@pytest.mark.anyio
+async def test_followup_delivery_blocks_complaint_risk(tmp_path) -> None:
+    class FakeBot:
+        def send_message(self, chat_id, text, **kwargs):
+            raise AssertionError("should not send risk task")
+
+    crm = CareCrmStore(tmp_path / "care.sqlite3")
+    row = crm.upsert_appointment(
+        Appointment(
+            id=7822,
+            client=ClientProfile(name="Елена", phone="+7 922 111 22 35", external_id="922"),
+            service=Service(id=9, title="Чистка лица", price=5000, duration_minutes=60),
+            city="Краснодар",
+            starts_at=datetime(2026, 6, 2, 12, 0),
+        )
+    )
+    crm.mark_visit(int(row["id"]), attended=True, actual_service_title="Чистка лица", confirmed_by="test")
+    crm.link_client_channel(int(row["client_id"]), channel="telegram_client", external_user_id="2002", chat_id="1001", verified=True)
+    task_id = int(crm.list_followup_tasks(client_id=int(row["client_id"]))[0]["id"])
+    crm.update_client_flags(int(row["client_id"]), complaint_risk=True, risk_reason="клиент жаловался")
+
+    gate = crm.followup_send_gate(task_id)
+    result = await CareFollowupDeliveryService(crm, FakeBot()).send_task(task_id)
+
+    assert gate["status"] == "blocked"
+    assert "жаловался" in gate["reason"]
+    assert result["status"] != "sent"
+    assert crm.get_followup_task(task_id)["status"] == "blocked"
 
 
 def test_care_followup_admin_card_helpers() -> None:
@@ -6808,6 +6912,9 @@ def test_care_followup_send_is_blocked_by_feature_flag(monkeypatch) -> None:
         def update_followup_task(self, task_id, **kwargs):
             self.updates.append((task_id, kwargs))
             return {"id": task_id, **kwargs}
+
+        def followup_send_gate(self, task_id):
+            return {"status": "allowed", "allowed": True, "task_id": task_id, "chat_id": "1001"}
 
     stores = []
 

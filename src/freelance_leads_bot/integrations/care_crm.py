@@ -25,8 +25,12 @@ CREATE TABLE IF NOT EXISTS crm_clients (
     skin_type TEXT DEFAULT '',
     notes TEXT DEFAULT '',
     consent_status TEXT DEFAULT 'unknown',
+    consent_source TEXT DEFAULT '',
     do_not_contact INTEGER NOT NULL DEFAULT 0,
     complaint_risk INTEGER NOT NULL DEFAULT 0,
+    risk_reason TEXT DEFAULT '',
+    risk_updated_at TEXT DEFAULT '',
+    last_contacted_at TEXT DEFAULT '',
     last_visit_at TEXT DEFAULT '',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -61,6 +65,9 @@ CREATE TABLE IF NOT EXISTS crm_visits (
     actually_attended INTEGER NOT NULL,
     actual_service_id INTEGER NOT NULL DEFAULT 0,
     actual_service_title TEXT DEFAULT '',
+    actual_service_category TEXT DEFAULT '',
+    actual_amount_value TEXT DEFAULT '',
+    actual_amount_unit TEXT DEFAULT '',
     amount_ml TEXT DEFAULT '',
     units TEXT DEFAULT '',
     product_or_drug TEXT DEFAULT '',
@@ -88,8 +95,11 @@ CREATE TABLE IF NOT EXISTS crm_followup_tasks (
     reason TEXT DEFAULT '',
     confidence REAL NOT NULL DEFAULT 0.5,
     risk_level TEXT NOT NULL DEFAULT 'low',
+    blocked_reason TEXT DEFAULT '',
+    requires_channel_resolution INTEGER NOT NULL DEFAULT 0,
     approved_by TEXT DEFAULT '',
     approved_at TEXT DEFAULT '',
+    reviewed_by_olga_at TEXT DEFAULT '',
     draft_source TEXT DEFAULT 'rule',
     outcome TEXT DEFAULT '',
     admin_chat_id TEXT DEFAULT '',
@@ -517,27 +527,62 @@ class CareCrmStore:
         client_id: int,
         *,
         consent_status: str | None = None,
+        consent_source: str | None = None,
         do_not_contact: bool | None = None,
         complaint_risk: bool | None = None,
+        risk_reason: str | None = None,
     ) -> dict[str, Any]:
         current = self.get_client(client_id)
         if not current:
             raise KeyError(f"client {client_id} not found")
         consent = current.get("consent_status") if consent_status is None else consent_status
+        consent_from = current.get("consent_source") if consent_source is None else consent_source
         do_not = current.get("do_not_contact") if do_not_contact is None else int(do_not_contact)
         risk = current.get("complaint_risk") if complaint_risk is None else int(complaint_risk)
+        risk_text = current.get("risk_reason") if risk_reason is None else risk_reason
+        risk_updated = current.get("risk_updated_at") or ""
+        if complaint_risk is not None or risk_reason is not None:
+            risk_updated = datetime.now(timezone.utc).isoformat()
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE crm_clients
                 SET consent_status = ?,
+                    consent_source = ?,
                     do_not_contact = ?,
                     complaint_risk = ?,
+                    risk_reason = ?,
+                    risk_updated_at = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (consent, int(do_not or 0), int(risk or 0), client_id),
+                (consent, consent_from, int(do_not or 0), int(risk or 0), risk_text, risk_updated, client_id),
             )
+            if int(do_not or 0):
+                conn.execute(
+                    """
+                    UPDATE crm_followup_tasks
+                    SET status = 'blocked',
+                        blocked_reason = 'do_not_contact',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE client_id = ?
+                      AND status IN ('planned', 'needs_olga')
+                    """,
+                    (client_id,),
+                )
+            elif int(risk or 0):
+                conn.execute(
+                    """
+                    UPDATE crm_followup_tasks
+                    SET status = 'blocked',
+                        blocked_reason = 'complaint_risk',
+                        risk_level = 'blocked',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE client_id = ?
+                      AND status IN ('planned', 'needs_olga')
+                    """,
+                    (client_id,),
+                )
         updated = self.get_client(client_id)
         return updated or current
 
@@ -606,7 +651,11 @@ class CareCrmStore:
                     c.phone AS client_phone,
                     c.do_not_contact,
                     c.complaint_risk,
+                    c.consent_status,
+                    c.risk_reason,
                     v.actual_service_title,
+                    v.actual_service_category,
+                    v.product_or_drug,
                     a.scheduled_at,
                     a.city
                 FROM crm_followup_tasks t
@@ -628,10 +677,11 @@ class CareCrmStore:
                 UPDATE crm_followup_tasks
                 SET status = ?,
                     sent_at = COALESCE(NULLIF(?, ''), sent_at),
+                    reviewed_by_olga_at = CASE WHEN ? IN ('skipped', 'blocked') THEN CURRENT_TIMESTAMP ELSE reviewed_by_olga_at END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (status, sent_at, task_id),
+                (status, sent_at, status, task_id),
             )
             row = conn.execute("SELECT * FROM crm_followup_tasks WHERE id = ?", (task_id,)).fetchone()
         return dict(row) if row else None
@@ -644,6 +694,8 @@ class CareCrmStore:
         reason: str | None = None,
         confidence: float | None = None,
         risk_level: str | None = None,
+        blocked_reason: str | None = None,
+        requires_channel_resolution: bool | None = None,
         approved_by: str | None = None,
         draft_source: str | None = None,
         outcome: str | None = None,
@@ -660,8 +712,11 @@ class CareCrmStore:
                     reason = ?,
                     confidence = ?,
                     risk_level = ?,
+                    blocked_reason = ?,
+                    requires_channel_resolution = ?,
                     approved_by = ?,
                     approved_at = CASE WHEN ? != '' THEN ? ELSE approved_at END,
+                    reviewed_by_olga_at = CASE WHEN ? IN ('needs_olga', 'blocked', 'skipped') THEN CURRENT_TIMESTAMP ELSE reviewed_by_olga_at END,
                     draft_source = ?,
                     outcome = ?,
                     status = ?,
@@ -673,9 +728,14 @@ class CareCrmStore:
                     current.get("reason") if reason is None else reason,
                     float(current.get("confidence") or 0.5) if confidence is None else float(confidence),
                     current.get("risk_level") if risk_level is None else risk_level,
+                    current.get("blocked_reason") if blocked_reason is None else blocked_reason,
+                    int(current.get("requires_channel_resolution") or 0)
+                    if requires_channel_resolution is None
+                    else int(bool(requires_channel_resolution)),
                     current.get("approved_by") if approved_by is None else approved_by,
                     approved_by or "",
                     datetime.now(timezone.utc).isoformat(),
+                    current.get("status") if status is None else status,
                     current.get("draft_source") if draft_source is None else draft_source,
                     current.get("outcome") if outcome is None else outcome,
                     current.get("status") if status is None else status,
@@ -722,7 +782,11 @@ class CareCrmStore:
                     c.phone AS client_phone,
                     c.do_not_contact,
                     c.complaint_risk,
+                    c.consent_status,
+                    c.risk_reason,
                     v.actual_service_title,
+                    v.actual_service_category,
+                    v.product_or_drug,
                     a.scheduled_at,
                     a.city
                 FROM crm_followup_tasks t
@@ -757,6 +821,39 @@ class CareCrmStore:
                 (day_value,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def visit_confirmation_summary(self, day: str | date, *, stale_needs_details_hours: int = 24) -> dict[str, Any]:
+        day_value = day.isoformat() if isinstance(day, date) else str(day)[:10]
+        stale_before = datetime.now(timezone.utc) - timedelta(hours=max(1, int(stale_needs_details_hours or 24)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT confirmation_status, COUNT(*)
+                FROM crm_appointments
+                WHERE substr(scheduled_at, 1, 10) = ?
+                GROUP BY confirmation_status
+                """,
+                (day_value,),
+            ).fetchall()
+            stale = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM crm_appointments
+                WHERE confirmation_status = 'needs_details'
+                  AND updated_at <= ?
+                """,
+                (stale_before.isoformat(),),
+            ).fetchone()
+        counts = {str(row[0] or "unknown"): int(row[1] or 0) for row in rows}
+        return {
+            "day": day_value,
+            "pending": counts.get("pending", 0),
+            "sent": counts.get("sent", 0),
+            "confirmed": counts.get("confirmed", 0),
+            "no_show": counts.get("no_show", 0),
+            "needs_details": counts.get("needs_details", 0),
+            "stale_needs_details": int((stale or [0])[0] or 0),
+        }
 
     def get_appointment(self, appointment_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -828,19 +925,26 @@ class CareCrmStore:
             raise KeyError(f"appointment {appointment_id} not found")
         now = datetime.now(timezone.utc).isoformat()
         service_title = actual_service_title.strip() or str(appointment.get("booked_service_title") or "")
+        service_category = _service_category(service_title)
+        normalized_amount = _normalize_amount(amount_ml) or re_search_amount_ml(service_title)
+        normalized_unit = units.strip() or ("мл" if normalized_amount else "")
         status = "attended" if attended else "no_show"
         confirmation_status = "confirmed" if attended else "no_show"
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO crm_visits (
-                    appointment_id, client_id, actually_attended, actual_service_title, amount_ml, units,
+                    appointment_id, client_id, actually_attended, actual_service_title, actual_service_category,
+                    actual_amount_value, actual_amount_unit, amount_ml, units,
                     product_or_drug, procedure_notes, reaction, aftercare_notes, confirmed_by, confirmed_at, source_text
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(appointment_id) DO UPDATE SET
                     actually_attended = excluded.actually_attended,
                     actual_service_title = excluded.actual_service_title,
+                    actual_service_category = excluded.actual_service_category,
+                    actual_amount_value = COALESCE(NULLIF(excluded.actual_amount_value, ''), crm_visits.actual_amount_value),
+                    actual_amount_unit = COALESCE(NULLIF(excluded.actual_amount_unit, ''), crm_visits.actual_amount_unit),
                     amount_ml = COALESCE(NULLIF(excluded.amount_ml, ''), crm_visits.amount_ml),
                     units = COALESCE(NULLIF(excluded.units, ''), crm_visits.units),
                     product_or_drug = COALESCE(NULLIF(excluded.product_or_drug, ''), crm_visits.product_or_drug),
@@ -857,8 +961,11 @@ class CareCrmStore:
                     int(appointment["client_id"]),
                     int(attended),
                     service_title,
+                    service_category,
+                    normalized_amount,
+                    normalized_unit,
                     amount_ml,
-                    units,
+                    normalized_unit or units,
                     product_or_drug,
                     procedure_notes,
                     reaction,
@@ -892,11 +999,27 @@ class CareCrmStore:
                 visit = conn.execute("SELECT * FROM crm_visits WHERE appointment_id = ?", (appointment_id,)).fetchone()
                 if visit:
                     self._plan_followup_tasks(conn, appointment=appointment, visit=dict(visit))
+            else:
+                conn.execute(
+                    """
+                    UPDATE crm_followup_tasks
+                    SET status = 'blocked',
+                        blocked_reason = 'no_show',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE visit_id IN (SELECT id FROM crm_visits WHERE appointment_id = ?)
+                      AND status IN ('planned', 'needs_olga')
+                    """,
+                    (appointment_id,),
+                )
         updated = self.get_appointment(appointment_id)
         return updated or appointment
 
     def _plan_followup_tasks(self, conn: sqlite3.Connection, *, appointment: dict[str, Any], visit: dict[str, Any]) -> None:
-        if bool(appointment.get("client_do_not_contact") or False) or bool(appointment.get("client_complaint_risk") or False):
+        if (
+            bool(appointment.get("client_do_not_contact") or False)
+            or bool(appointment.get("client_complaint_risk") or False)
+            or str(appointment.get("client_consent_status") or "").casefold() == "denied"
+        ):
             return
         service_title = str(visit.get("actual_service_title") or appointment.get("booked_service_title") or "")
         scheduled_at = _parse_iso_datetime(str(appointment.get("scheduled_at") or "")) or datetime.now()
@@ -907,7 +1030,7 @@ class CareCrmStore:
                 continue
             due_at = (scheduled_at + timedelta(days=rule.delay_days)).isoformat()
             reason = _followup_reason(rule, service_title, scheduled_at)
-            risk_level = "blocked" if bool(appointment.get("client_complaint_risk") or False) else "low"
+            risk_level = "low"
             conn.execute(
                 """
                 INSERT INTO crm_followup_tasks (
@@ -955,9 +1078,91 @@ class CareCrmStore:
             attended=True,
             actual_service_title=str(details["actual_service_title"]),
             amount_ml=str(details.get("amount_ml") or ""),
+            units=str(details.get("amount_unit") or ""),
+            product_or_drug=str(details.get("product_or_drug") or ""),
             confirmed_by=confirmed_by,
             source_text=text,
         )
+
+    def block_client_followups(self, client_id: int, *, reason: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE crm_followup_tasks
+                SET status = 'blocked',
+                    blocked_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE client_id = ?
+                  AND status IN ('planned', 'needs_olga')
+                """,
+                (reason, client_id),
+            )
+            return int(cur.rowcount or 0)
+
+    def care_ops_summary(self, *, now: datetime | None = None) -> dict[str, Any]:
+        due_before = (now or datetime.now(timezone.utc)).isoformat()
+        due = self.list_followup_tasks(status="", due_before=due_before, limit=100)
+        due_open = [task for task in due if str(task.get("status") or "") in {"planned", "needs_olga"}]
+        needs_channel = 0
+        blocked_risk = 0
+        unsafe_sendable = 0
+        for task in due_open:
+            gate = self.followup_send_gate(int(task["id"]))
+            if gate["status"] == "needs_channel":
+                needs_channel += 1
+            if gate["status"] == "blocked":
+                reason = str(gate.get("reason") or "")
+                if "risk" in reason or "complaint" in reason or str(task.get("risk_level") or "").casefold() in {"high", "blocked"}:
+                    blocked_risk += 1
+                    unsafe_sendable += 1
+        return {
+            "due_open": len(due_open),
+            "due_needs_channel": needs_channel,
+            "due_blocked_risk": blocked_risk,
+            "unsafe_sendable": unsafe_sendable,
+        }
+
+    def mark_client_contacted(self, client_id: int, *, contacted_at: str = "") -> None:
+        value = contacted_at or datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE crm_clients
+                SET last_contacted_at = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (value, client_id),
+            )
+
+    def followup_send_gate(self, task_id: int) -> dict[str, Any]:
+        task = self.get_followup_task(task_id)
+        if not task:
+            return {"status": "missing", "allowed": False, "reason": "followup task not found", "task_id": task_id}
+        if bool(task.get("do_not_contact") or False) or str(task.get("consent_status") or "").casefold() == "denied":
+            return {"status": "blocked", "allowed": False, "reason": "client marked do_not_contact/consent denied", "task_id": task_id}
+        if bool(task.get("complaint_risk") or False):
+            return {
+                "status": "blocked",
+                "allowed": False,
+                "reason": str(task.get("risk_reason") or "client has complaint/risk flag"),
+                "task_id": task_id,
+            }
+        risk = str(task.get("risk_level") or "").casefold()
+        if risk in {"blocked", "high"}:
+            return {"status": "blocked", "allowed": False, "reason": f"risk_level={risk}", "task_id": task_id}
+        status = str(task.get("status") or "")
+        if status not in {"planned"}:
+            return {"status": "blocked", "allowed": False, "reason": f"task status is {status or 'unknown'}", "task_id": task_id}
+        if not int(task.get("visit_id") or 0):
+            return {"status": "blocked", "allowed": False, "reason": "task is not linked to a confirmed visit", "task_id": task_id}
+        if not str(task.get("message_draft") or "").strip():
+            return {"status": "blocked", "allowed": False, "reason": "empty message draft", "task_id": task_id}
+        links = self.list_client_links(int(task["client_id"]), channel="telegram_client")
+        chat_id = next((str(link.get("chat_id") or "") for link in links if link.get("verified") and str(link.get("chat_id") or "")), "")
+        if not chat_id:
+            return {"status": "needs_channel", "allowed": False, "reason": "no verified Telegram client link", "task_id": task_id}
+        return {"status": "allowed", "allowed": True, "reason": "", "task_id": task_id, "chat_id": chat_id}
 
     def mark_needs_details(self, appointment_id: int, *, confirmed_by: str = "") -> dict[str, Any]:
         with self.connect() as conn:
@@ -1515,12 +1720,23 @@ class FollowupBrainService:
             approved_by=author,
             draft_source="olga_revision",
             outcome="draft_rewritten",
+            status="planned",
         )
         if task:
+            self.store.add_interaction(
+                int(task["client_id"]),
+                visit_id=int(task.get("visit_id") or 0) or None,
+                channel="telegram_admin",
+                direction="internal_note",
+                author=author,
+                body=text.strip(),
+                intent="followup_draft_rewrite",
+                metadata={"task_id": task_id, "kind": task.get("kind"), "service_category": task.get("actual_service_category")},
+            )
             self.store.create_learning_lesson(
                 lesson="Ольга исправила follow-up черновик; учитывать такой тон/формулировку в похожих сообщениях.",
                 source="followup_revision",
-                tags=("followup", "olga_style", str(task.get("kind") or "")),
+                tags=("followup", "olga_style", str(task.get("kind") or ""), str(task.get("actual_service_category") or "")),
                 confidence=0.75,
                 metadata={"task_id": task_id, "text": text.strip()},
             )
@@ -1530,7 +1746,7 @@ class FollowupBrainService:
         if bool(task.get("do_not_contact") or False):
             return "blocked"
         if bool(task.get("complaint_risk") or False):
-            return "high"
+            return "blocked"
         return str(task.get("risk_level") or "low")
 
     def _lesson_hint(self, service: str) -> str:
@@ -1613,10 +1829,14 @@ def parse_actual_visit_details(text: str, *, booked_service_title: str = "") -> 
     amount_match = re_search_amount_ml(raw)
     service_title = _extract_actual_service_title(raw, booked_service_title=booked_service_title)
     understood = bool(service_title and len(service_title) >= 3)
+    product_or_drug = _extract_product_or_drug(raw)
     return {
         "understood": understood,
         "actual_service_title": service_title,
+        "actual_service_category": _service_category(service_title),
         "amount_ml": amount_match or "",
+        "amount_unit": "мл" if amount_match else "",
+        "product_or_drug": product_or_drug,
     }
 
 
@@ -1655,9 +1875,43 @@ def _extract_actual_service_title(text: str, *, booked_service_title: str = "") 
     if correction_match and ("не " in lowered or "вместо" in lowered):
         cleaned = correction_match.group(1).strip(" .,!?:;-")
     without_amount = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:мл|ml)\b", "", cleaned, flags=re.IGNORECASE)
+    without_amount = re.sub(r"\b(?:препарат|drug|на)\s+[A-Za-zА-Яа-яЁё0-9_.-]+\b", "", without_amount, flags=re.IGNORECASE)
     service_part = without_amount.split(",", 1)[0].strip(" .,!?:;-")
     service_part = " ".join(service_part.split()).strip(" .,!?:;-")
+    if service_part.casefold() in {"да", "нет", "ок", "был", "была", "пришла", "пришел"}:
+        return ""
     return service_part
+
+
+def _extract_product_or_drug(text: str) -> str:
+    raw = str(text or "").strip()
+    explicit = re.search(r"\b(?:препарат|drug)\s*[:\-]?\s*([A-Za-zА-Яа-яЁё0-9_.-]{3,})", raw, flags=re.IGNORECASE)
+    if explicit:
+        return explicit.group(1).strip(" .,!?:;-")
+    after_amount = re.search(r"\b\d+(?:[.,]\d+)?\s*(?:мл|ml)\s*[,;:]?\s+([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9_.-]{2,})", raw, flags=re.IGNORECASE)
+    if after_amount:
+        candidate = after_amount.group(1).strip(" .,!?:;-")
+        if candidate.casefold() not in {"и", "на", "по", "препарат"}:
+            return candidate
+    return ""
+
+
+def _service_category(service_title: str) -> str:
+    lowered = str(service_title or "").casefold()
+    if any(word in lowered for word in ("губ", "lip")):
+        return "lips"
+    if any(word in lowered for word in ("ягод", "поп", "butt")):
+        return "buttocks"
+    if any(word in lowered for word in ("ботокс", "botox", "диспорт", "лоб", "межбров")):
+        return "botulinum"
+    if any(word in lowered for word in ("биорев", "мезо", "skin", "кож")):
+        return "skin_care"
+    return "other" if lowered.strip() else ""
+
+
+def _normalize_amount(value: str) -> str:
+    match = re.search(r"(\d+(?:[.,]\d+)?)", str(value or ""))
+    return match.group(1).replace(",", ".") if match else ""
 
 
 def _followup_rule_matches(rule: FollowupRule, service_title: str) -> bool:
@@ -1698,17 +1952,35 @@ def _normalize_phone(phone: str) -> str:
 
 
 def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
+    client_columns = {
+        "consent_source": "TEXT DEFAULT ''",
+        "risk_reason": "TEXT DEFAULT ''",
+        "risk_updated_at": "TEXT DEFAULT ''",
+        "last_contacted_at": "TEXT DEFAULT ''",
+    }
+    visit_columns = {
+        "actual_service_category": "TEXT DEFAULT ''",
+        "actual_amount_value": "TEXT DEFAULT ''",
+        "actual_amount_unit": "TEXT DEFAULT ''",
+    }
     followup_columns = {
         "reason": "TEXT DEFAULT ''",
         "confidence": "REAL NOT NULL DEFAULT 0.5",
         "risk_level": "TEXT NOT NULL DEFAULT 'low'",
+        "blocked_reason": "TEXT DEFAULT ''",
+        "requires_channel_resolution": "INTEGER NOT NULL DEFAULT 0",
         "approved_by": "TEXT DEFAULT ''",
         "approved_at": "TEXT DEFAULT ''",
+        "reviewed_by_olga_at": "TEXT DEFAULT ''",
         "draft_source": "TEXT DEFAULT 'rule'",
         "outcome": "TEXT DEFAULT ''",
         "admin_chat_id": "TEXT DEFAULT ''",
         "admin_card_message_id": "TEXT DEFAULT ''",
     }
+    for column, definition in client_columns.items():
+        _ensure_column(conn, "crm_clients", column, definition)
+    for column, definition in visit_columns.items():
+        _ensure_column(conn, "crm_visits", column, definition)
     for column, definition in followup_columns.items():
         _ensure_column(conn, "crm_followup_tasks", column, definition)
 

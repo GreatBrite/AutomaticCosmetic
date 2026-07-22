@@ -238,6 +238,20 @@ systemctl list-timers --all yclients-visit-confirmations.timer --no-pager
 
 Follow-up клиентам отправляется только если включён `TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED`. До проверки черновиков держать этот флаг выключенным.
 
+Правила отдела заботы:
+
+- После подтверждённого визита follow-up можно готовить даже при `consent_status=unknown`, если нет явного запрета.
+- `do_not_contact` или `consent_status=denied` полностью блокируют отправку клиенту.
+- `complaint_risk`, risk-level `high/blocked` или спорный риск — полный стоп: клиенту не пишем, оставляем задачу Ольге.
+- Если у клиента нет verified Telegram-связки, `/care_followups` показывает задачу найти канал связи или не писать, а не готовую отправку.
+- Ответ Ольги текстом на care-карточку заменяет черновик и сохраняется как урок тона для будущих follow-up.
+
+Полезные ops-сигналы:
+
+- `care_visit_details` — есть визиты в `needs_details` дольше 24 часов.
+- `care_followup_channels` — due-задачи есть, но нет verified Telegram-канала.
+- `care_followup_risk_gate` — live-отправка включена, а в очереди есть риск-блокированные задачи.
+
 ## Что делать при data/disk warning
 
 Проверить крупнейшие элементы:

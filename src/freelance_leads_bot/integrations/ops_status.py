@@ -19,6 +19,7 @@ from .config import IntegrationSettings
 
 DEFAULT_UNANSWERED_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_UNANSWERED_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
+DEFAULT_CARE_CRM_PATH = Path("data/care_crm.sqlite3")
 DEFAULT_DATA_PATH = Path("data")
 DEFAULT_DATA_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_DATA_ENTRY_WARNING_BYTES = 512 * 1024 * 1024
@@ -60,6 +61,7 @@ def build_ops_status_report(
     yclients_health: dict[str, Any] | None = None,
     unanswered_report_path: Path = DEFAULT_UNANSWERED_REPORT_PATH,
     unanswered_state_path: Path = DEFAULT_UNANSWERED_STATE_PATH,
+    care_crm_path: Path = DEFAULT_CARE_CRM_PATH,
     rag_db_path: Path | None = None,
     data_path: Path = DEFAULT_DATA_PATH,
     data_warning_bytes: int = DEFAULT_DATA_WARNING_BYTES,
@@ -160,6 +162,45 @@ def build_ops_status_report(
         )
     )
 
+    care = read_care_crm_status(care_crm_path, now=generated_at)
+    stale_visit_details = int(care.get("stale_needs_details_count") or 0)
+    due_needs_channel = int(care.get("due_needs_channel_count") or 0)
+    due_blocked_risk = int(care.get("due_blocked_risk_count") or 0)
+    unsafe_with_send_enabled = bool(settings.telegram_client_followup_send_enabled and due_blocked_risk > 0)
+    checks.append(
+        OpsCheck(
+            "care_visit_details",
+            stale_visit_details == 0,
+            "warning",
+            "No stale visit confirmations need details."
+            if stale_visit_details == 0
+            else f"{stale_visit_details} visit confirmations need details for more than 24h.",
+            care,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "care_followup_channels",
+            due_needs_channel == 0,
+            "warning",
+            "All due care followups have a verified Telegram channel."
+            if due_needs_channel == 0
+            else f"{due_needs_channel} due care followups need a verified Telegram channel.",
+            care,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "care_followup_risk_gate",
+            not unsafe_with_send_enabled,
+            "error",
+            "Care followup send gate has no risky due tasks with live sending enabled."
+            if not unsafe_with_send_enabled
+            else f"TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED is on while {due_blocked_risk} due tasks are risk-blocked.",
+            care,
+        )
+    )
+
     rag = read_rag_status(rag_db)
     rag_approved = int(rag.get("approved_count") or 0)
     rag_needs_review = int(rag.get("needs_review_count") or 0)
@@ -246,6 +287,9 @@ def build_ops_status_report(
         "avito_max_overdue_followup_age_seconds": max_overdue_followup_age,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
+        "care_stale_needs_details": stale_visit_details,
+        "care_due_needs_channel": due_needs_channel,
+        "care_due_blocked_risk": due_blocked_risk,
         "rag_approved": rag_approved,
         "rag_high_risk_approved": rag.get("approved_high_risk_count", 0),
         "rag_high_risk_excluded_from_avito_autoanswer": rag.get("approved_high_risk_count", 0),
@@ -277,7 +321,80 @@ def safe_live_flags(settings: IntegrationSettings) -> dict[str, Any]:
         "rag_handoff_threshold": settings.rag_handoff_threshold,
         "vk_ready": settings.vk_ready,
         "vk_send_enabled": settings.vk_send_enabled,
+        "telegram_client_followup_send_enabled": settings.telegram_client_followup_send_enabled,
     }
+
+
+def read_care_crm_status(path: Path, *, now: int | None = None) -> dict[str, Any]:
+    now_ts = int(time.time()) if now is None else int(now)
+    result = {
+        "exists": path.exists(),
+        "path": str(path),
+        "stale_needs_details_count": 0,
+        "due_needs_channel_count": 0,
+        "due_blocked_risk_count": 0,
+    }
+    if not path.exists():
+        return result
+    try:
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            stale_cutoff = datetime.fromtimestamp(now_ts - 24 * 60 * 60, timezone.utc).isoformat()
+            result["stale_needs_details_count"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM crm_appointments
+                    WHERE confirmation_status = 'needs_details'
+                      AND updated_at <= ?
+                    """,
+                    (stale_cutoff,),
+                ).fetchone()[0]
+                or 0
+            )
+            due_before = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
+            result["due_needs_channel_count"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM crm_followup_tasks t
+                    JOIN crm_clients c ON c.id = t.client_id
+                    WHERE t.status IN ('planned', 'needs_olga')
+                      AND t.due_at <= ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM crm_client_links l
+                        WHERE l.client_id = t.client_id
+                          AND l.channel = 'telegram_client'
+                          AND l.verified = 1
+                          AND l.chat_id != ''
+                      )
+                    """,
+                    (due_before,),
+                ).fetchone()[0]
+                or 0
+            )
+            result["due_blocked_risk_count"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM crm_followup_tasks t
+                    JOIN crm_clients c ON c.id = t.client_id
+                    WHERE t.status IN ('planned', 'needs_olga')
+                      AND t.due_at <= ?
+                      AND (
+                        c.do_not_contact = 1
+                        OR c.complaint_risk = 1
+                        OR lower(COALESCE(t.risk_level, '')) IN ('high', 'blocked')
+                      )
+                    """,
+                    (due_before,),
+                ).fetchone()[0]
+                or 0
+            )
+    except sqlite3.Error as exc:
+        result["error"] = type(exc).__name__
+    return result
 
 
 def read_unanswered_status(
@@ -428,6 +545,11 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f" high_risk_approved={summary.get('rag_high_risk_approved', 0)}"
             f" excluded_from_avito_autoanswer={summary.get('rag_high_risk_excluded_from_avito_autoanswer', 0)}"
             f" needs_review={summary.get('rag_needs_review', 0)}"
+        ),
+        (
+            f"Care: stale_visit_details={summary.get('care_stale_needs_details', 0)}"
+            f" due_needs_channel={summary.get('care_due_needs_channel', 0)}"
+            f" due_blocked_risk={summary.get('care_due_blocked_risk', 0)}"
         ),
         (
             f"Data: total={_format_bytes(int(summary.get('data_total_bytes') or 0))}"

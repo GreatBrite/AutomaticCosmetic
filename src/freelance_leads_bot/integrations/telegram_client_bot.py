@@ -324,28 +324,30 @@ class CareFollowupDeliveryService:
         waiting_link: list[int] = []
         for task in tasks:
             task_id = int(task.get("id") or 0)
-            if (
-                bool(task.get("do_not_contact") or False)
-                or bool(task.get("complaint_risk") or False)
-                or str(task.get("risk_level") or "").casefold() in {"high", "blocked"}
-                or float(task.get("confidence") or 0) < 0.7
-            ):
-                self.care_crm.mark_followup_task_status(task_id, status="blocked")
-                blocked.append(task_id)
-                continue
-            links = self.care_crm.list_client_links(int(task["client_id"]), channel="telegram_client")
-            chat_id = next((str(link.get("chat_id") or "") for link in links if str(link.get("chat_id") or "")), "")
-            if not chat_id:
+            gate = self.care_crm.followup_send_gate(task_id)
+            if gate["status"] == "needs_channel":
+                self.care_crm.update_followup_task(
+                    task_id,
+                    requires_channel_resolution=True,
+                    outcome="needs_channel_resolution",
+                )
                 waiting_link.append(task_id)
                 continue
-            text = str(task.get("message_draft") or "").strip()
-            if not text:
-                self.care_crm.mark_followup_task_status(task_id, status="blocked")
+            if not gate.get("allowed"):
+                self.care_crm.update_followup_task(
+                    task_id,
+                    status="blocked",
+                    blocked_reason=str(gate.get("reason") or gate.get("status") or "blocked"),
+                    risk_level="blocked" if "risk" in str(gate.get("reason") or "") else None,
+                )
                 blocked.append(task_id)
                 continue
+            chat_id = str(gate.get("chat_id") or "")
+            text = str(task.get("message_draft") or "").strip()
             await asyncio.to_thread(self.bot.send_message, chat_id, text)
             sent_at = datetime.now(timezone.utc).isoformat()
             self.care_crm.mark_followup_task_status(task_id, status="sent", sent_at=sent_at)
+            self.care_crm.mark_client_contacted(int(task["client_id"]), contacted_at=sent_at)
             self.care_crm.add_interaction(
                 int(task["client_id"]),
                 visit_id=int(task.get("visit_id") or 0) or None,
@@ -363,26 +365,23 @@ class CareFollowupDeliveryService:
         task = self.care_crm.get_followup_task(task_id)
         if not task:
             return {"ok": False, "status": "missing", "task_id": task_id}
-        if str(task.get("status") or "") != "planned":
-            return {"ok": False, "status": str(task.get("status") or ""), "task_id": task_id}
-        if (
-            bool(task.get("do_not_contact") or False)
-            or bool(task.get("complaint_risk") or False)
-            or str(task.get("risk_level") or "").casefold() in {"high", "blocked"}
-        ):
-            self.care_crm.mark_followup_task_status(task_id, status="blocked")
-            return {"ok": False, "status": "blocked", "task_id": task_id}
-        links = self.care_crm.list_client_links(int(task["client_id"]), channel="telegram_client")
-        chat_id = next((str(link.get("chat_id") or "") for link in links if str(link.get("chat_id") or "")), "")
-        if not chat_id:
-            return {"ok": False, "status": "waiting_link", "task_id": task_id}
+        gate = self.care_crm.followup_send_gate(task_id)
+        if gate["status"] == "needs_channel":
+            self.care_crm.update_followup_task(task_id, requires_channel_resolution=True, outcome="needs_channel_resolution")
+            return {"ok": False, "status": "needs_channel", "task_id": task_id}
+        if not gate.get("allowed"):
+            self.care_crm.update_followup_task(
+                task_id,
+                status="blocked",
+                blocked_reason=str(gate.get("reason") or gate.get("status") or "blocked"),
+            )
+            return {"ok": False, "status": "blocked", "reason": gate.get("reason"), "task_id": task_id}
+        chat_id = str(gate.get("chat_id") or "")
         text = str(task.get("message_draft") or "").strip()
-        if not text:
-            self.care_crm.mark_followup_task_status(task_id, status="blocked")
-            return {"ok": False, "status": "empty_text", "task_id": task_id}
         await asyncio.to_thread(self.bot.send_message, chat_id, text)
         sent_at = datetime.now(timezone.utc).isoformat()
         self.care_crm.mark_followup_task_status(task_id, status="sent", sent_at=sent_at)
+        self.care_crm.mark_client_contacted(int(task["client_id"]), contacted_at=sent_at)
         self.care_crm.add_interaction(
             int(task["client_id"]),
             visit_id=int(task.get("visit_id") or 0) or None,
