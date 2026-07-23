@@ -75,6 +75,7 @@ from .integrations.handoff_refs import (
     update_handoff_status,
 )
 from .integrations.handoff_notify import _download_photo_url, handoff_notifier_from_settings
+from .integrations.telegram_client_topics import get_or_create_client_topic, topic_request_from_avito_followup
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
 from .integrations.runtime import booking_from_settings, rag_admin_intent_parser_from_settings
@@ -1648,6 +1649,8 @@ def send_avito_followup_cards(
     topic_params: dict[str, str] | None = None,
     *,
     report_path: Path | str = AVITO_UNANSWERED_REPORT_PATH,
+    topics_enabled: bool = True,
+    topics_path: Path | str | None = None,
     limit: int = 10,
 ) -> None:
     report = _read_json_file(Path(report_path))
@@ -1672,13 +1675,37 @@ def send_avito_followup_cards(
     bot.send_message(chat_id, f"<b>Зависшие Avito-обещания</b>\nКарточек: {min(len(active), limit)} из {len(active)}.", **(topic_params or {}))
     for row in active[:limit]:
         key = str(row.get("key") or "")
+        card_topic_params = avito_followup_topic_params(
+            bot,
+            chat_id,
+            row,
+            topics_enabled=topics_enabled,
+            topics_path=topics_path,
+        ) or (topic_params or {})
         bot.send_message(
             chat_id,
             escape(pending_followup_card_text(row)),
             reply_markup=pending_followup_keyboard(key) if key else None,
-            **(topic_params or {}),
+            **card_topic_params,
         )
-        send_avito_followup_media(bot, chat_id, row, topic_params=topic_params)
+        send_avito_followup_media(bot, chat_id, row, topic_params=card_topic_params)
+
+
+def avito_followup_topic_params(
+    bot: TelegramBot,
+    chat_id: str,
+    row: dict,
+    *,
+    topics_enabled: bool = True,
+    topics_path: Path | str | None = None,
+) -> dict[str, str]:
+    try:
+        request = topic_request_from_avito_followup(row)
+        kwargs = {"path": topics_path} if topics_path else {}
+        result = get_or_create_client_topic(bot, chat_id, enabled=topics_enabled, **request, **kwargs)
+        return dict(result.get("topic_params") or {})
+    except Exception:
+        return {}
 
 
 def send_avito_followup_media(
@@ -3072,7 +3099,13 @@ def serve(settings: Settings) -> None:
                     continue
                 if data == "avito_followups":
                     bot.answer_callback_query(callback_id, "Avito обещания")
-                    send_avito_followup_cards(bot, callback_chat_id, callback_topic_params)
+                    send_avito_followup_cards(
+                        bot,
+                        callback_chat_id,
+                        callback_topic_params,
+                        topics_enabled=integration_settings.telegram_client_topics_enabled,
+                        topics_path=integration_settings.telegram_client_topics_path,
+                    )
                     continue
                 if data == "preset:live:ask":
                     bot.answer_callback_query(callback_id, "Подтверждение")
@@ -3327,7 +3360,13 @@ def serve(settings: Settings) -> None:
             elif text.startswith("/visit_confirmations") or text.startswith("/visits_today") or text.startswith("/visits"):
                 send_visit_confirmation_cards(bot, reply_chat_id, integration_settings, raw_text, topic_params)
             elif text.startswith("/avito_followups") or text.startswith("/avito_promises"):
-                send_avito_followup_cards(bot, reply_chat_id, topic_params)
+                send_avito_followup_cards(
+                    bot,
+                    reply_chat_id,
+                    topic_params,
+                    topics_enabled=integration_settings.telegram_client_topics_enabled,
+                    topics_path=integration_settings.telegram_client_topics_path,
+                )
             elif text.startswith("/care_followups") or text.startswith("/followups"):
                 send_care_followup_cards(bot, reply_chat_id, integration_settings, topic_params)
             elif text.startswith("/client"):

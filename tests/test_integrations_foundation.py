@@ -6827,6 +6827,7 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
         def __init__(self) -> None:
             self.messages = []
             self.photos = []
+            self.topics = []
 
         def send_message(self, chat_id, text, **kwargs):
             self.messages.append((chat_id, text, kwargs))
@@ -6836,6 +6837,10 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
             self.photos.append((chat_id, photo_url, caption, kwargs))
             return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
 
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": 77}}
+
     report_path = tmp_path / "report.json"
     key = "1:chat-followup:m-bot-1"
     report_path.write_text(
@@ -6844,6 +6849,7 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
                 "pending_followups": [
                     {
                         "key": key,
+                        "account_id": 1,
                         "chat_id": "chat-followup",
                         "client_name": "Анна",
                         "business_status": "overdue",
@@ -6863,13 +6869,72 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
     )
     bot = FakeBot()
 
-    main_module.send_avito_followup_cards(bot, "admin-chat", report_path=report_path)
+    main_module.send_avito_followup_cards(bot, "admin-chat", report_path=report_path, topics_path=tmp_path / "topics.json")
 
     assert len(bot.messages) == 2
     assert "Зависшие Avito-обещания" in bot.messages[0][1]
     assert "Жду адрес" in bot.messages[1][1]
+    assert bot.topics == [("admin-chat", "Анна | Avito / Геленджик | Увеличение губ")]
+    assert bot.messages[1][2]["message_thread_id"] == "77"
     assert bot.messages[1][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"avfu:{pending_followup_token(key)}:done"
-    assert bot.photos == [("admin-chat", "https://img.example/client.jpg", "Фото клиента из Avito (1/1)", {})]
+    assert bot.photos == [("admin-chat", "https://img.example/client.jpg", "Фото клиента из Avito (1/1)", {"message_thread_id": "77"})]
+
+
+def test_avito_followup_cards_reuse_existing_client_topic(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.photos = []
+            self.topics = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+        def send_photo_url(self, chat_id, photo_url, caption=None, **kwargs):
+            self.photos.append((chat_id, photo_url, caption, kwargs))
+            return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
+
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": 99}}
+
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": [
+                    {
+                        "key": "1:chat-followup:m-bot-1",
+                        "account_id": 1,
+                        "chat_id": "chat-followup",
+                        "client_name": "Анна",
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "age_seconds": 3600,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    topic_path = tmp_path / "topics.json"
+    remember_client_topic(
+        key="avito:1:chat-followup",
+        telegram_chat_id="admin-chat",
+        message_thread_id="55",
+        title="Анна",
+        path=topic_path,
+    )
+    bot = FakeBot()
+
+    main_module.send_avito_followup_cards(bot, "admin-chat", report_path=report_path, topics_path=topic_path)
+
+    assert bot.topics == []
+    assert bot.messages[1][2]["message_thread_id"] == "55"
 
 
 def test_avito_followup_media_downloads_and_uploads_when_telegram_cannot_fetch_url(tmp_path, monkeypatch) -> None:

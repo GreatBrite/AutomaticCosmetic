@@ -879,11 +879,17 @@ async def main() -> None:
                 if fresh_rows:
                     for row in fresh_rows[:max_alert_items]:
                         key = str(row.get("key") or "")
-                        await notifier.notify_text(pending_followup_card_text(row), reply_markup=pending_followup_keyboard(key))
+                        followup_result = await notifier.notify_avito_followup(
+                            row,
+                            pending_followup_card_text(row),
+                            reply_markup=pending_followup_keyboard(key),
+                        )
+                        topic_params = followup_result.get("topic_params") or (followup_result.get("topic") or {}).get("topic_params") or {}
                         for index, url in enumerate(_followup_media_urls(row)[:5], start=1):
                             await notifier.notify_photo_url(
                                 url,
                                 caption=f"Фото клиента из Avito для зависшего обещания ({index})",
+                                topic_params=topic_params,
                             )
                     followup_notified = min(len(fresh_rows), max_alert_items)
 

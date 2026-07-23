@@ -168,6 +168,8 @@ LLM-понимание свободных команд Ольги использ
 /avito_followups
 ```
 
+Если `TELEGRAM_CLIENT_TOPICS_ENABLED=true`, бот создаёт отдельную Telegram-тему под каждый Avito-диалог и сохраняет связь в `TELEGRAM_CLIENT_TOPICS_PATH` (`data/telegram_client_topics.json` по умолчанию). Карточка и фото клиента отправляются в эту тему; если Telegram не дал создать тему, бот молча откатывается к обычной отправке в основной чат.
+
 По каждой карточке нужно выбрать действие:
 
 - `Закрыто` — клиент уже получил финальный ответ.
@@ -267,6 +269,7 @@ df -h .
 - `data/leads.sqlite3`
 - `data/expert_rag.sqlite3`
 - `data/telegram_handoff_refs.json`
+- `data/telegram_client_topics.json`
 - `data/avito_processed_events.json`
 - `data/avito_unanswered_monitor_state.json`
 

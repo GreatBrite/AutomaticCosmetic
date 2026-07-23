@@ -26,16 +26,38 @@ from .handoff_refs import (
 from .avito_identity import client_display_name, dialog_ref
 from .config import IntegrationSettings
 from .models import Handoff
+from .telegram_client_topics import (
+    DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+    client_topic_key,
+    get_or_create_client_topic,
+    topic_request_from_avito_followup,
+    topic_title_for_client,
+)
 
 
 class HandoffNotifier(Protocol):
     async def notify(self, handoff: Handoff) -> dict[str, Any]:
         ...
 
-    async def notify_text(self, text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
+    async def notify_text(
+        self,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         ...
 
-    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+    async def notify_photo_url(
+        self,
+        photo_url: str,
+        *,
+        caption: str = "",
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        ...
+
+    async def notify_avito_followup(self, row: dict[str, Any], text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
         ...
 
 
@@ -75,17 +97,58 @@ class PreviewHandoffNotifier:
             "text": handoff_text,
         }
 
-    async def notify_text(self, text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
+    async def notify_text(
+        self,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        row = {"created_at": datetime.now(timezone.utc).isoformat(), "type": "operations_notification", "text": text, "reply_markup": reply_markup or {}}
+        row = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "type": "operations_notification",
+            "text": text,
+            "reply_markup": reply_markup or {},
+            "topic_params": topic_params or {},
+        }
         await asyncio.to_thread(_append_jsonl, self.path, row)
-        return {"sent": False, "reason": "preview_only", "outbox": str(self.path), "text": text, "reply_markup": reply_markup or {}}
+        return {
+            "sent": False,
+            "reason": "preview_only",
+            "outbox": str(self.path),
+            "text": text,
+            "reply_markup": reply_markup or {},
+            "topic_params": topic_params or {},
+        }
 
-    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+    async def notify_photo_url(
+        self,
+        photo_url: str,
+        *,
+        caption: str = "",
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        row = {"created_at": datetime.now(timezone.utc).isoformat(), "type": "operations_photo", "photo_url": photo_url, "caption": caption}
+        row = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "type": "operations_photo",
+            "photo_url": photo_url,
+            "caption": caption,
+            "topic_params": topic_params or {},
+        }
         await asyncio.to_thread(_append_jsonl, self.path, row)
-        return {"sent": False, "reason": "preview_only", "outbox": str(self.path), "photo_url": photo_url, "caption": caption}
+        return {
+            "sent": False,
+            "reason": "preview_only",
+            "outbox": str(self.path),
+            "photo_url": photo_url,
+            "caption": caption,
+            "topic_params": topic_params or {},
+        }
+
+    async def notify_avito_followup(self, row: dict[str, Any], text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
+        return await self.notify_text(text, reply_markup=reply_markup)
 
 
 class TelegramHandoffNotifier:
@@ -95,16 +158,22 @@ class TelegramHandoffNotifier:
         chat_id: str,
         media_dir: Path | str = Path("data/avito_photos"),
         ref_path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
+        topics_enabled: bool = True,
+        topics_path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
         self.media_dir = Path(media_dir)
         self.ref_path = Path(ref_path)
+        self.topics_enabled = topics_enabled
+        self.topics_path = Path(topics_path)
 
     async def notify(self, handoff: Handoff) -> dict[str, Any]:
         handoff_text = format_handoff_message(handoff)
         text = escape(handoff_text)
         urgent = _is_booking_critical(handoff)
+        topic_result = await self._topic_for_handoff(handoff)
+        topic_params = dict(topic_result.get("topic_params") or {})
         if not urgent:
             existing_ref = await asyncio.to_thread(
                 latest_unresolved_handoff_ref_for_chat,
@@ -119,7 +188,7 @@ class TelegramHandoffNotifier:
 
         notify_error = ""
         try:
-            result = await _to_thread_retry(self.bot.send_message, self.chat_id, text)
+            result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, text, **topic_params))
         except Exception as exc:
             result = {"ok": False, "error": repr(exc)}
             notify_error = repr(exc)
@@ -132,6 +201,7 @@ class TelegramHandoffNotifier:
                 telegram_chat_id=self.chat_id,
                 telegram_message_id=telegram_message_id,
                 avito_chat_id=handoff.message.chat_id,
+                telegram_message_thread_id=topic_params.get("message_thread_id", ""),
                 client_name=str((handoff.message.metadata or {}).get("client_name") or ""),
                 handoff_text=handoff_text,
                 source_message_id=str(handoff.message.message_id or ""),
@@ -147,8 +217,8 @@ class TelegramHandoffNotifier:
                 assignee=str(task_fields.get("assignee") or ""),
                 path=self.ref_path,
             )
-        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff)
-        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff)
+        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params)
+        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params)
         attachment_statuses = photo_statuses + media_statuses
         if telegram_message_id and attachment_statuses:
             await asyncio.to_thread(_store_ref_media_statuses, self.chat_id, telegram_message_id, attachment_statuses, self.ref_path)
@@ -168,10 +238,17 @@ class TelegramHandoffNotifier:
             "media_errors": media_errors,
             "media_statuses": attachment_statuses,
             "media_failure_notify": failure_notify,
+            "topic": topic_result,
+            "topic_params": topic_params,
             "text": handoff_text,
         }
 
-    async def _send_handoff_photos(self, handoff: Handoff) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    async def _send_handoff_photos(
+        self,
+        handoff: Handoff,
+        *,
+        topic_params: dict[str, str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         photo_results: list[dict[str, Any]] = []
         photo_errors: list[dict[str, Any]] = []
         statuses: list[dict[str, Any]] = []
@@ -182,7 +259,7 @@ class TelegramHandoffNotifier:
                 status.update({"status": "downloaded", "path": str(photo_path)})
                 dialog_line = _dialog_line(handoff.message)
                 caption = escape(f"Фото из {handoff.message.channel.value}, {dialog_line[:1].lower() + dialog_line[1:]}") if index == 1 else None
-                send_result = await _to_thread_retry(self.bot.send_photo, self.chat_id, photo_path, caption)
+                send_result = await _to_thread_retry(lambda: self.bot.send_photo(self.chat_id, photo_path, caption, **(topic_params or {})))
             except Exception as exc:
                 status.update({"status": "failed", "error": repr(exc)})
                 photo_errors.append({"kind": "photo", "url_hash": _url_hash(photo_url), "error": repr(exc), "index": index})
@@ -193,7 +270,12 @@ class TelegramHandoffNotifier:
             photo_results.append({"path": str(photo_path), "telegram": send_result, "index": index})
         return photo_results, photo_errors, statuses
 
-    async def _send_handoff_media(self, handoff: Handoff) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    async def _send_handoff_media(
+        self,
+        handoff: Handoff,
+        *,
+        topic_params: dict[str, str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         media_results: list[dict[str, Any]] = []
         media_errors: list[dict[str, Any]] = []
         statuses: list[dict[str, Any]] = []
@@ -205,7 +287,7 @@ class TelegramHandoffNotifier:
                 status.update({"status": "downloaded", "path": str(media_path)})
                 dialog_line = _dialog_line(handoff.message)
                 caption = escape(f"Вложение из {handoff.message.channel.value}, {dialog_line[:1].lower() + dialog_line[1:]}") if index == 1 else None
-                send_result = await _to_thread_retry(self.bot.send_document, self.chat_id, media_path, caption)
+                send_result = await _to_thread_retry(lambda: self.bot.send_document(self.chat_id, media_path, caption, **(topic_params or {})))
             except Exception as exc:
                 status.update({"status": "failed", "error": repr(exc)})
                 media_errors.append({"kind": "media", "url_hash": _url_hash(media_url), "error": repr(exc), "index": index})
@@ -250,6 +332,7 @@ class TelegramHandoffNotifier:
             telegram_chat_id=self.chat_id,
             telegram_message_id=telegram_message_id,
             avito_chat_id=handoff.message.chat_id,
+            telegram_message_thread_id=str(existing_ref.get("telegram_message_thread_id") or ""),
             client_name=str((handoff.message.metadata or {}).get("client_name") or ""),
             handoff_text=handoff_text,
             handoff_id=handoff_id,
@@ -257,8 +340,12 @@ class TelegramHandoffNotifier:
             status=str(existing_ref.get("status") or "open"),
             path=self.ref_path,
         )
-        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff)
-        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff)
+        topic_params = {"message_thread_id": str(existing_ref.get("telegram_message_thread_id") or "")} if existing_ref.get("telegram_message_thread_id") else {}
+        if not topic_params:
+            topic_result = await self._topic_for_handoff(handoff)
+            topic_params = dict(topic_result.get("topic_params") or {})
+        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params)
+        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params)
         attachment_statuses = photo_statuses + media_statuses
         if attachment_statuses:
             await asyncio.to_thread(_store_ref_media_statuses, self.chat_id, telegram_message_id, attachment_statuses, self.ref_path)
@@ -279,37 +366,122 @@ class TelegramHandoffNotifier:
             "media_errors": media_errors,
             "media_statuses": attachment_statuses,
             "media_failure_notify": failure_notify,
+            "topic_params": topic_params,
             "text": handoff_text,
         }
 
-    async def notify_text(self, text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
+    async def notify_text(
+        self,
+        text: str,
+        *,
+        reply_markup: dict | None = None,
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         try:
             if reply_markup:
-                result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, escape(text), reply_markup=reply_markup))
+                result = await _to_thread_retry(
+                    lambda: self.bot.send_message(
+                        self.chat_id,
+                        escape(text),
+                        reply_markup=reply_markup,
+                        **(topic_params or {}),
+                    )
+                )
             else:
-                result = await _to_thread_retry(self.bot.send_message, self.chat_id, escape(text))
-            return {"sent": True, "telegram": result, "text": text, "reply_markup": reply_markup or {}}
+                result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, escape(text), **(topic_params or {})))
+            return {"sent": True, "telegram": result, "text": text, "reply_markup": reply_markup or {}, "topic_params": topic_params or {}}
         except Exception as exc:
-            return {"sent": False, "error": repr(exc), "text": text, "reply_markup": reply_markup or {}}
+            return {"sent": False, "error": repr(exc), "text": text, "reply_markup": reply_markup or {}, "topic_params": topic_params or {}}
 
-    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+    async def notify_photo_url(
+        self,
+        photo_url: str,
+        *,
+        caption: str = "",
+        topic_params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         try:
-            result = await _to_thread_retry(self.bot.send_photo_url, self.chat_id, photo_url, escape(caption) if caption else None)
-            return {"sent": True, "telegram": result, "photo_url": photo_url, "caption": caption}
+            result = await _to_thread_retry(
+                lambda: self.bot.send_photo_url(self.chat_id, photo_url, escape(caption) if caption else None, **(topic_params or {}))
+            )
+            return {"sent": True, "telegram": result, "photo_url": photo_url, "caption": caption, "topic_params": topic_params or {}}
         except Exception as url_exc:
             try:
                 path = await asyncio.to_thread(_download_photo_url, photo_url, self.media_dir)
-                result = await _to_thread_retry(self.bot.send_photo, self.chat_id, path, escape(caption) if caption else None)
+                result = await _to_thread_retry(
+                    lambda: self.bot.send_photo(self.chat_id, path, escape(caption) if caption else None, **(topic_params or {}))
+                )
                 return {
                     "sent": True,
                     "telegram": result,
                     "photo_url": photo_url,
                     "caption": caption,
+                    "topic_params": topic_params or {},
                     "fallback": "download_upload",
                     "url_error": repr(url_exc),
                 }
             except Exception as exc:
-                return {"sent": False, "error": repr(exc), "url_error": repr(url_exc), "photo_url": photo_url, "caption": caption}
+                return {
+                    "sent": False,
+                    "error": repr(exc),
+                    "url_error": repr(url_exc),
+                    "photo_url": photo_url,
+                    "caption": caption,
+                    "topic_params": topic_params or {},
+                }
+
+    async def notify_avito_followup(self, row: dict[str, Any], text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
+        topic_result = await self._topic_for_avito_followup(row)
+        topic_params = dict(topic_result.get("topic_params") or {})
+        result = await self.notify_text(text, reply_markup=reply_markup, topic_params=topic_params)
+        result["topic"] = topic_result
+        return result
+
+    async def _topic_for_handoff(self, handoff: Handoff) -> dict[str, Any]:
+        message = handoff.message
+        listing = message.listing
+        metadata = message.metadata or {}
+        client_name = str(metadata.get("client_name") or metadata.get("name") or message.client_id or "").strip()
+        external_chat_id = str(message.chat_id or message.client_id or "").strip()
+        key = client_topic_key(
+            channel=message.channel.value,
+            account_id=str(metadata.get("account_id") or ""),
+            external_chat_id=external_chat_id,
+            client_id=message.client_id,
+        )
+        title = topic_title_for_client(
+            client_name=client_name,
+            channel=message.channel.value,
+            city=str((listing.city if listing else "") or metadata.get("city") or ""),
+            listing_title=str((listing.title if listing else "") or metadata.get("listing_title") or ""),
+            external_chat_id=external_chat_id,
+        )
+        return await asyncio.to_thread(
+            get_or_create_client_topic,
+            self.bot,
+            self.chat_id,
+            key=key,
+            title=title,
+            channel=message.channel.value,
+            external_chat_id=external_chat_id,
+            account_id=str(metadata.get("account_id") or ""),
+            client_name=client_name,
+            listing_title=str((listing.title if listing else "") or metadata.get("listing_title") or ""),
+            city=str((listing.city if listing else "") or metadata.get("city") or ""),
+            enabled=self.topics_enabled,
+            path=self.topics_path,
+        )
+
+    async def _topic_for_avito_followup(self, row: dict[str, Any]) -> dict[str, Any]:
+        request = topic_request_from_avito_followup(row)
+        return await asyncio.to_thread(
+            get_or_create_client_topic,
+            self.bot,
+            self.chat_id,
+            enabled=self.topics_enabled,
+            path=self.topics_path,
+            **request,
+        )
 
 
 async def process_handoff_sla(
@@ -372,7 +544,12 @@ async def process_handoff_sla(
 
 def handoff_notifier_from_settings(settings: IntegrationSettings) -> HandoffNotifier:
     if settings.handoff_notify_ready:
-        return TelegramHandoffNotifier(TelegramBot(settings.telegram_admin_bot_token), settings.handoff_notify_chat_id)
+        return TelegramHandoffNotifier(
+            TelegramBot(settings.telegram_admin_bot_token),
+            settings.handoff_notify_chat_id,
+            topics_enabled=settings.telegram_client_topics_enabled,
+            topics_path=settings.telegram_client_topics_path,
+        )
     return PreviewHandoffNotifier()
 
 
