@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,10 @@ from typing import Any
 DEFAULT_FOLLOWUP_AUDIT_LOG_PATH = Path("data/avito_followup_audit.jsonl")
 DEFAULT_FOLLOWUP_SNOOZE_SECONDS = 2 * 60 * 60
 FOLLOWUP_ACTIONS = {"done", "stale", "urgent", "later"}
+CRITICAL_FOLLOWUP_RE = re.compile(
+    r"\b(запис|перенос|отмен|адрес|подтвержд|в\s+силе|фото|voice|голосов|жалоб|отзыв|уточн|провер|подтверж)\b",
+    re.IGNORECASE,
+)
 
 
 def pending_followup_token(key: str) -> str:
@@ -89,14 +94,16 @@ def apply_pending_followup_action(
         return {"ok": False, "reason": "followup_not_found", "token": token, "action": action}
     row = pending.get(key) if isinstance(pending.get(key), dict) else {}
     if action == "done":
+        close_status = "closed_manual_no_client_reply" if _critical_without_client_reply(row) else "manual_closed"
         row.update(
             {
-                "business_status": "manual_closed",
+                "business_status": close_status,
                 "business_resolved": True,
                 "closed_at": now_ts,
                 "closed_at_iso": _iso(now_ts),
                 "closed_by": actor,
-                "close_reason": "manual_closed",
+                "close_reason": close_status,
+                "client_answer_confirmed": close_status == "manual_closed",
                 "overdue": False,
             }
         )
@@ -156,6 +163,26 @@ def _find_pending_key_by_token(pending: dict[str, Any], token: str) -> str:
         if pending_followup_token(str(key)) == token:
             return str(key)
     return ""
+
+
+def _critical_without_client_reply(row: dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if row.get("final_answer") or row.get("client_answer_confirmed") or row.get("sent_to_client_at"):
+        return False
+    if str(row.get("severity") or "").strip().casefold() == "critical":
+        return True
+    text = "\n".join(
+        str(row.get(key) or "")
+        for key in (
+            "bot_promise",
+            "last_client_message",
+            "reason",
+            "listing_title",
+            "business_status",
+        )
+    )
+    return bool(CRITICAL_FOLLOWUP_RE.search(text))
 
 
 def _load_state(path: Path) -> dict[str, Any]:

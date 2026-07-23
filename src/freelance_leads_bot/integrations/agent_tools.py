@@ -889,6 +889,9 @@ class AutomationToolbox:
         if not image_path:
             return ToolResult(ok=False, error="image_path is missing")
         result = await self.avito_image_sender.send_image(account_id, chat_id, image_path)
+        if sent_successfully(result):
+            remember_avito_outgoing(self.history_store, chat_id, f"[image] {Path(image_path).name}")
+            update_latest_handoff_for_chat(chat_id, "closed")
         return ToolResult(ok=True, data={"account_id": account_id, "chat_id": chat_id, "image_path": image_path, "send_result": result})
 
     async def _execute_avito_messages_send_file(self, args: dict[str, Any]) -> ToolResult:
@@ -908,6 +911,12 @@ class AutomationToolbox:
         if not hasattr(sender, "send_file"):
             return ToolResult(ok=False, error="Avito sender does not support generic files")
         result = await sender.send_file(account_id, chat_id, file_path, caption)
+        if sent_successfully(result):
+            outgoing = f"[file] {Path(file_path).name}"
+            if caption.strip():
+                outgoing = f"{outgoing}\n{caption.strip()}"
+            remember_avito_outgoing(self.history_store, chat_id, outgoing)
+            update_latest_handoff_for_chat(chat_id, "closed")
         return ToolResult(ok=True, data={"account_id": account_id, "chat_id": chat_id, "file_path": file_path, "caption": caption, "send_result": result})
 
 

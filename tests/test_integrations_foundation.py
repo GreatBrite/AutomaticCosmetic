@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import sqlite3
+import tarfile
 import time
 import zipfile
 
@@ -165,6 +167,7 @@ from scripts.avito_unanswered_monitor import (
     sync_pending_followups,
 )
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
+from scripts.backup_runtime_data import backup_runtime_data
 from scripts.avito_live_telegram_relay import (
     compact_handoff_event,
     compact_relay_event,
@@ -3706,7 +3709,7 @@ async def test_codex_tool_loop_planner_executes_multiple_tools_before_final_repl
             }
         return {"action": "codex_reply", "reply": "Ботокс сейчас от 3000 ₽, зависит от зоны. В каком городе удобно?"}
 
-    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop))
+    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop, max_steps=4))
     message = avito_inbound_message(
         {
             "type": "message",
@@ -3752,7 +3755,7 @@ async def test_codex_tool_loop_zero_max_steps_disables_step_cap(tmp_path) -> Non
 
 
 @pytest.mark.anyio
-async def test_codex_tool_loop_default_disables_step_cap(tmp_path) -> None:
+async def test_codex_tool_loop_default_step_cap_handoffs_safely(tmp_path) -> None:
     toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
     calls = 0
 
@@ -3763,14 +3766,24 @@ async def test_codex_tool_loop_default_disables_step_cap(tmp_path) -> None:
             return {"tool_calls": [{"name": "yclients.services.list", "arguments": {}}]}
         return {"action": "codex_reply", "reply": "Готово без явного лимита."}
 
-    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop))
+    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fake_codex_loop, max_steps=4))
     message = avito_inbound_message({"type": "message", "chat_id": "chat-default-unlimited", "content": {"text": "Расскажите про уход после ботокса"}})
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "codex_reply"
-    assert reply.reply == "Готово без явного лимита."
-    assert calls == 8
+    assert reply.action == "handoff"
+    assert "уточню" in reply.reply.casefold()
+    assert reply.handoff is not None
+    assert "достиг лимита шагов" in reply.handoff.summary
+    assert calls == 4
+
+
+def test_integration_settings_default_avito_codex_max_steps_is_four(monkeypatch) -> None:
+    monkeypatch.delenv("AVITO_CODEX_MAX_STEPS", raising=False)
+
+    settings = IntegrationSettings.from_env()
+
+    assert settings.avito_codex_max_steps == 4
 
 
 @pytest.mark.anyio
@@ -5892,6 +5905,25 @@ def test_shared_rag_retrieval_blocks_unsafe_autoanswer_but_keeps_similar_answers
     assert result.answers
 
 
+def test_shared_rag_retrieval_blocks_temporal_autoanswer_without_expiry(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="guby", title="Губы", aliases=("губы",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="Есть окно на губы завтра?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "guby", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(RagRetrievalRequest(channel="avito", text="Есть окно завтра на губы?", min_score=0.0))
+
+    assert result.answers == ()
+    assert result.safe_for_autoanswer is False
+    assert result.handoff_reason == "no_approved_knowledge"
+
+
 @pytest.mark.anyio
 async def test_telegram_rag_plan_cancel_and_details_callbacks(tmp_path) -> None:
     class FakeBot:
@@ -7027,8 +7059,79 @@ def test_avito_followup_callback_updates_report_immediately(tmp_path) -> None:
     assert report["pending_followup_count"] == 0
     assert report["overdue_followup_count"] == 0
     assert report["critical_followup_count"] == 0
-    assert report["pending_followups"][0]["business_status"] == "manual_closed"
+    assert report["pending_followups"][0]["business_status"] == "closed_manual_no_client_reply"
     assert report["pending_followups"][0]["business_resolved"] is True
+
+
+def test_pending_followup_done_keeps_noncritical_manual_close(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    audit_path = tmp_path / "audit.jsonl"
+    key = "1:chat-followup:m-bot-1"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    key: {
+                        "chat_id": "chat-followup",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                        "bot_promise": "Передам Ольге пожелание по тону.",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = apply_pending_followup_action(
+        state_path=state_path,
+        token=pending_followup_token(key),
+        action="done",
+        now=1780000000,
+        audit_path=audit_path,
+    )
+    row = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+
+    assert result["ok"] is True
+    assert row["business_status"] == "manual_closed"
+    assert row["client_answer_confirmed"] is True
+
+
+def test_pending_followup_done_marks_critical_without_client_reply(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    audit_path = tmp_path / "audit.jsonl"
+    key = "1:chat-followup:m-bot-1"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    key: {
+                        "chat_id": "chat-followup",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                        "severity": "critical",
+                        "bot_promise": "Уточню адрес и подтвержу запись.",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = apply_pending_followup_action(
+        state_path=state_path,
+        token=pending_followup_token(key),
+        action="done",
+        now=1780000000,
+        audit_path=audit_path,
+    )
+    row = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+
+    assert result["ok"] is True
+    assert row["business_status"] == "closed_manual_no_client_reply"
+    assert row["client_answer_confirmed"] is False
 
 
 def test_care_followup_send_is_blocked_by_feature_flag(monkeypatch) -> None:
@@ -8042,6 +8145,36 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
 
 
 @pytest.mark.anyio
+async def test_handoff_sla_marks_critical_expired_separately(tmp_path) -> None:
+    class FakeNotifier:
+        async def notify_text(self, text):
+            return {"sent": True, "text": text}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-critical",
+        handoff_text="СРОЧНО: клиент ждёт подтверждение записи/адрес\nПричина: booking_critical",
+        urgency="critical",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 8 * 24 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+
+    result = await process_handoff_sla(FakeNotifier(), ref_path=ref_path, now=now)
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
+
+    assert result["expired"] == 0
+    assert result["expired_critical"] == 1
+    assert updated["status"] == "expired_critical"
+    assert updated.get("closed_at", 0) == 0
+    assert updated["expired_at"] == now
+
+
+@pytest.mark.anyio
 async def test_telegram_handoff_notifier_sends_photos_when_merging_existing_card(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
@@ -8159,9 +8292,17 @@ async def test_telegram_handoff_notifier_keeps_sending_after_one_photo_fails(tmp
     assert result["photos_sent"] == 2
     assert result["photos_failed"] == 1
     assert len(result["photo_errors"]) == 1
-    assert [status["status"] for status in result["media_statuses"]] == ["sent_to_telegram", "failed", "sent_to_telegram"]
+    assert [status["status"] for status in result["media_statuses"]] == [
+        "sent_to_olga",
+        "manual_avito_check_required",
+        "sent_to_olga",
+    ]
     assert ref is not None
-    assert [status["status"] for status in ref["media_statuses"]] == ["sent_to_telegram", "failed", "sent_to_telegram"]
+    assert [status["status"] for status in ref["media_statuses"]] == [
+        "sent_to_olga",
+        "manual_avito_check_required",
+        "sent_to_olga",
+    ]
     assert result["media_failure_notify"]["sent"] is True
     assert "не удалось переслать вложение" in result["media_failure_notify"]["text"]
     assert len(bot.photos) == 2
@@ -8394,7 +8535,7 @@ def test_ops_status_reports_actionable_avito_queue(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8424,7 +8565,7 @@ def test_ops_status_failed_autoreply_is_error(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8465,7 +8606,7 @@ def test_ops_status_warns_on_stale_unanswered_report(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8509,7 +8650,7 @@ def test_ops_status_human_summary_highlights_warnings(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8559,7 +8700,7 @@ def test_ops_status_warns_on_overdue_avito_promises(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8606,7 +8747,7 @@ def test_ops_status_errors_when_overdue_avito_promises_exceed_sla(tmp_path) -> N
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8650,7 +8791,7 @@ def test_ops_status_human_summary_marks_high_risk_rag_as_excluded_from_avito_aut
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8691,7 +8832,7 @@ def test_ops_status_exit_code_can_be_strict_for_warnings(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8759,7 +8900,7 @@ def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8780,6 +8921,35 @@ def test_ops_status_human_summary_includes_data_footprint(tmp_path) -> None:
     assert "Data: total=80B" in text
     assert "disk_free=" in text
     assert "data_footprint" in text
+
+
+def test_backup_runtime_data_copies_sqlite_and_archives_json_env(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "care.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO sample (name) VALUES ('olga')")
+    (data_dir / "state.json").write_text('{"ok": true}', encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("TOKEN=secret\n", encoding="utf-8")
+
+    result = backup_runtime_data(
+        data_dir=data_dir,
+        output_dir=tmp_path / "backups",
+        env_path=env_path,
+        now=1780000000,
+    )
+
+    assert result["ok"] is True
+    copied_db = Path(result["sqlite_files"][0])
+    assert copied_db.exists()
+    with sqlite3.connect(copied_db) as conn:
+        assert conn.execute("SELECT name FROM sample").fetchone()[0] == "olga"
+    with tarfile.open(result["archive_path"], "r:gz") as archive:
+        names = archive.getnames()
+    assert "data/state.json" in names
+    assert ".env" in names
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:
@@ -8816,7 +8986,7 @@ def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> 
         _settings(),
         service_states={"freelance-leads-bot.service": "active"},
         avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
-        yclients_health={"ok": True},
+        yclients_health={"ok": True, "secret_required": True},
         unanswered_report_path=report_path,
         unanswered_state_path=state_path,
         rag_db_path=rag_path,
@@ -8945,6 +9115,110 @@ async def test_preview_avito_sender_writes_outbox(tmp_path) -> None:
     assert result["sent"] is False
     assert result["reason"] == "preview_only"
     assert "Ответ клиенту" in outbox.read_text(encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_process_avito_message_send_failure_is_retryable(tmp_path) -> None:
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(action="codex_reply", reply="Ответ клиенту.", metadata={"planner": "test"})
+
+    class FailingSender:
+        async def send_message(self, account_id, chat_id, text):
+            return {"sent": False, "error": "boom"}
+
+    message = avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-fail", "content": {"text": "Нестандартный вопрос"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=FailingSender(),
+        handoff_notifier=PreviewHandoffNotifier(tmp_path / "handoff.jsonl"),
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is False
+    assert result["processing_status"] == "retryable_error"
+    assert result["error"] == "avito_send_failed:boom"
+    assert result["mark_read"]["reason"] == "not_marked_read_delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_process_avito_message_handoff_failure_is_retryable_when_no_client_reply(tmp_path) -> None:
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(
+                action="handoff",
+                reply="",
+                handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=context.message, summary="Нужно уточнить у Ольги."),
+                metadata={"planner": "test"},
+            )
+
+    class Sender:
+        async def send_message(self, account_id, chat_id, text):
+            raise AssertionError("empty reply must not be sent")
+
+    class FailingNotifier:
+        async def notify(self, handoff):
+            return {"sent": False, "error": "telegram down"}
+
+    message = avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-handoff-fail", "content": {"text": "Нестандартный вопрос"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=Sender(),
+        handoff_notifier=FailingNotifier(),
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is False
+    assert result["processing_status"] == "retryable_error"
+    assert result["error"] == "telegram_handoff_failed:telegram down"
+    assert result["mark_read"]["reason"] == "not_marked_read_delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_process_avito_message_successful_handoff_counts_processed(tmp_path) -> None:
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(
+                action="handoff",
+                reply="",
+                handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=context.message, summary="Нужно уточнить у Ольги."),
+                metadata={"planner": "test"},
+            )
+
+    class Sender:
+        async def send_message(self, account_id, chat_id, text):
+            raise AssertionError("empty reply must not be sent")
+
+    class Notifier:
+        async def notify(self, handoff):
+            return {"sent": True, "telegram": {"ok": True, "result": {"message_id": 1}}}
+
+    message = avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-handoff-ok", "content": {"text": "Нестандартный вопрос"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=Sender(),
+        handoff_notifier=Notifier(),
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is True
+    assert result["processing_status"] == "processed"
+    assert result["handoff"] == "missing_data"
 
 
 @pytest.mark.anyio

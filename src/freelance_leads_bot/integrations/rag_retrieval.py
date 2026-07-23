@@ -8,6 +8,14 @@ from .expert_rag import APPROVED, ExpertRagStore, infer_metadata
 from .models import InboundMessage
 from .service_catalog import ACTIVE, HIDDEN, ServiceCatalogStore, service_catalog_from_rag_metadata
 
+TEMPORAL_FACT_RE = re.compile(
+    r"(?iu)(?:\b(?:сегодня|завтра|послезавтра)\b|"
+    r"\b(?:понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[еия])\b|"
+    r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|"
+    r"\b\d{1,2}\s*(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b|"
+    r"\b\d{1,2}:\d{2}\b|есть\s+окн|свободн|можно\s+запис|адрес)"
+)
+
 
 @dataclass(frozen=True)
 class RagRetrievalRequest:
@@ -137,7 +145,12 @@ class RagRetrievalService:
 
 def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
-    return answer.get("status") == APPROVED and metadata.get("autoanswer_allowed") is not False
+    if answer.get("status") != APPROVED or metadata.get("autoanswer_allowed") is False:
+        return False
+    if answer.get("expires_at") or metadata.get("valid_until") or metadata.get("expires_at"):
+        return True
+    text = "\n".join(str(answer.get(key) or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
+    return not TEMPORAL_FACT_RE.search(text)
 
 
 def _strip_batch_system_text(text: str) -> str:

@@ -193,6 +193,12 @@ journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
 
 После ручного ответа в Avito монитор должен запомнить исходящее сообщение и закрыть открытую задачу, если ответ похож на финальный.
 
+Если нажали `Закрыто` по критичной карточке, а монитор не видит исходящего ответа клиенту после создания задачи, карточка получает статус `closed_manual_no_client_reply`. Это не дёргает Ольгу повторно, но остаётся warning в `ops_status`: такой случай нужно отдельно проверить в Avito.
+
+Фото и вложения из Avito бот пересылает в тему клиента. Статусы хранятся в `data/telegram_handoff_refs.json`: `received`, `downloaded`, `sent_to_olga`, `download_failed`, `manual_avito_check_required`. Если фото/файл не удалось переслать после retry, Ольга получает текстовую карточку “открыть Avito и проверить вложение вручную”.
+
+Голосовые сообщения расшифровываются webhook/missed-poller. Если расшифровка упала, сообщение не считается обработанным молча: создаётся handoff Ольге, а при падении handoff сообщение остаётся retryable.
+
 ### `avito_unanswered_report_fresh`
 
 Monitor может зависнуть или перестать обновлять отчёт.
@@ -252,6 +258,68 @@ Follow-up клиентам отправляется только если вкл
 - `care_visit_details` — есть визиты в `needs_details` дольше 24 часов.
 - `care_followup_channels` — due-задачи есть, но нет verified Telegram-канала.
 - `care_followup_risk_gate` — live-отправка включена, а в очереди есть риск-блокированные задачи.
+
+## YCLIENTS webhook secret
+
+В production `YCLIENTS_INTEGRATION_SECRET` должен быть непустым. `/health` обязан показывать:
+
+```json
+{"secret_required": true}
+```
+
+POST на `/yclients/webhook` и `/yclients/callback` без `X-YCLIENTS-Signature`/`X-YClients-Webhook-Secret` должен возвращать `403`. GET/HEAD probe остаётся открытым для health-check.
+
+Если `ops_status` показывает `yclients_webhook_secret` как error:
+
+```bash
+grep -n '^YCLIENTS_INTEGRATION_SECRET=' .env
+systemctl restart yclients-yclients-integration.service
+curl -s http://127.0.0.1:8020/health
+```
+
+Секрет не писать в логи, PR и скриншоты.
+
+## Backup и restore
+
+Ежедневный backup:
+
+```bash
+sudo cp deploy/systemd/automaticcosmetic-backup.service /etc/systemd/system/
+sudo cp deploy/systemd/automaticcosmetic-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now automaticcosmetic-backup.timer
+```
+
+Ручной запуск:
+
+```bash
+.venv/bin/python scripts/backup_runtime_data.py --data-dir data --output-dir backups --env-path .env --retention-days 14
+```
+
+SQLite копируется через безопасный sqlite backup API в `backups/sqlite-*/`. JSON-state и `.env` архивируются отдельно в `backups/runtime-json-env-*.tar.gz` с правами `0600`.
+
+Restore:
+
+```bash
+systemctl stop freelance-leads-bot.service yclients-avito-webhook.service yclients-yclients-integration.service
+cp backups/sqlite-YYYYMMDDTHHMMSSZ/*.sqlite3 data/
+tar -xzf backups/runtime-json-env-YYYYMMDDTHHMMSSZ.tar.gz -C /root/AutomaticCosmetic
+systemctl start yclients-yclients-integration.service yclients-avito-webhook.service freelance-leads-bot.service
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
+```
+
+Перед restore проверить, что архив именно нужной даты.
+
+## Log rotation
+
+Шаблон лежит в `deploy/logrotate/automaticcosmetic`.
+
+```bash
+sudo cp deploy/logrotate/automaticcosmetic /etc/logrotate.d/automaticcosmetic
+sudo logrotate -d /etc/logrotate.d/automaticcosmetic
+```
+
+Ротация касается только `*.log`, `*.jsonl`, trace/audit/outbox. Она не трогает SQLite, client topics, handoff refs и state JSON.
 
 ## Что делать при data/disk warning
 

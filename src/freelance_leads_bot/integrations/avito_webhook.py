@@ -17,7 +17,7 @@ from .avito_consultant import AvitoAgentPlanner, AvitoConsultant, CodexToolLoopP
 from .avito_dedup import PersistentProcessedEventStore
 from .avito_media import AvitoApiPhotoResolver, AvitoPhotoResolver, enrich_reply_handoff_photos
 from .avito_read import AvitoReadGateway, avito_read_client_from_settings
-from .avito_history import prepare_avito_outgoing_text, remember_avito_outgoing
+from .avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
 from .avito_sender import AvitoSender, avito_sender_from_settings
 from .avito_turn_buffer import (
     batch_to_inbound_message,
@@ -34,6 +34,7 @@ from .handoff_notify import HandoffNotifier, handoff_notifier_from_settings
 from .handoff_refs import update_latest_handoff_for_chat
 from .mentor_memory import MentorMemoryService
 from .expert_rag import ExpertRagStore
+from .models import Handoff, HandoffReason
 from .runtime import booking_from_settings, rag_retrieval_from_settings
 from .roles import CodexRole, legacy_runtime_status, role_profile
 from .yclients import YClientsGateway
@@ -45,6 +46,18 @@ app = FastAPI(title="Automatic Cosmetic Avito Webhook")
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 WEBHOOK_LOG_PATH = Path("data/avito_webhook.log")
 AVITO_DEBOUNCE_WORKER_INTERVAL_SECONDS = 2.0
+SAFE_IGNORE_REASONS = {
+    "not_message_event",
+    "duplicate",
+    "duplicate_history",
+    "assistant_echo",
+    "client_ack_after_pending_reply",
+    "not_incoming",
+    "system",
+    "deleted_message",
+    "own_message",
+    "empty",
+}
 
 
 def _log_webhook(row: dict[str, Any]) -> None:
@@ -245,7 +258,7 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
                     "handoff_notify": result.get("handoff_notify"),
                 }
             )
-        if result.get("ok"):
+        if _dedup_allowed(result):
             _mark_batch_messages_processed(message)
             mark_avito_turn_batch_processed(batch)
         else:
@@ -280,9 +293,34 @@ async def avito_webhook(
 
     message = annotate_avito_message_actor(avito_inbound_message(event), settings)
     message = await transcribe_avito_voice_message(message, voice_resolver=voice_resolver)
+    if message.metadata.get("voice_transcription_error"):
+        result = await _notify_voice_transcription_error(message, handoff_notifier)
+        _log_webhook(
+            {
+                "event": "processed" if result.get("ok") else "retryable_error",
+                "reason": result.get("reason"),
+                "chat_id": message.chat_id,
+                "message_id": message.message_id,
+                "message_type": message.metadata.get("message_type"),
+                "voice_id": message.metadata.get("voice_id"),
+                "voice_transcription_error": message.metadata.get("voice_transcription_error"),
+                "handoff_notify": result.get("handoff_notify"),
+            }
+        )
+        if _dedup_allowed(result):
+            processed_events.mark_once(f"{message.chat_id}:{message.message_id}" if message.message_id else "")
+        return result
     ignore_reason = _ignore_reason(event, message, settings)
     if ignore_reason:
         manual_outgoing = _remember_manual_avito_outgoing_if_needed(message, settings, history_store, ignore_reason)
+        result = {
+            "ok": True,
+            "processing_status": "ignored",
+            "ignored": True,
+            "reason": ignore_reason,
+            "message_id": message.message_id,
+            "manual_outgoing": manual_outgoing,
+        }
         _log_webhook(
             {
                 "event": "ignored",
@@ -296,12 +334,14 @@ async def avito_webhook(
                 "manual_outgoing": manual_outgoing,
             }
         )
-        return {"ok": True, "ignored": True, "reason": ignore_reason, "message_id": message.message_id, "manual_outgoing": manual_outgoing}
+        if _dedup_allowed(result):
+            processed_events.mark_once(f"{message.chat_id}:{message.message_id}" if message.message_id else "")
+        return result
 
     dedup_key = f"{message.chat_id}:{message.message_id}" if message.message_id else ""
     if processed_events.contains(dedup_key):
         _log_webhook({"event": "ignored", "reason": "duplicate", "chat_id": message.chat_id, "message_id": message.message_id})
-        return {"ok": True, "ignored": True, "reason": "duplicate", "message_id": message.message_id}
+        return {"ok": True, "processing_status": "ignored", "ignored": True, "reason": "duplicate", "message_id": message.message_id}
 
     if settings.avito_turn_debounce_seconds > 0:
         queued = enqueue_avito_turn_message(
@@ -319,7 +359,7 @@ async def avito_webhook(
                 "queue": queued,
             }
         )
-        return {"ok": True, "queued": True, "reason": "turn_debounce", "message_id": message.message_id, "queue": queued}
+        return {"ok": True, "processing_status": "queued", "queued": True, "reason": "turn_debounce", "message_id": message.message_id, "queue": queued}
 
     result = await process_avito_message(
         message=message,
@@ -347,7 +387,7 @@ async def avito_webhook(
             "handoff_notify": result.get("handoff_notify"),
         }
     )
-    if result.get("ok"):
+    if _dedup_allowed(result):
         processed_events.mark_once(dedup_key)
     return result
 
@@ -485,6 +525,7 @@ async def process_avito_message(
     if history_store and _history_has_message_id(conversation_history, message.message_id) and not force_unanswered_autoreply:
         return {
             "ok": True,
+            "processing_status": "ignored",
             "ignored": True,
             "reason": "duplicate_history",
             "message_id": message.message_id,
@@ -496,6 +537,7 @@ async def process_avito_message(
         mark_read = await _mark_avito_chat_read(avito_reader, _account_id(message.metadata.get("account_id"), settings), message.chat_id)
         return {
             "ok": True,
+            "processing_status": "ignored",
             "ignored": True,
             "reason": "client_ack_after_pending_reply",
             "message_id": message.message_id,
@@ -505,6 +547,7 @@ async def process_avito_message(
     if _looks_like_own_echo(conversation_history, message):
         return {
             "ok": True,
+            "processing_status": "ignored",
             "ignored": True,
             "reason": "assistant_echo",
             "message_id": message.message_id,
@@ -513,12 +556,20 @@ async def process_avito_message(
     if _is_empty_chat_prompt(message):
         reply = prepare_avito_outgoing_text(history_store, message.chat_id, "Здравствуйте! Подскажите, пожалуйста, какой у вас вопрос?")
         send_result = await sender.send_message(_account_id(message.metadata.get("account_id"), settings), message.chat_id, reply)
+        delivery_ok = _delivery_ok(send_result)
         if history_store:
             history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
-            remember_avito_outgoing(history_store, message.chat_id, reply)
-        mark_read = await _mark_avito_chat_read(avito_reader, _account_id(message.metadata.get("account_id"), settings), message.chat_id)
+            if delivery_ok:
+                remember_avito_outgoing(history_store, message.chat_id, reply)
+        mark_read = (
+            await _mark_avito_chat_read(avito_reader, _account_id(message.metadata.get("account_id"), settings), message.chat_id)
+            if delivery_ok
+            else {"ok": False, "reason": "not_marked_read_delivery_failed"}
+        )
         return {
-            "ok": True,
+            "ok": delivery_ok,
+            "processing_status": "processed" if delivery_ok else "retryable_error",
+            "error": "" if delivery_ok else _delivery_error(send_result, "avito_send_failed"),
             "action": "empty_chat_greeting",
             "reply": reply,
             "appointment_id": None,
@@ -541,13 +592,19 @@ async def process_avito_message(
     outgoing_reply = prepare_avito_outgoing_text(history_store, message.chat_id, decision.reply)
     send_result = await sender.send_message(account_id, message.chat_id, outgoing_reply) if outgoing_reply else {"sent": False, "reason": "empty_reply"}
     handoff_result = await handoff_notifier.notify(decision.handoff) if decision.handoff else None
+    send_ok = _delivery_ok(send_result) if outgoing_reply else False
+    handoff_ok = _delivery_ok(handoff_result) if decision.handoff else False
+    processing_ok = send_ok or handoff_ok
     memory_result = mentor_memory.observe_client_decision(message=message, decision=decision, send_result=send_result) if mentor_memory else None
     if history_store:
         history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
-        remember_avito_outgoing(history_store, message.chat_id, outgoing_reply or decision.reply)
-    mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id)
+        if send_ok:
+            remember_avito_outgoing(history_store, message.chat_id, outgoing_reply or decision.reply)
+    mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id) if processing_ok else {"ok": False, "reason": "not_marked_read_delivery_failed"}
     return {
-        "ok": True,
+        "ok": processing_ok,
+        "processing_status": "processed" if processing_ok else "retryable_error",
+        "error": "" if processing_ok else _processing_error(send_result, handoff_result, decision.handoff is not None, outgoing_reply),
         "action": decision.action,
         "reply": outgoing_reply,
         "appointment_id": decision.appointment_id,
@@ -689,13 +746,70 @@ def _ignore_reason(event: dict[str, Any], message: Any, settings: IntegrationSet
     if bool(message.metadata.get("is_own_account")) or _is_own_message(raw_author, settings):
         return "own_message"
 
-    if message.metadata.get("voice_transcription_error"):
-        return "voice_transcription_error"
-
     if not message.text and not message.has_photo:
         return "empty"
 
     return ""
+
+
+async def _notify_voice_transcription_error(message: Any, handoff_notifier: HandoffNotifier) -> dict[str, Any]:
+    handoff = Handoff(
+        reason=HandoffReason.MISSING_DATA,
+        message=message,
+        summary=(
+            "Клиент прислал голосовое в Avito, но бот не смог его расшифровать. "
+            "Нужно открыть Avito, прослушать голосовое и ответить клиенту."
+        ),
+    )
+    result = await handoff_notifier.notify(handoff)
+    ok = _delivery_ok(result)
+    return {
+        "ok": ok,
+        "processing_status": "processed" if ok else "retryable_error",
+        "action": "voice_transcription_error_handoff",
+        "handoff": handoff.reason.value,
+        "handoff_notify": result,
+        "reason": "voice_transcription_error" if ok else "voice_transcription_handoff_failed",
+        "error": "" if ok else _delivery_error(result, "telegram_handoff_failed"),
+        "message_id": message.message_id,
+        "chat_id": message.chat_id,
+    }
+
+
+def _delivery_ok(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if sent_successfully(result):
+        return True
+    if result.get("reason") == "preview_only" and (result.get("outbox_path") or result.get("outbox")):
+        return True
+    return bool(result.get("ok") and not result.get("error"))
+
+
+def _delivery_error(result: Any, fallback: str) -> str:
+    if not isinstance(result, dict):
+        return fallback
+    return str(result.get("error") or result.get("reason") or fallback)
+
+
+def _processing_error(send_result: Any, handoff_result: Any, had_handoff: bool, outgoing_reply: str) -> str:
+    reasons: list[str] = []
+    if outgoing_reply and not _delivery_ok(send_result):
+        reasons.append("avito_send_failed:" + _delivery_error(send_result, "unknown"))
+    if had_handoff and not _delivery_ok(handoff_result):
+        reasons.append("telegram_handoff_failed:" + _delivery_error(handoff_result, "unknown"))
+    if not outgoing_reply and not had_handoff:
+        reasons.append("no_reply_or_handoff")
+    return "; ".join(reasons) or "delivery_failed"
+
+
+def _dedup_allowed(result: dict[str, Any]) -> bool:
+    status = str(result.get("processing_status") or "")
+    if status in {"processed", "queued"}:
+        return True
+    if status == "ignored":
+        return str(result.get("reason") or "") in SAFE_IGNORE_REASONS
+    return bool(result.get("ok") and result.get("ignored") and str(result.get("reason") or "") in SAFE_IGNORE_REASONS)
 
 
 def _is_empty_chat_prompt(message: Any) -> bool:

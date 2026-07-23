@@ -131,7 +131,7 @@ class IntegrationSettings:
             default_model=_env("DEFAULT_MODEL", "anthropic/claude-sonnet-4.5"),
             avito_codex_enabled=True if avito_test_mode else _env_bool("AVITO_CODEX_ENABLED"),
             avito_codex_timeout_seconds=_env_int("AVITO_CODEX_TIMEOUT_SECONDS", 180),
-            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 0),
+            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 4),
             avito_turn_debounce_seconds=_env_int("AVITO_TURN_DEBOUNCE_SECONDS", 60),
             avito_turn_max_wait_seconds=_env_int("AVITO_TURN_MAX_WAIT_SECONDS", 120),
             avito_turn_batch_max_messages=_env_int("AVITO_TURN_BATCH_MAX_MESSAGES", 10),

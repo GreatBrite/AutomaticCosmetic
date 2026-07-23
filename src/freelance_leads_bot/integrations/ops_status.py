@@ -93,6 +93,18 @@ def build_ops_status_report(
 
     yclients_health = yclients_health if yclients_health is not None else fetch_json("http://127.0.0.1:8020/health")
     checks.append(_health_check("yclients_integration_health", yclients_health))
+    yclients_secret_required = bool((yclients_health or {}).get("secret_required"))
+    checks.append(
+        OpsCheck(
+            "yclients_webhook_secret",
+            yclients_secret_required,
+            "error",
+            "YCLIENTS webhook/callback require a shared secret."
+            if yclients_secret_required
+            else "YCLIENTS webhook/callback shared secret is not required; set YCLIENTS_INTEGRATION_SECRET.",
+            {"health": yclients_health},
+        )
+    )
 
     unanswered = read_unanswered_status(
         unanswered_report_path,
@@ -104,6 +116,7 @@ def build_ops_status_report(
     critical_unanswered = int(unanswered.get("critical_unanswered_count") or 0)
     pending_followups = int(unanswered.get("pending_followup_count") or 0)
     overdue_followups = int(unanswered.get("overdue_followup_count") or 0)
+    manual_closed_without_client_reply = int(unanswered.get("manual_closed_without_client_reply_count") or 0)
     max_overdue_followup_age = int(unanswered.get("max_overdue_followup_age_seconds") or 0)
     overdue_error_after = (
         _env_int("AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS", 3 * 60 * 60)
@@ -149,6 +162,17 @@ def build_ops_status_report(
                     else "."
                 )
             ),
+            unanswered,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "avito_manual_closure_without_client_reply",
+            manual_closed_without_client_reply == 0,
+            "warning",
+            "No critical Avito promises were manually closed without a confirmed client reply."
+            if manual_closed_without_client_reply == 0
+            else f"{manual_closed_without_client_reply} critical Avito promises were closed manually without a confirmed client reply.",
             unanswered,
         )
     )
@@ -284,6 +308,7 @@ def build_ops_status_report(
         "avito_critical_unanswered": critical_unanswered,
         "avito_pending_followups": pending_followups,
         "avito_overdue_followups": overdue_followups,
+        "avito_manual_closed_without_client_reply": manual_closed_without_client_reply,
         "avito_max_overdue_followup_age_seconds": max_overdue_followup_age,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
@@ -315,6 +340,7 @@ def safe_live_flags(settings: IntegrationSettings) -> dict[str, Any]:
         "avito_unanswered_interval_seconds": settings.avito_unanswered_interval_seconds,
         "yclients_ready": settings.yclients_ready,
         "yclients_allow_mutations": settings.yclients_allow_mutations,
+        "yclients_integration_secret_required": bool(settings.yclients_integration_secret.strip()),
         "handoff_notify_ready": settings.handoff_notify_ready,
         "rag_retrieval_enabled": settings.rag_retrieval_enabled,
         "rag_autoanswer_threshold": settings.rag_autoanswer_threshold,
@@ -410,6 +436,7 @@ def read_unanswered_status(
     items = report.get("items") if isinstance(report.get("items"), list) else []
     actionable_count = int(report.get("actionable_count") or sum(1 for item in items if isinstance(item, dict) and item.get("needs_action")))
     pending_followups = report.get("pending_followups") if isinstance(report.get("pending_followups"), list) else []
+    state_pending = state.get("pending_followups") if isinstance(state.get("pending_followups"), dict) else {}
     overdue_rows = [
         row
         for row in pending_followups
@@ -436,6 +463,19 @@ def read_unanswered_status(
         "pending_followup_count": int(report.get("pending_followup_count") or len(pending_followups)),
         "overdue_followup_count": int(report.get("overdue_followup_count") or 0),
         "critical_followup_count": int(report.get("critical_followup_count") or 0),
+        "manual_closed_without_client_reply_count": int(
+            report.get("manual_closed_without_client_reply_count")
+            or sum(
+                1
+                for row in pending_followups
+                if isinstance(row, dict) and row.get("business_status") == "closed_manual_no_client_reply"
+            )
+            or sum(
+                1
+                for row in state_pending.values()
+                if isinstance(row, dict) and row.get("business_status") == "closed_manual_no_client_reply"
+            )
+        ),
         "max_overdue_followup_age_seconds": max((int(row.get("age_seconds") or 0) for row in overdue_rows), default=0),
         "handled_count": len(handled),
         "failed_count": len(failed),

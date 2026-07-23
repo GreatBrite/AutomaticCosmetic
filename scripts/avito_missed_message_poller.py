@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 from pyavitoapi.transport.errors import AvitoApiError
@@ -264,89 +264,115 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
             candidates.append(raw_message)
         if not candidates:
             continue
-        for stale_message in candidates[:-1]:
-            dedup.mark_once(f"{chat_id}:{stale_message.get('id') or ''}")
-            skipped += 1
-            skip_reasons["stale_candidate"] += 1
-        raw_message = candidates[-1]
-        key = f"{chat_id}:{raw_message.get('id') or ''}"
-        if dedup.contains(key):
-            skipped += 1
-            skip_reasons["duplicate"] += 1
-            continue
-        message = _inbound_from_message(account_id=account_id, chat=chat, raw_message=raw_message)
-        if str(message.metadata.get("message_type") or "") == "voice" and voice_resolver:
-            try:
-                message = await voice_resolver.transcribe(message)
-            except Exception as exc:
+        for raw_message in candidates:
+            key = f"{chat_id}:{raw_message.get('id') or ''}"
+            if dedup.contains(key):
                 skipped += 1
-                skip_reasons["voice_transcription_error"] += 1
-                _log({"event": "ignored", "chat_id": chat_id, "message_id": message.message_id, "reason": "voice_transcription_error", "error": repr(exc)})
+                skip_reasons["duplicate"] += 1
                 continue
-        if settings.avito_turn_debounce_seconds > 0:
-            queued = enqueue_avito_turn_message(
-                message,
-                debounce_seconds=settings.avito_turn_debounce_seconds,
-                max_wait_seconds=settings.avito_turn_max_wait_seconds,
-                max_messages=settings.avito_turn_batch_max_messages,
-            )
-            skipped += 1
-            skip_reasons["turn_debounce_queued"] += 1
+            message = _inbound_from_message(account_id=account_id, chat=chat, raw_message=raw_message)
+            if str(message.metadata.get("message_type") or "") == "voice" and voice_resolver:
+                try:
+                    message = await voice_resolver.transcribe(message)
+                except Exception as exc:
+                    metadata = dict(message.metadata)
+                    metadata["voice_transcription_error"] = repr(exc)
+                    message = replace(message, metadata=metadata)
+                    _log(
+                        {
+                            "event": "voice_transcription_error",
+                            "chat_id": chat_id,
+                            "message_id": message.message_id,
+                            "error": repr(exc),
+                        }
+                    )
+            if settings.avito_turn_debounce_seconds > 0:
+                queued = enqueue_avito_turn_message(
+                    message,
+                    debounce_seconds=settings.avito_turn_debounce_seconds,
+                    max_wait_seconds=settings.avito_turn_max_wait_seconds,
+                    max_messages=settings.avito_turn_batch_max_messages,
+                )
+                dedup.mark_once(key)
+                skipped += 1
+                skip_reasons["turn_debounce_queued"] += 1
+                _log(
+                    {
+                        "event": "queued",
+                        "reason": "turn_debounce",
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "message": asdict(message),
+                        "queue": queued,
+                    }
+                )
+                continue
+            try:
+                result = await process_avito_message(
+                    message=message,
+                    settings=settings,
+                    toolbox=toolbox,
+                    planner=planner,
+                    sender=sender,
+                    handoff_notifier=notifier,
+                    photo_resolver=photo_resolver,
+                    history_store=history_store,
+                    expert_rag=expert_rag,
+                )
+            except Exception as exc:
+                errors += 1
+                _log({"event": "process_error", "chat_id": chat_id, "message_id": raw_message.get("id"), "error": repr(exc)})
+                continue
+            if _dedup_allowed(result):
+                dedup.mark_once(key)
+            if result.get("ignored"):
+                skipped += 1
+                skip_reasons[str(result.get("reason") or "ignored")] += 1
+                _log(
+                    {
+                        "event": "ignored",
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "reason": result.get("reason"),
+                        "result": result,
+                    }
+                )
+                continue
+            if not result.get("ok"):
+                errors += 1
+                skip_reasons[str(result.get("reason") or "retryable_error")] += 1
+                _log(
+                    {
+                        "event": "retryable_error",
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "message": asdict(message),
+                        "result": result,
+                    }
+                )
+                continue
+            processed += 1
             _log(
                 {
-                    "event": "queued",
-                    "reason": "turn_debounce",
+                    "event": "processed",
                     "chat_id": chat_id,
                     "message_id": message.message_id,
                     "message": asdict(message),
-                    "queue": queued,
-                }
-            )
-            continue
-        try:
-            result = await process_avito_message(
-                message=message,
-                settings=settings,
-                toolbox=toolbox,
-                planner=planner,
-                sender=sender,
-                handoff_notifier=notifier,
-                photo_resolver=photo_resolver,
-                history_store=history_store,
-                expert_rag=expert_rag,
-            )
-        except Exception as exc:
-            errors += 1
-            _log({"event": "process_error", "chat_id": chat_id, "message_id": raw_message.get("id"), "error": repr(exc)})
-            continue
-        dedup.mark_once(key)
-        if result.get("ignored"):
-            skipped += 1
-            skip_reasons[str(result.get("reason") or "ignored")] += 1
-            _log(
-                {
-                    "event": "ignored",
-                    "chat_id": chat_id,
-                    "message_id": message.message_id,
-                    "reason": result.get("reason"),
                     "result": result,
                 }
             )
-            continue
-        processed += 1
-        _log(
-            {
-                "event": "processed",
-                "chat_id": chat_id,
-                "message_id": message.message_id,
-                "message": asdict(message),
-                "result": result,
-            }
-        )
 
     summary = {"processed": processed, "skipped": skipped, "errors": errors, "chats": len(chats), "skip_reasons": dict(skip_reasons)}
     _log({"event": "summary", **summary})
     return summary
+
+
+def _dedup_allowed(result: dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is not True:
+        return False
+    return str(result.get("processing_status") or "processed") in {"processed", "queued", "ignored"}
 
 
 async def main() -> None:

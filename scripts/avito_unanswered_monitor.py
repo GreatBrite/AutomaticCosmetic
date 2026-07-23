@@ -824,6 +824,11 @@ async def main() -> None:
             followups = pending_followup_rows(state, now=now)
             overdue_followups = [row for row in followups if row.get("overdue")]
             critical_followups = [row for row in followups if row.get("severity") == "critical"]
+            manual_closed_without_client_reply = [
+                row
+                for row in pending_followup_rows(state, now=now, include_resolved=True)
+                if row.get("business_status") == "closed_manual_no_client_reply"
+            ]
             report = {
                 "ok": True,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -834,6 +839,7 @@ async def main() -> None:
                 "pending_followup_count": len(followups),
                 "overdue_followup_count": len(overdue_followups),
                 "critical_followup_count": len(critical_followups),
+                "manual_closed_without_client_reply_count": len(manual_closed_without_client_reply),
                 "items": [],
                 "pending_followups": followups,
             }
@@ -917,6 +923,7 @@ async def main() -> None:
                 "critical_unanswered_count": report["critical_unanswered_count"],
                 "pending_followup_count": len(followups),
                 "overdue_followup_count": len(overdue_followups),
+                "manual_closed_without_client_reply_count": len(manual_closed_without_client_reply),
                 "notified": notified,
                 "followup_notified": followup_notified,
                 "autoreply": autoreply,

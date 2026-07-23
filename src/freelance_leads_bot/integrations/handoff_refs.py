@@ -10,8 +10,15 @@ from typing import Any
 
 DEFAULT_HANDOFF_REFS_PATH = Path("data/telegram_handoff_refs.json")
 MAX_HANDOFF_REFS = 1000
-UNRESOLVED_HANDOFF_STATUSES = {"open", "in_progress", "draft_pending", "rejected"}
-CLOSED_HANDOFF_STATUSES = {"answered", "closed", "expired"}
+UNRESOLVED_HANDOFF_STATUSES = {"open", "in_progress", "draft_pending", "rejected", "expired_critical"}
+CLOSED_HANDOFF_STATUSES = {
+    "answered",
+    "resolved",
+    "closed",
+    "closed_manual",
+    "closed_manual_no_client_reply",
+    "expired",
+}
 
 
 def telegram_handoff_ref_key(telegram_chat_id: str, telegram_message_id: str | int) -> str:
@@ -133,7 +140,7 @@ def update_handoff_status(
             continue
         ref["status"] = status
         ref["draft_id"] = str(draft_id or ref.get("draft_id") or "")
-        ref["closed_at"] = now if status == "closed" else 0
+        ref["closed_at"] = now if status in CLOSED_HANDOFF_STATUSES else 0
         ref["updated_at"] = now
         changed = True
     if changed:

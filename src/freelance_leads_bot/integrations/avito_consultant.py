@@ -37,6 +37,13 @@ RISK_WORDS = (
     "жалоба",
     "плохо после",
 )
+TEMPORAL_FACT_RE = re.compile(
+    r"(?iu)(?:\b(?:сегодня|завтра|послезавтра)\b|"
+    r"\b(?:понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[еия])\b|"
+    r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|"
+    r"\b\d{1,2}\s*(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b|"
+    r"\b\d{1,2}:\d{2}\b|есть\s+окн|свободн|можно\s+запис|адрес)"
+)
 
 
 @dataclass(frozen=True)
@@ -173,8 +180,13 @@ class CodexToolLoopPlanner:
         metadata = {"planner": "codex_tool_loop", "trace": trace, "max_steps": self.max_steps, "conversation_key": context.conversation_key}
         metadata.update(self._write_trace(payload, trace, outcome))
         return AvitoConsultantReply(
-            action="codex_tool_loop_limit",
+            action="handoff",
             reply="Сейчас уточню детали и вернусь с ответом.",
+            handoff=Handoff(
+                reason=HandoffReason.MISSING_DATA,
+                message=context.message,
+                summary=f"Avito Codex достиг лимита шагов ({self.max_steps}). Нужно проверить диалог и дать клиенту финальный ответ.",
+            ),
             metadata=metadata,
         )
 
@@ -702,6 +714,10 @@ def _unsafe_knowledge_item(item: dict[str, Any]) -> bool:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     if metadata.get("client_autoanswer") is False or metadata.get("autoanswer_allowed") is False:
         return True
+    if not (metadata.get("valid_until") or metadata.get("expires_at")):
+        temporal_text = f"{item.get('title') or ''}\n{item.get('content') or ''}"
+        if TEMPORAL_FACT_RE.search(temporal_text):
+            return True
     tags = {str(tag).casefold() for tag in item.get("tags") or []}
     if "bad_example" in tags:
         return True
@@ -889,7 +905,19 @@ def _normalize_handoff_summary(summary: str) -> str:
 
 def _expert_answer_autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
-    return metadata.get("autoanswer_allowed") is not False
+    if metadata.get("autoanswer_allowed") is False:
+        return False
+    return not _temporal_answer_without_expiry(answer, metadata)
+
+
+def _temporal_answer_without_expiry(answer: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    if answer.get("expires_at") or metadata.get("valid_until") or metadata.get("expires_at"):
+        return False
+    text = "\n".join(
+        str(answer.get(key) or "")
+        for key in ("question_canonical", "answer_client", "answer_internal", "topic")
+    )
+    return bool(TEMPORAL_FACT_RE.search(text))
 
 
 class _NoopBooking:

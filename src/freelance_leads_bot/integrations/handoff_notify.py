@@ -261,11 +261,11 @@ class TelegramHandoffNotifier:
                 caption = escape(f"Фото из {handoff.message.channel.value}, {dialog_line[:1].lower() + dialog_line[1:]}") if index == 1 else None
                 send_result = await _to_thread_retry(lambda: self.bot.send_photo(self.chat_id, photo_path, caption, **(topic_params or {})))
             except Exception as exc:
-                status.update({"status": "failed", "error": repr(exc)})
-                photo_errors.append({"kind": "photo", "url_hash": _url_hash(photo_url), "error": repr(exc), "index": index})
+                status.update({"status": "manual_avito_check_required", "download_failed": True, "error": repr(exc)})
+                photo_errors.append({"kind": "photo", "url_hash": _url_hash(photo_url), "status": "manual_avito_check_required", "error": repr(exc), "index": index})
                 statuses.append(status)
                 continue
-            status.update({"status": "sent_to_telegram"})
+            status.update({"status": "sent_to_olga"})
             statuses.append(status)
             photo_results.append({"path": str(photo_path), "telegram": send_result, "index": index})
         return photo_results, photo_errors, statuses
@@ -289,11 +289,11 @@ class TelegramHandoffNotifier:
                 caption = escape(f"Вложение из {handoff.message.channel.value}, {dialog_line[:1].lower() + dialog_line[1:]}") if index == 1 else None
                 send_result = await _to_thread_retry(lambda: self.bot.send_document(self.chat_id, media_path, caption, **(topic_params or {})))
             except Exception as exc:
-                status.update({"status": "failed", "error": repr(exc)})
-                media_errors.append({"kind": "media", "url_hash": _url_hash(media_url), "error": repr(exc), "index": index})
+                status.update({"status": "manual_avito_check_required", "download_failed": True, "error": repr(exc)})
+                media_errors.append({"kind": "media", "url_hash": _url_hash(media_url), "status": "manual_avito_check_required", "error": repr(exc), "index": index})
                 statuses.append(status)
                 continue
-            status.update({"status": "sent_to_telegram"})
+            status.update({"status": "sent_to_olga"})
             statuses.append(status)
             media_results.append({"path": str(media_path), "telegram": send_result, "index": index})
         return media_results, media_errors, statuses
@@ -498,6 +498,7 @@ async def process_handoff_sla(
     reminders = 0
     escalations = 0
     expired = 0
+    expired_critical = 0
     notifications: list[dict[str, Any]] = []
     changed = False
     for ref in refs.values():
@@ -509,10 +510,15 @@ async def process_handoff_sla(
         created_at = int(ref.get("created_at") or ref.get("updated_at") or now)
         age = max(0, now - created_at)
         if age >= expire_after_seconds:
-            ref["status"] = "expired"
-            ref["closed_at"] = now
+            if _ref_is_critical(ref):
+                ref["status"] = "expired_critical"
+                ref["expired_at"] = now
+                expired_critical += 1
+            else:
+                ref["status"] = "expired"
+                ref["closed_at"] = now
+                expired += 1
             ref["updated_at"] = now
-            expired += 1
             changed = True
             continue
         if age >= reminder_after_seconds and not int(ref.get("reminder_sent_at") or 0):
@@ -538,6 +544,7 @@ async def process_handoff_sla(
         "reminders": reminders,
         "escalations": escalations,
         "expired": expired,
+        "expired_critical": expired_critical,
         "notifications": notifications,
     }
 
