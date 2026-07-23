@@ -2694,10 +2694,15 @@ async def test_telegram_client_start_and_phone_binding_flow(tmp_path) -> None:
     class FakeBot:
         def __init__(self) -> None:
             self.messages = []
+            self.photos = []
 
         def send_message(self, chat_id, text, **kwargs):
             self.messages.append((chat_id, text, kwargs))
             return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+        def send_photo_url(self, chat_id, photo_url, caption=None, **kwargs):
+            self.photos.append((chat_id, photo_url, caption, kwargs))
+            return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
 
     class FakePlanner:
         async def respond(self, context, toolbox):
@@ -6698,6 +6703,35 @@ def test_pending_followup_stays_open_after_client_ack_and_closes_on_final_answer
     assert all_rows[0]["final_answer"].startswith("Адрес:")
 
 
+def test_pending_followup_keeps_client_photo_urls_for_olga_card() -> None:
+    chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Анна"}]}
+    state: dict[str, object] = {}
+    messages = [
+        {
+            "id": "m-client-photo",
+            "author_id": 10,
+            "direction": "in",
+            "type": "image",
+            "created": 100,
+            "content": {"text": "[фото]", "image": {"sizes": {"1280x960": "https://img.example/big.jpg"}}},
+        },
+        {
+            "id": "m-bot-1",
+            "author_id": 1,
+            "direction": "out",
+            "type": "text",
+            "created": 160,
+            "content": {"text": "Спасибо, фото получили. Уточним по зонам и стоимости, затем вернёмся с ответом."},
+        },
+    ]
+
+    sync_pending_followups(account_id=1, chat=chat, messages=messages, state=state, now=4000, reminder_seconds=1800, escalation_seconds=7200)
+    rows = pending_followup_rows(state, now=4000)
+
+    assert rows[0]["last_client_message"] == "[фото]"
+    assert rows[0]["last_client_photo_urls"] == ["https://img.example/big.jpg"]
+
+
 def test_pending_followup_alert_includes_business_context_and_action() -> None:
     text = format_pending_followup_alert(
         [
@@ -6792,10 +6826,15 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
     class FakeBot:
         def __init__(self) -> None:
             self.messages = []
+            self.photos = []
 
         def send_message(self, chat_id, text, **kwargs):
             self.messages.append((chat_id, text, kwargs))
             return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+        def send_photo_url(self, chat_id, photo_url, caption=None, **kwargs):
+            self.photos.append((chat_id, photo_url, caption, kwargs))
+            return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
 
     report_path = tmp_path / "report.json"
     key = "1:chat-followup:m-bot-1"
@@ -6814,6 +6853,7 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
                         "listing_title": "Увеличение губ",
                         "bot_promise": "Уточню адрес и напишу.",
                         "last_client_message": "Жду адрес",
+                        "last_client_photo_urls": ["https://img.example/client.jpg"],
                     }
                 ]
             },
@@ -6829,6 +6869,7 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
     assert "Зависшие Avito-обещания" in bot.messages[0][1]
     assert "Жду адрес" in bot.messages[1][1]
     assert bot.messages[1][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == f"avfu:{pending_followup_token(key)}:done"
+    assert bot.photos == [("admin-chat", "https://img.example/client.jpg", "Фото клиента из Avito (1/1)", {})]
 
 
 def test_avito_followup_callback_updates_report_immediately(tmp_path) -> None:

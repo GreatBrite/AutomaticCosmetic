@@ -35,6 +35,9 @@ class HandoffNotifier(Protocol):
     async def notify_text(self, text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
         ...
 
+    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+        ...
+
 
 class PreviewHandoffNotifier:
     """Writes human handoffs to a local outbox until live Telegram notifications are enabled."""
@@ -77,6 +80,12 @@ class PreviewHandoffNotifier:
         row = {"created_at": datetime.now(timezone.utc).isoformat(), "type": "operations_notification", "text": text, "reply_markup": reply_markup or {}}
         await asyncio.to_thread(_append_jsonl, self.path, row)
         return {"sent": False, "reason": "preview_only", "outbox": str(self.path), "text": text, "reply_markup": reply_markup or {}}
+
+    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"created_at": datetime.now(timezone.utc).isoformat(), "type": "operations_photo", "photo_url": photo_url, "caption": caption}
+        await asyncio.to_thread(_append_jsonl, self.path, row)
+        return {"sent": False, "reason": "preview_only", "outbox": str(self.path), "photo_url": photo_url, "caption": caption}
 
 
 class TelegramHandoffNotifier:
@@ -282,6 +291,13 @@ class TelegramHandoffNotifier:
             return {"sent": True, "telegram": result, "text": text, "reply_markup": reply_markup or {}}
         except Exception as exc:
             return {"sent": False, "error": repr(exc), "text": text, "reply_markup": reply_markup or {}}
+
+    async def notify_photo_url(self, photo_url: str, *, caption: str = "") -> dict[str, Any]:
+        try:
+            result = await _to_thread_retry(self.bot.send_photo_url, self.chat_id, photo_url, escape(caption) if caption else None)
+            return {"sent": True, "telegram": result, "photo_url": photo_url, "caption": caption}
+        except Exception as exc:
+            return {"sent": False, "error": repr(exc), "photo_url": photo_url, "caption": caption}
 
 
 async def process_handoff_sla(

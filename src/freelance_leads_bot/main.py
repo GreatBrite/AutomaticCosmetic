@@ -1678,6 +1678,43 @@ def send_avito_followup_cards(
             reply_markup=pending_followup_keyboard(key) if key else None,
             **(topic_params or {}),
         )
+        send_avito_followup_media(bot, chat_id, row, topic_params=topic_params)
+
+
+def send_avito_followup_media(
+    bot: TelegramBot,
+    chat_id: str,
+    row: dict,
+    *,
+    topic_params: dict[str, str] | None = None,
+    limit: int = 5,
+) -> int:
+    urls = _avito_followup_media_urls(row)[: max(0, int(limit or 0))]
+    sent = 0
+    for index, url in enumerate(urls, start=1):
+        try:
+            bot.send_photo_url(
+                chat_id,
+                url,
+                caption=f"Фото клиента из Avito ({index}/{len(urls)})",
+                **(topic_params or {}),
+            )
+            sent += 1
+        except Exception:
+            continue
+    return sent
+
+
+def _avito_followup_media_urls(row: dict) -> list[str]:
+    urls: list[str] = []
+    for key in ("last_client_photo_urls", "last_client_media_urls", "photo_urls", "media_urls"):
+        value = row.get(key) if isinstance(row, dict) else None
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            if text.startswith(("http://", "https://")) and text not in urls:
+                urls.append(text)
+    return urls
 
 
 def handle_avito_followup_callback(

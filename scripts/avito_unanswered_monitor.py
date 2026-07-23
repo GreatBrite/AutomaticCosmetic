@@ -312,6 +312,8 @@ def sync_pending_followups(
                     row["client_ack_after_promise"] = True
                     row["last_client_message"] = text
                     row["last_client_message_at"] = created
+                    row["last_client_photo_urls"] = _photo_urls(message)
+                    row["last_client_media_urls"] = _photo_urls(message)
             continue
 
         if not _is_outgoing_reply(message, account_id=account_id):
@@ -337,6 +339,7 @@ def sync_pending_followups(
                     active_keys.discard(key)
             client_message = _latest_client_message_before(ordered, account_id=account_id, created_before=created)
             client_text = _message_text(client_message) if client_message else ""
+            client_photo_urls = _photo_urls(client_message) if client_message else []
             classification = _classify_client_message(client_text)
             key = _followup_key(account_id=account_id, chat_id=chat_id, message_id=message_id)
             row = pending.get(key) if isinstance(pending.get(key), dict) else {}
@@ -358,6 +361,8 @@ def sync_pending_followups(
                     "client_ack_after_promise": bool(client_message and int(client_message.get("created") or 0) >= created),
                     "last_client_message": client_text,
                     "last_client_message_at": int(client_message.get("created") or 0) if client_message else 0,
+                    "last_client_photo_urls": client_photo_urls,
+                    "last_client_media_urls": client_photo_urls,
                     "listing_title": listing_title,
                     "listing_city": listing_city,
                     "severity": "critical" if classification["severity"] == "critical" or CLIENT_CRITICAL_RE.search(text) else "action",
@@ -565,13 +570,36 @@ def _photo_urls(message: dict[str, Any]) -> list[str]:
         value = content.get(key) or message.get(key)
         values = value if isinstance(value, list) else [value]
         for candidate in values:
-            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
-                result.append(candidate)
-            elif isinstance(candidate, dict):
-                for nested in candidate.values():
-                    if isinstance(nested, str) and nested.startswith(("http://", "https://")):
-                        result.append(nested)
+            result.extend(_urls_from_any(candidate))
     return list(dict.fromkeys(result))
+
+
+def _urls_from_any(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.startswith(("http://", "https://")) else []
+    if isinstance(value, dict):
+        urls: list[str] = []
+        for nested in value.values():
+            urls.extend(_urls_from_any(nested))
+        return urls
+    if isinstance(value, list):
+        urls = []
+        for item in value:
+            urls.extend(_urls_from_any(item))
+        return urls
+    return []
+
+
+def _followup_media_urls(row: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    for key in ("last_client_photo_urls", "last_client_media_urls", "photo_urls", "media_urls"):
+        value = row.get(key) if isinstance(row, dict) else None
+        values = value if isinstance(value, list) else [value]
+        for candidate in values:
+            url = str(candidate or "").strip()
+            if url.startswith(("http://", "https://")) and url not in result:
+                result.append(url)
+    return result
 
 
 def _media_ids(message: dict[str, Any]) -> list[str]:
@@ -852,6 +880,11 @@ async def main() -> None:
                     for row in fresh_rows[:max_alert_items]:
                         key = str(row.get("key") or "")
                         await notifier.notify_text(pending_followup_card_text(row), reply_markup=pending_followup_keyboard(key))
+                        for index, url in enumerate(_followup_media_urls(row)[:5], start=1):
+                            await notifier.notify_photo_url(
+                                url,
+                                caption=f"Фото клиента из Avito для зависшего обещания ({index})",
+                            )
                     followup_notified = min(len(fresh_rows), max_alert_items)
 
             if autoreply_enabled and settings.avito_unanswered_autoreply_enabled:
