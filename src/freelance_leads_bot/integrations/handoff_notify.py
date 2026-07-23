@@ -296,8 +296,20 @@ class TelegramHandoffNotifier:
         try:
             result = await _to_thread_retry(self.bot.send_photo_url, self.chat_id, photo_url, escape(caption) if caption else None)
             return {"sent": True, "telegram": result, "photo_url": photo_url, "caption": caption}
-        except Exception as exc:
-            return {"sent": False, "error": repr(exc), "photo_url": photo_url, "caption": caption}
+        except Exception as url_exc:
+            try:
+                path = await asyncio.to_thread(_download_photo_url, photo_url, self.media_dir)
+                result = await _to_thread_retry(self.bot.send_photo, self.chat_id, path, escape(caption) if caption else None)
+                return {
+                    "sent": True,
+                    "telegram": result,
+                    "photo_url": photo_url,
+                    "caption": caption,
+                    "fallback": "download_upload",
+                    "url_error": repr(url_exc),
+                }
+            except Exception as exc:
+                return {"sent": False, "error": repr(exc), "url_error": repr(url_exc), "photo_url": photo_url, "caption": caption}
 
 
 async def process_handoff_sla(

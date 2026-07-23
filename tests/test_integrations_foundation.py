@@ -6872,6 +6872,33 @@ def test_avito_followup_cards_include_inline_actions(tmp_path) -> None:
     assert bot.photos == [("admin-chat", "https://img.example/client.jpg", "Фото клиента из Avito (1/1)", {})]
 
 
+def test_avito_followup_media_downloads_and_uploads_when_telegram_cannot_fetch_url(tmp_path, monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.photos = []
+
+        def send_photo_url(self, chat_id, photo_url, caption=None, **kwargs):
+            raise RuntimeError("Telegram cannot fetch URL")
+
+        def send_photo(self, chat_id, path, caption=None, **kwargs):
+            self.photos.append((chat_id, str(path), caption, kwargs))
+            return {"ok": True}
+
+    downloaded = tmp_path / "downloaded.jpg"
+    downloaded.write_bytes(b"jpg")
+    monkeypatch.setattr(main_module, "_download_photo_url", lambda url, media_dir: downloaded)
+    bot = FakeBot()
+
+    sent = main_module.send_avito_followup_media(
+        bot,
+        "admin-chat",
+        {"last_client_photo_urls": ["https://img.example/client.jpg"]},
+    )
+
+    assert sent == 1
+    assert bot.photos == [("admin-chat", str(downloaded), "Фото клиента из Avito (1/1)", {})]
+
+
 def test_avito_followup_callback_updates_report_immediately(tmp_path) -> None:
     class FakeBot:
         def __init__(self) -> None:

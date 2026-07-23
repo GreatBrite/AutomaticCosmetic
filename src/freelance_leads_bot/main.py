@@ -74,7 +74,7 @@ from .integrations.handoff_refs import (
     remember_telegram_handoff_ref,
     update_handoff_status,
 )
-from .integrations.handoff_notify import handoff_notifier_from_settings
+from .integrations.handoff_notify import _download_photo_url, handoff_notifier_from_settings
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
 from .integrations.runtime import booking_from_settings, rag_admin_intent_parser_from_settings
@@ -1692,16 +1692,22 @@ def send_avito_followup_media(
     urls = _avito_followup_media_urls(row)[: max(0, int(limit or 0))]
     sent = 0
     for index, url in enumerate(urls, start=1):
+        caption = f"Фото клиента из Avito ({index}/{len(urls)})"
         try:
             bot.send_photo_url(
                 chat_id,
                 url,
-                caption=f"Фото клиента из Avito ({index}/{len(urls)})",
+                caption=caption,
                 **(topic_params or {}),
             )
             sent += 1
         except Exception:
-            continue
+            try:
+                path = _download_photo_url(url, ROOT / "data" / "avito_followup_photos")
+                bot.send_photo(chat_id, path, caption=caption, **(topic_params or {}))
+                sent += 1
+            except Exception:
+                continue
     return sent
 
 
