@@ -6801,9 +6801,15 @@ def test_pending_followup_admin_action_closes_state_and_writes_audit(tmp_path) -
     assert audit[0]["chat_id"] == "chat-followup"
     assert parse_pending_followup_callback(f"avfu:{token}:done") == (token, "done")
     assert pending_followup_keyboard(key)["inline_keyboard"][0][0]["callback_data"] == f"avfu:{token}:done"
+    button_texts = [
+        button["text"]
+        for row in pending_followup_keyboard(key)["inline_keyboard"]
+        for button in row
+    ]
+    assert "Срочно" not in button_texts
 
 
-def test_pending_followup_admin_can_mark_urgent_and_snooze(tmp_path) -> None:
+def test_pending_followup_admin_keeps_old_urgent_callback_compatible_and_snoozes(tmp_path) -> None:
     state_path = tmp_path / "state.json"
     key = "1:chat-followup:m-bot-1"
     state_path.write_text(

@@ -26,7 +26,6 @@ def pending_followup_keyboard(key: str) -> dict[str, list[list[dict[str, str]]]]
                 {"text": "Не актуально", "callback_data": f"avfu:{token}:stale"},
             ],
             [
-                {"text": "Срочно", "callback_data": f"avfu:{token}:urgent"},
                 {"text": "Напомнить позже", "callback_data": f"avfu:{token}:later"},
             ],
         ]
