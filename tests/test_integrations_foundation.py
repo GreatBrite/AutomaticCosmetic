@@ -9530,6 +9530,69 @@ def test_ops_status_reports_open_telegram_handoffs_without_mutating_refs(tmp_pat
     assert ops_status_exit_code(report, strict=True) == 1
 
 
+def test_ops_status_reports_telegram_manual_closed_without_client_reply(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    handoff_path = tmp_path / "telegram_handoff_refs.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "admin:10": {
+                    "handoff_id": "handoff-no-reply",
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "10",
+                    "avito_chat_id": "chat-booking",
+                    "handoff_text": "Сообщение: Запись на 28 июля у нас в силе? Адрес напишите.",
+                    "status": "closed_manual_no_client_reply",
+                    "resolution_note": "Ольга проверила, клиенту не писали из-за неактуальности",
+                    "created_at": 1000,
+                    "updated_at": 1000,
+                    "closed_at": 1100,
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = handoff_path.read_text(encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        handoff_refs_path=handoff_path,
+        rag_db_path=rag_path,
+        now=2000,
+    )
+    after = handoff_path.read_text(encoding="utf-8")
+    open_check = next(check for check in report.checks if check.name == "telegram_open_handoffs")
+    manual_check = next(check for check in report.checks if check.name == "telegram_manual_closure_without_client_reply")
+    status = read_telegram_handoff_status(handoff_path, now=2000)
+
+    assert before == after
+    assert open_check.ok is True
+    assert manual_check.ok is False
+    assert manual_check.severity == "warning"
+    assert status["open_count"] == 0
+    assert status["manual_closed_without_client_reply_count"] == 1
+    assert report.summary["handoff_manual_closed_without_client_reply"] == 1
+    assert ops_status_exit_code(report, strict=False) == 0
+    assert ops_status_exit_code(report, strict=True) == 1
+
+
 def test_ops_status_json_redacts_secrets_and_keeps_secret_required_flag(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"

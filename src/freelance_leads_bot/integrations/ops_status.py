@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import IntegrationSettings
-from .handoff_refs import DEFAULT_HANDOFF_REFS_PATH, handoff_ref_is_critical, read_open_handoff_refs
+from .handoff_refs import DEFAULT_HANDOFF_REFS_PATH, handoff_ref_is_critical, load_telegram_handoff_refs, read_open_handoff_refs
 from .roles import role_safety_report
 
 
@@ -233,6 +233,7 @@ def build_ops_status_report(
     handoff_oldest_age = int(handoff_status.get("oldest_age_seconds") or 0)
     handoff_error_count = int(handoff_status.get("error_count") or 0)
     handoff_warning_count = int(handoff_status.get("warning_count") or 0)
+    handoff_manual_closed_without_client_reply = int(handoff_status.get("manual_closed_without_client_reply_count") or 0)
     handoff_ok = handoff_error_count == 0 and handoff_warning_count == 0
     checks.append(
         OpsCheck(
@@ -246,6 +247,17 @@ def build_ops_status_report(
                 f"critical={handoff_critical}, draft_pending={handoff_status.get('draft_pending_count', 0)}, "
                 f"oldest={int(handoff_oldest_age / 3600)}h."
             ),
+            handoff_status,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "telegram_manual_closure_without_client_reply",
+            handoff_manual_closed_without_client_reply == 0,
+            "warning",
+            "No Telegram handoffs were manually closed without a confirmed client reply."
+            if handoff_manual_closed_without_client_reply == 0
+            else f"{handoff_manual_closed_without_client_reply} Telegram handoffs were closed manually without a confirmed client reply.",
             handoff_status,
         )
     )
@@ -397,6 +409,7 @@ def build_ops_status_report(
         "handoff_oldest_age_seconds": handoff_oldest_age,
         "handoff_warning_count": handoff_warning_count,
         "handoff_error_count": handoff_error_count,
+        "handoff_manual_closed_without_client_reply": handoff_manual_closed_without_client_reply,
         "care_stale_needs_details": stale_visit_details,
         "care_due_needs_channel": due_needs_channel,
         "care_due_blocked_risk": due_blocked_risk,
@@ -580,6 +593,14 @@ def read_unanswered_status(
 def read_telegram_handoff_status(path: Path, *, now: int | None = None) -> dict[str, Any]:
     now_ts = int(time.time()) if now is None else int(now)
     rows = read_open_handoff_refs(path)
+    all_refs = [
+        row
+        for row in load_telegram_handoff_refs(path).values()
+        if isinstance(row, dict)
+    ]
+    manual_closed_without_client_reply_rows = [
+        row for row in all_refs if str(row.get("status") or "") == "closed_manual_no_client_reply"
+    ]
     open_count = len(rows)
     critical_rows = [row for row in rows if handoff_ref_is_critical(row)]
     draft_rows = [row for row in rows if str(row.get("status") or "") == "draft_pending"]
@@ -639,6 +660,7 @@ def read_telegram_handoff_status(path: Path, *, now: int | None = None) -> dict[
         "critical_count": len(critical_rows),
         "draft_pending_count": len(draft_rows),
         "expired_critical_count": len(expired_critical_rows),
+        "manual_closed_without_client_reply_count": len(manual_closed_without_client_reply_rows),
         "oldest_age_seconds": oldest_age,
         "warning_count": warning_count,
         "error_count": error_count,

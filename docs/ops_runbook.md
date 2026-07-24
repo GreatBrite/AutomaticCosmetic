@@ -224,6 +224,8 @@ LLM-понимание свободных команд Ольги использ
 
 Команда сохраняет в `data/telegram_handoff_refs.json` статус, `closed_at`, `resolution_note`, `resolution_source` и `resolution_action`. Решение `still_needs_action` state не закрывает: такая карточка остаётся видимой в `ops_status` и `/open_cards`.
 
+Решение `closed_manual_no_client_reply` не открывает карточку заново и не шлёт повторный пинг Ольге, но остаётся видимым отдельным warning `telegram_manual_closure_without_client_reply` в `ops_status`. Это нужно как audit-хвост: критичный вопрос был просмотрен и закрыт вручную без подтверждённого ответа клиенту.
+
 ### `avito_pending_followups`
 
 Это зависшие обещания бота после фраз вроде “уточню”, “проверю”, “подтвержу”.
