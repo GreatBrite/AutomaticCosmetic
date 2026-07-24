@@ -175,6 +175,7 @@ from scripts.avito_missed_message_poller import _list_recent_chats as list_recen
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.export_open_handoffs import build_open_handoffs_export, format_open_handoffs_markdown
+from scripts.production_readiness_report import build_production_readiness_report, format_production_readiness_markdown
 from scripts.verify_runtime_backup import verify_runtime_backup
 from scripts.verify_logrotate_config import verify_logrotate_config
 from scripts.avito_live_telegram_relay import (
@@ -9776,6 +9777,77 @@ def test_logrotate_config_rejects_sqlite_and_state_json(tmp_path) -> None:
     assert result["ok"] is False
     assert "/root/AutomaticCosmetic/data/leads.sqlite3" in result["forbidden_matches"]
     assert "/root/AutomaticCosmetic/data/telegram_handoff_refs.json" in result["forbidden_matches"]
+
+
+def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    care_path = data_dir / "care_crm.sqlite3"
+    CareCrmStore(care_path)
+    report_path = tmp_path / "avito_unanswered_report.json"
+    state_path = tmp_path / "avito_unanswered_monitor_state.json"
+    handoff_path = tmp_path / "telegram_handoff_refs.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "admin:10": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "10",
+                    "avito_chat_id": "chat-booking",
+                    "handoff_text": "Сообщение: Запись на 28 июля у нас в силе? Адрес напишите.",
+                    "status": "open",
+                    "created_at": 100,
+                    "updated_at": 100,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Когда есть окно?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    backup_data = tmp_path / "backup-data"
+    backup_data.mkdir()
+    with sqlite3.connect(backup_data / "leads.sqlite3") as conn:
+        conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY)")
+    (backup_data / "state.json").write_text("{}", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("TOKEN=secret\n", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    backup_runtime_data(data_dir=backup_data, output_dir=backup_dir, env_path=env_path, now=1780000000)
+
+    report = build_production_readiness_report(
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        handoff_refs_path=handoff_path,
+        care_crm_path=care_path,
+        rag_db_path=rag_path,
+        data_path=data_dir,
+        backup_dir=backup_dir,
+        logrotate_path=Path(__file__).resolve().parents[1] / "deploy" / "logrotate" / "automaticcosmetic",
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        now=1000 + 4 * 60 * 60,
+    )
+    markdown = format_production_readiness_markdown(report)
+
+    assert report["ok"] is False
+    assert "ops_status --strict is not green" in report["blockers"]
+    assert "1 open Olga handoffs need manual review" in report["blockers"]
+    assert "1 temporal RAG autoanswer items need cleanup decision" in report["blockers"]
+    assert report["backup_restore_verify"]["ok"] is True
+    assert report["logrotate"]["ok"] is True
+    assert "Status: `BLOCKED`" in markdown
+    assert "Review open Olga handoffs" in markdown
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:

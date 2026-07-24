@@ -427,7 +427,10 @@ cd /root/AutomaticCosmetic
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m compileall -q src scripts
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m pytest -q -p no:cacheprovider
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --strict
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python scripts/production_readiness_report.py --output data/production_readiness.md
 scripts/live_smoke_check.sh
 ```
+
+`production_readiness_report.py` read-only: он не закрывает карточки, не применяет RAG cleanup и не восстанавливает backup в live `data/`. Он собирает единый Markdown: `ops_status`, открытые handoff, temporal RAG candidates, backup restore verify и logrotate safety.
 
 Тестовый прогон не должен писать fake/test Avito события в live `data/avito_webhook.log`: pytest изолирует webhook log, processed-events и history DB через `tmp_path`. Если после тестов в production-логе появились `chat-codex`, `chat-voice`, `chat-review` или другие тестовые chat id, это регресс изоляции тестов.
