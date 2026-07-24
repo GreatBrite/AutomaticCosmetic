@@ -7573,6 +7573,7 @@ def test_export_avito_followups_markdown_is_read_only_and_includes_decisions(tmp
 
 def test_avito_followup_decisions_dry_run_and_apply_resolved_with_reason(tmp_path) -> None:
     state_path = tmp_path / "state.json"
+    report_path = tmp_path / "report.json"
     decisions_path = tmp_path / "avito_followups.md"
     audit_path = tmp_path / "audit.jsonl"
     key = "1:chat-followup:m-bot-1"
@@ -7598,36 +7599,68 @@ def test_avito_followup_decisions_dry_run_and_apply_resolved_with_reason(tmp_pat
         ),
         encoding="utf-8",
     )
+    report_path.write_text(
+        json.dumps(
+            {
+                "pending_followup_count": 1,
+                "overdue_followup_count": 1,
+                "critical_followup_count": 1,
+                "pending_followups": [
+                    {
+                        "key": key,
+                        "chat_id": "chat-followup",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                        "overdue": True,
+                        "severity": "critical",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     decisions_path.write_text(f"- [x] resolved #{token}: ответили в Avito в 12:10\n", encoding="utf-8")
     before = state_path.read_text(encoding="utf-8")
+    report_before = report_path.read_text(encoding="utf-8")
 
     dry_run = build_avito_followup_decision_review(
         decisions_path=decisions_path,
         state_path=state_path,
+        report_path=report_path,
         audit_path=audit_path,
         apply=False,
         now=1780000000,
     )
     after_dry_run = state_path.read_text(encoding="utf-8")
+    report_after_dry_run = report_path.read_text(encoding="utf-8")
     applied = build_avito_followup_decision_review(
         decisions_path=decisions_path,
         state_path=state_path,
+        report_path=report_path,
         audit_path=audit_path,
         apply=True,
         actor="olga",
         now=1780000100,
     )
     row = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
 
     assert dry_run["ok"] is True
     assert dry_run["items"][0]["would_apply"] is True
     assert before == after_dry_run
+    assert report_before == report_after_dry_run
     assert applied["ok"] is True
     assert applied["applied_count"] == 1
     assert row["business_resolved"] is True
     assert row["business_status"] == "manual_closed"
     assert row["client_answer_confirmed"] is True
     assert row["resolution_note"] == "ответили в Avito в 12:10"
+    assert report["pending_followup_count"] == 0
+    assert report["overdue_followup_count"] == 0
+    assert report["critical_followup_count"] == 0
+    assert report["pending_followups"][0]["business_resolved"] is True
+    assert report["pending_followups"][0]["resolution_note"] == "ответили в Avito в 12:10"
     assert audit_path.exists()
     assert "ответили в Avito в 12:10" in audit_path.read_text(encoding="utf-8")
 

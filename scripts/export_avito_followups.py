@@ -152,6 +152,7 @@ def build_avito_followup_decision_review(
     *,
     decisions_path: Path,
     state_path: Path = DEFAULT_STATE_PATH,
+    report_path: Path = DEFAULT_REPORT_PATH,
     audit_path: Path = DEFAULT_FOLLOWUP_AUDIT_LOG_PATH,
     apply: bool = False,
     actor: str = "markdown_review",
@@ -219,6 +220,11 @@ def build_avito_followup_decision_review(
             item["applied"] = bool(result.get("ok"))
             if item["applied"]:
                 applied_count += 1
+                _sync_report_after_action(
+                    report_path=report_path,
+                    key=str(result.get("key") or ""),
+                    row=result.get("row") if isinstance(result.get("row"), dict) else {},
+                )
             else:
                 item["errors"].append(str(result.get("reason") or "apply_failed"))
                 ok = False
@@ -229,6 +235,7 @@ def build_avito_followup_decision_review(
         "generated_at_iso": _iso(now_ts),
         "decisions_path": str(decisions_path),
         "state_path": str(state_path),
+        "report_path": str(report_path),
         "audit_path": str(audit_path),
         "decision_count": len(decisions),
         "applied_count": applied_count,
@@ -280,6 +287,28 @@ def _normalize_row(row: dict[str, Any], *, now: int) -> dict[str, Any]:
     normalized["age_seconds"] = int(row.get("age_seconds") or max(0, now - created_at))
     normalized["overdue"] = bool(row.get("overdue")) or str(row.get("business_status") or "") == "overdue"
     return normalized
+
+
+def _sync_report_after_action(*, report_path: Path, key: str, row: dict[str, Any]) -> None:
+    if not key or not row:
+        return
+    report = _load_json(report_path)
+    rows = report.get("pending_followups") if isinstance(report.get("pending_followups"), list) else []
+    changed = False
+    for index, existing in enumerate(rows):
+        if isinstance(existing, dict) and str(existing.get("key") or "") == key:
+            rows[index] = {**existing, **row, "key": key}
+            changed = True
+            break
+    if not changed:
+        return
+    report["pending_followups"] = rows
+    active = [item for item in rows if isinstance(item, dict) and not item.get("business_resolved")]
+    report["pending_followup_count"] = len(active)
+    report["overdue_followup_count"] = sum(1 for item in active if item.get("overdue") or item.get("business_status") == "overdue")
+    report["critical_followup_count"] = sum(1 for item in active if item.get("severity") == "critical")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _key_from_row(row: dict[str, Any]) -> str:
@@ -336,6 +365,7 @@ def main() -> None:
         review = build_avito_followup_decision_review(
             decisions_path=args.decisions,
             state_path=args.state,
+            report_path=args.report,
             audit_path=args.audit_log,
             apply=args.apply_decisions,
             actor=args.actor,
