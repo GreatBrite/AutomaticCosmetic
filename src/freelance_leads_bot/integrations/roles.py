@@ -113,6 +113,12 @@ WORKSPACE_DEBUG_TOOLS = frozenset(
         "workspace.files.list",
         "workspace.files.read",
         "workspace.logs.tail",
+    }
+)
+
+
+WORKSPACE_EXECUTION_TOOLS = frozenset(
+    {
         "workspace.command.run",
         "workspace.python.run",
     }
@@ -337,6 +343,51 @@ def telegram_role_for_user(user_id: int, *, admin_user_id: int, cosmetologist_us
     if user_id and user_id == cosmetologist_user_id:
         return CodexRole.OLGA_BOSS
     return CodexRole.ADMIN
+
+
+def role_safety_report() -> dict[str, Any]:
+    """Return a non-mutating audit of tool permissions for all Codex roles."""
+
+    rows: dict[str, Any] = {}
+    errors: list[str] = []
+    client_roles = {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}
+    dangerous_client_tools = ADMIN_MUTATION_TOOLS | INTERNAL_CRM_TOOL_NAMES | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS
+    for role in CodexRole:
+        profile = role_profile(role)
+        tools = set(profile.allowed_tools or ())
+        workspace_tools = sorted(tool for tool in tools if tool.startswith("workspace."))
+        mutating_tools = sorted(tools & ADMIN_MUTATION_TOOLS)
+        row = {
+            "role": role.value,
+            "allow_workspace_tools": profile.allow_workspace_tools,
+            "live_actions_enabled": profile.live_actions_enabled,
+            "tool_count": len(tools),
+            "workspace_tools": workspace_tools,
+            "workspace_execution_tools": sorted(tools & WORKSPACE_EXECUTION_TOOLS),
+            "admin_mutation_tools": mutating_tools,
+        }
+        if role in client_roles:
+            forbidden = sorted(tools & dangerous_client_tools)
+            row["forbidden_client_tools"] = forbidden
+            if forbidden:
+                errors.append(f"{role.value} exposes forbidden client tools: {', '.join(forbidden)}")
+        if role == CodexRole.OLGA_BOSS:
+            forbidden = sorted(tools & (WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS))
+            row["forbidden_olga_workspace_tools"] = forbidden
+            if forbidden or profile.allow_workspace_tools:
+                errors.append(f"{role.value} exposes workspace tools")
+        if role == CodexRole.ADMIN:
+            forbidden = sorted(tools & WORKSPACE_EXECUTION_TOOLS)
+            row["forbidden_admin_workspace_execution_tools"] = forbidden
+            if forbidden:
+                errors.append(f"{role.value} exposes workspace execution tools: {', '.join(forbidden)}")
+        if role == CodexRole.YCLIENTS_UPSELL_STUB:
+            forbidden = sorted(tools & (ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS))
+            row["forbidden_upsell_tools"] = forbidden
+            if forbidden or profile.live_actions_enabled:
+                errors.append(f"{role.value} is not read-only/stub safe")
+        rows[role.value] = row
+    return {"ok": not errors, "roles": rows, "errors": errors}
 
 
 def conversation_key(channel: str, role: CodexRole | str, identifier: str, *, thread: dict[str, Any] | None = None) -> str:

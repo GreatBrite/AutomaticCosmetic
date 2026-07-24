@@ -127,7 +127,7 @@ from src.freelance_leads_bot.integrations.ops_status import (
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, review_suggestion, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
-from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile
+from src.freelance_leads_bot.integrations.roles import CodexRole, conversation_key, legacy_runtime_status, role_profile, role_safety_report
 import src.freelance_leads_bot.integrations.telegram_admin_bot as telegram_admin_bot_module
 from src.freelance_leads_bot.integrations.telegram_admin_bot import TelegramAdminBotTransport, telegram_delivery_params, telegram_history_key
 from src.freelance_leads_bot.integrations.telegram_client_bot import (
@@ -3129,6 +3129,8 @@ async def test_role_profile_filters_tools_and_blocks_upsell_mutations(tmp_path) 
     )
 
     assert "workspace.logs.tail" in admin_toolbox.tool_names()
+    assert "workspace.command.run" not in admin_toolbox.tool_names()
+    assert "workspace.python.run" not in admin_toolbox.tool_names()
     assert "workspace.logs.tail" not in olga_toolbox.tool_names()
     assert "schedule.city.set" in olga_toolbox.tool_names()
     assert "avito.messages.send_phone" in olga_toolbox.tool_names()
@@ -3148,6 +3150,24 @@ async def test_role_profile_filters_tools_and_blocks_upsell_mutations(tmp_path) 
     )
     assert blocked.ok is False
     assert "unknown tool" in blocked.error
+
+
+def test_role_safety_report_enforces_production_tool_matrix() -> None:
+    report = role_safety_report()
+    roles = report["roles"]
+
+    assert report["ok"] is True
+    assert roles["admin"]["workspace_tools"] == ["workspace.files.list", "workspace.files.read", "workspace.logs.tail"]
+    assert roles["admin"]["forbidden_admin_workspace_execution_tools"] == []
+    assert roles["olga_boss"]["forbidden_olga_workspace_tools"] == []
+    assert roles["olga_boss"]["allow_workspace_tools"] is False
+    assert roles["yclients_upsell_stub"]["live_actions_enabled"] is False
+    assert roles["yclients_upsell_stub"]["forbidden_upsell_tools"] == []
+    for role in ("avito_client", "telegram_client", "vk_client"):
+        assert roles[role]["workspace_tools"] == []
+        assert roles[role]["forbidden_client_tools"] == []
+        assert "avito.messages.send" not in role_profile(CodexRole(role)).allowed_tools
+        assert "yclients.appointments.create" not in role_profile(CodexRole(role)).allowed_tools
 
 
 @pytest.mark.anyio

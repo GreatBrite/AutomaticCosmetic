@@ -298,6 +298,17 @@ Follow-up клиентам отправляется только если вкл
 - `care_followup_channels` — due-задачи есть, но нет verified Telegram-канала.
 - `care_followup_risk_gate` — live-отправка включена, а в очереди есть риск-блокированные задачи.
 
+## Role/tool matrix
+
+Матрица ролей проверяется тестом `test_role_safety_report_enforces_production_tool_matrix`.
+
+Нормальное состояние:
+
+- клиентские роли `avito_client`, `telegram_client`, `vk_client` имеют только read-only YCLIENTS/knowledge и безопасную CRM-memory; без Avito send, YCLIENTS mutations, workspace и RAG-admin tools;
+- Ольга может делать рабочие бизнес-мутации через allowlist, но не имеет `workspace.*`;
+- admin имеет workspace только read-only: `workspace.files.list`, `workspace.files.read`, `workspace.logs.tail`; без `workspace.command.run` и `workspace.python.run`;
+- upsell stub read-only: не отправляет клиентам, не мутирует YCLIENTS/Avito/RAG-admin и `live_actions_enabled=false`.
+
 ## YCLIENTS webhook secret
 
 В production `YCLIENTS_INTEGRATION_SECRET` должен быть непустым. `/health` обязан показывать:
