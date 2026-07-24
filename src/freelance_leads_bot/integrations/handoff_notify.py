@@ -198,13 +198,7 @@ class TelegramHandoffNotifier:
         if telegram_message_id:
             task_fields = _booking_task_fields(handoff) if urgent else _handoff_task_fields(handoff)
             reason = str(getattr(handoff.reason, "value", handoff.reason))
-            is_critical = urgent or reason in {
-                "booking_ambiguous",
-                "photo_consultation",
-                "complaint_or_risk",
-                "medical_question",
-                "voice_transcription_failed",
-            }
+            is_critical = _handoff_is_critical(handoff)
             ref = await asyncio.to_thread(
                 remember_telegram_handoff_ref,
                 telegram_chat_id=self.chat_id,
@@ -339,6 +333,8 @@ class TelegramHandoffNotifier:
             edit_result = await _to_thread_retry(self.bot.edit_message_text, self.chat_id, parsed_message_id, escaped_text)
         except Exception as exc:
             return {"merged": False, "reason": "edit_failed", "error": repr(exc)}
+        is_critical = _handoff_is_critical(handoff)
+        task_fields = _handoff_task_fields(handoff)
         ref = await asyncio.to_thread(
             remember_telegram_handoff_ref,
             telegram_chat_id=self.chat_id,
@@ -351,6 +347,11 @@ class TelegramHandoffNotifier:
             source_message_id=str(handoff.message.message_id or ""),
             status=str(existing_ref.get("status") or "open"),
             reason=str(getattr(handoff.reason, "value", handoff.reason)),
+            urgency="critical" if is_critical else str(existing_ref.get("urgency") or ""),
+            sla="critical" if is_critical else str(existing_ref.get("sla") or ""),
+            client_waits_for=str(task_fields.get("client_waits_for") or existing_ref.get("client_waits_for") or ""),
+            deadline_at=int(time.time()) + 60 * 60 if is_critical else int(existing_ref.get("deadline_at") or 0),
+            escalation_at=int(time.time()) + 3 * 60 * 60 if is_critical else int(existing_ref.get("escalation_at") or 0),
             path=self.ref_path,
         )
         topic_params = {"message_thread_id": str(existing_ref.get("telegram_message_thread_id") or "")} if existing_ref.get("telegram_message_thread_id") else {}
@@ -680,6 +681,7 @@ def _handoff_is_critical(handoff: Handoff) -> bool:
         "booking_ambiguous",
         "photo_consultation",
         "complaint_or_risk",
+        "expert_expectation",
         "medical_question",
         "voice_transcription_failed",
     }
@@ -795,6 +797,8 @@ def _handoff_task_fields(handoff: Handoff) -> dict[str, str]:
     waits_for = ""
     if reason == "photo_consultation" or message.has_photo:
         waits_for = "оценка фото/вложения"
+    elif reason == "expert_expectation":
+        waits_for = "экспертная оценка Ольги по объёму/ожидаемому результату"
     elif reason in {"complaint_or_risk", "medical_question"}:
         waits_for = "экспертный ответ Ольги"
     elif reason == "voice_transcription_failed":

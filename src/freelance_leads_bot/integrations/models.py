@@ -19,6 +19,7 @@ class HandoffReason(str, Enum):
     BOOKING_AMBIGUOUS = "booking_ambiguous"
     BOOKING_CRITICAL = "booking_critical"
     COMPLAINT_OR_RISK = "complaint_or_risk"
+    EXPERT_EXPECTATION = "expert_expectation"
     MISSING_DATA = "missing_data"
 
 

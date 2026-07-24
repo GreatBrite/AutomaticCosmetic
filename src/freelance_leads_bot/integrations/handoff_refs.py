@@ -26,15 +26,17 @@ CRITICAL_HANDOFF_REASONS = {
     "booking_ambiguous",
     "photo_consultation",
     "complaint_or_risk",
+    "expert_expectation",
     "medical_question",
     "voice_transcription_failed",
 }
 CRITICAL_HANDOFF_TEXT_RE = re.compile(
     r"("
-    r"booking[_\s-]*critical|booking[_\s-]*ambiguous|photo[_\s-]*consultation|complaint[_\s-]*or[_\s-]*risk|"
+    r"booking[_\s-]*critical|booking[_\s-]*ambiguous|photo[_\s-]*consultation|complaint[_\s-]*or[_\s-]*risk|expert[_\s-]*expectation|"
     r"запис[ьи]|перезапис|перенос|отмен[аи]|адрес|где\s+.*при(?:й|и)ти|"
     r"в\s+силе|подтверд|подтвержд|дат[ауеы]|время|окн[оа]|"
-    r"фото|вложени|голосов|жалоб|отзыв|негатив|медицин|противопоказ"
+    r"фото|вложени|голосов|жалоб|отзыв|негатив|медицин|противопоказ|"
+    r"об[ъь]?[её]м|мл|результат|размер|заметн|выраженн|нельзя\s+автообещ"
     r")",
     re.IGNORECASE,
 )

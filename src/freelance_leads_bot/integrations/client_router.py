@@ -68,7 +68,7 @@ def route_client_message(
             city=city,
             service_key=service_key,
             risk_flags=("expert_expectation",),
-            handoff_reason=HandoffReason.MISSING_DATA.value,
+            handoff_reason=HandoffReason.EXPERT_EXPECTATION.value,
             block_autoanswer_reason="aesthetic_expectation_guard",
             metadata={"guard": "aesthetic_expectation_guard", "reason": "нельзя автообещать результат по мл"},
         )

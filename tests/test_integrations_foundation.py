@@ -2703,7 +2703,7 @@ def test_client_message_router_handoffs_aesthetic_volume_expectations() -> None:
     )
 
     assert route.route == "expert_expectation_handoff"
-    assert route.handoff_reason == HandoffReason.MISSING_DATA.value
+    assert route.handoff_reason == HandoffReason.EXPERT_EXPECTATION.value
     assert route.block_autoanswer_reason == "aesthetic_expectation_guard"
     assert route.metadata["reason"] == "нельзя автообещать результат по мл"
 
@@ -2830,9 +2830,50 @@ async def test_avito_consultant_handoffs_aesthetic_volume_expectation(tmp_path) 
 
     assert reply.action == "handoff"
     assert reply.handoff is not None
-    assert reply.handoff.reason == HandoffReason.MISSING_DATA
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
     assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
     assert "нельзя автообещать результат по мл" in reply.handoff.summary
+
+
+@pytest.mark.anyio
+async def test_aesthetic_expectation_handoff_ref_is_critical_for_sla(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "id": "m-expert-1",
+            "chat_id": "chat-expert",
+            "content": {"text": "300 мл хватит на грудь, будет плюс один размер?"},
+        }
+    )
+    handoff = Handoff(
+        reason=HandoffReason.EXPERT_EXPECTATION,
+        message=message,
+        summary="Нельзя автообещать результат по мл. Проверьте вопрос клиента.",
+    )
+    ref_path = tmp_path / "handoff_refs.json"
+    notifier = TelegramHandoffNotifier(FakeTelegramBot(), "admin-chat", ref_path=ref_path, topics_enabled=False)
+
+    result = await notifier.notify(handoff)
+    refs = load_telegram_handoff_refs(ref_path)
+    ref = next(iter(refs.values()))
+
+    assert result["telegram_handoff_ref"]["reason"] == HandoffReason.EXPERT_EXPECTATION.value
+    assert ref["urgency"] == "critical"
+    assert ref["sla"] == "critical"
+    assert ref["deadline_at"] > 0
+    assert ref["escalation_at"] > 0
+    assert "объёму/ожидаемому результату" in ref["client_waits_for"]
+    assert handoff_ref_is_critical(ref) is True
 
 
 @pytest.mark.anyio
@@ -4078,7 +4119,7 @@ async def test_codex_tool_loop_allows_silent_handoff_for_before_after_assets() -
     assert reply.action == "handoff"
     assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
     assert reply.handoff is not None
-    assert reply.handoff.reason == "missing_data"
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
     assert "Клиенту уже ответили" in reply.handoff.summary
     assert "Нужно у Ольги" not in reply.handoff.summary
     assert "нельзя автообещать результат по мл" in reply.handoff.summary
@@ -9396,7 +9437,7 @@ def test_codex_review_guard_handoffs_aesthetic_volume_promise() -> None:
 
     assert reviewed.action == "handoff"
     assert reviewed.handoff is not None
-    assert reviewed.handoff.reason == HandoffReason.MISSING_DATA
+    assert reviewed.handoff.reason == HandoffReason.EXPERT_EXPECTATION
     assert reviewed.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
     assert reviewed.metadata["aesthetic_expectation_guard"]["reason"] == "aesthetic_expectation_guard"
 

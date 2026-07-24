@@ -104,7 +104,7 @@ def apply_review_outcome(
                 decision,
                 action="handoff",
                 reply=guard["safe_reply"],
-                handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=message, summary=guard["handoff_summary"]),
+                handoff=Handoff(reason=HandoffReason.EXPERT_EXPECTATION, message=message, summary=guard["handoff_summary"]),
                 metadata=metadata,
             )
         return replace(decision, reply=reply, metadata=metadata)
@@ -120,7 +120,7 @@ def apply_review_outcome(
             decision,
             action="handoff",
             reply=guard["safe_reply"],
-            handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=message, summary=guard["handoff_summary"]),
+            handoff=Handoff(reason=HandoffReason.EXPERT_EXPECTATION, message=message, summary=guard["handoff_summary"]),
             metadata=metadata,
         )
     if action == "handoff":

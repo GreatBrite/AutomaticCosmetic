@@ -310,7 +310,7 @@ class AvitoConsultant:
                 context,
                 route,
                 reply="По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее.",
-                reason=HandoffReason.MISSING_DATA,
+                reason=HandoffReason.EXPERT_EXPECTATION,
             )
         if route.route in {"booking_read", "address"}:
             return await self._fallback_response(context)
