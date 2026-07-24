@@ -410,6 +410,10 @@ df -h .
 
 ```bash
 cd /root/AutomaticCosmetic
-.venv/bin/python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m compileall -q src scripts
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m pytest -q -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --strict
 scripts/live_smoke_check.sh
 ```
+
+Тестовый прогон не должен писать fake/test Avito события в live `data/avito_webhook.log`: pytest изолирует webhook log, processed-events и history DB через `tmp_path`. Если после тестов в production-логе появились `chat-codex`, `chat-voice`, `chat-review` или другие тестовые chat id, это регресс изоляции тестов.

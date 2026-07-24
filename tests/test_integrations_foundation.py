@@ -60,6 +60,7 @@ from src.freelance_leads_bot.integrations.avito_turn_buffer import (
     mark_avito_turn_batch_processed,
     pop_due_avito_turn_batches,
 )
+import src.freelance_leads_bot.integrations.avito_webhook as avito_webhook_module
 from src.freelance_leads_bot.integrations.avito_webhook import (
     annotate_avito_message_actor,
     app as avito_app,
@@ -504,15 +505,18 @@ def test_send_open_handoff_cards_marks_critical_sla(tmp_path, monkeypatch) -> No
 def isolate_avito_processed_events(tmp_path):
     old_path = processed_events.path
     old_seen = processed_events.seen
+    old_webhook_log_path = avito_webhook_module.WEBHOOK_LOG_PATH
     old_history_override = avito_app.dependency_overrides.get(get_history_store)
     processed_events.path = tmp_path / "avito_processed_events.json"
     processed_events.seen = {}
+    avito_webhook_module.WEBHOOK_LOG_PATH = tmp_path / "avito_webhook.log"
     avito_app.dependency_overrides[get_history_store] = lambda: LeadStore(tmp_path / "avito_history.sqlite3")
     try:
         yield
     finally:
         processed_events.path = old_path
         processed_events.seen = old_seen
+        avito_webhook_module.WEBHOOK_LOG_PATH = old_webhook_log_path
         if old_history_override is None:
             avito_app.dependency_overrides.pop(get_history_store, None)
         else:
@@ -549,6 +553,24 @@ def test_avito_event_is_converted_to_inbound_message() -> None:
     assert message.text == "Здравствуйте, сколько стоит чистка?"
     assert message.listing is not None
     assert message.listing.city == "Москва"
+
+
+def test_avito_webhook_log_is_isolated_from_production_data(tmp_path) -> None:
+    assert avito_webhook_module.WEBHOOK_LOG_PATH.parent == tmp_path
+
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json={"type": "ping"})
+
+        assert response.status_code == 200
+        assert avito_webhook_module.WEBHOOK_LOG_PATH.exists()
+        rows = [json.loads(line) for line in avito_webhook_module.WEBHOOK_LOG_PATH.read_text(encoding="utf-8").splitlines()]
+        assert rows[-1]["event"] == "ignored"
+        assert rows[-1]["reason"] == "not_message_event"
+        assert not str(avito_webhook_module.WEBHOOK_LOG_PATH).startswith("data/")
+    finally:
+        avito_app.dependency_overrides.clear()
 
 
 def test_booking_request_parser_extracts_date_time_city_and_phone() -> None:
