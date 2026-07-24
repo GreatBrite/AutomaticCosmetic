@@ -9431,6 +9431,39 @@ def test_ops_status_json_redacts_secrets_and_keeps_secret_required_flag(tmp_path
     assert payload["flags"]["yclients_integration_secret_required"] is True
 
 
+def test_ops_status_reports_role_tool_matrix(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для губ?",
+        answer_client="Используем сертифицированные препараты.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    check = next(check for check in report.checks if check.name == "role_tool_matrix")
+
+    assert check.ok is True
+    assert check.severity == "error"
+    assert check.data is not None
+    assert check.data["roles"]["admin"]["workspace_execution_tools"] == []
+    assert check.data["roles"]["olga_boss"]["workspace_tools"] == []
+    assert check.data["roles"]["avito_client"]["forbidden_client_tools"] == []
+
+
 def test_webhook_runners_disable_uvicorn_access_logs() -> None:
     root = Path(__file__).resolve().parents[1]
     paths = [

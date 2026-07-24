@@ -17,6 +17,7 @@ from typing import Any
 
 from .config import IntegrationSettings
 from .handoff_refs import DEFAULT_HANDOFF_REFS_PATH, handoff_ref_is_critical, read_open_handoff_refs
+from .roles import role_safety_report
 
 
 DEFAULT_UNANSWERED_REPORT_PATH = Path("data/avito_unanswered_report.json")
@@ -122,6 +123,18 @@ def build_ops_status_report(
             if yclients_secret_required
             else "YCLIENTS webhook/callback shared secret is not required; set YCLIENTS_INTEGRATION_SECRET.",
             {"health": yclients_health},
+        )
+    )
+    role_matrix = role_safety_report()
+    checks.append(
+        OpsCheck(
+            "role_tool_matrix",
+            bool(role_matrix.get("ok")),
+            "error",
+            "Codex role/tool matrix is production-safe."
+            if role_matrix.get("ok")
+            else "Codex role/tool matrix is unsafe: " + "; ".join(str(error) for error in role_matrix.get("errors") or []),
+            role_matrix,
         )
     )
 
