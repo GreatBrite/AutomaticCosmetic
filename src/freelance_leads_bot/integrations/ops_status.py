@@ -22,6 +22,7 @@ from .roles import role_safety_report
 
 DEFAULT_UNANSWERED_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_UNANSWERED_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
+DEFAULT_AVITO_POLLER_LOG_PATH = Path("data/avito_poller.log")
 DEFAULT_CARE_CRM_PATH = Path("data/care_crm.sqlite3")
 DEFAULT_DATA_PATH = Path("data")
 DEFAULT_DATA_WARNING_BYTES = 2 * 1024 * 1024 * 1024
@@ -75,6 +76,7 @@ def build_ops_status_report(
     yclients_health: dict[str, Any] | None = None,
     unanswered_report_path: Path = DEFAULT_UNANSWERED_REPORT_PATH,
     unanswered_state_path: Path = DEFAULT_UNANSWERED_STATE_PATH,
+    avito_poller_log_path: Path | None = None,
     handoff_refs_path: Path | None = None,
     care_crm_path: Path = DEFAULT_CARE_CRM_PATH,
     rag_db_path: Path | None = None,
@@ -93,6 +95,11 @@ def build_ops_status_report(
         DEFAULT_HANDOFF_REFS_PATH
         if Path(unanswered_report_path) == DEFAULT_UNANSWERED_REPORT_PATH
         else Path(unanswered_report_path).parent / DEFAULT_HANDOFF_REFS_PATH.name
+    )
+    resolved_avito_poller_log_path = avito_poller_log_path or (
+        DEFAULT_AVITO_POLLER_LOG_PATH
+        if Path(unanswered_report_path) == DEFAULT_UNANSWERED_REPORT_PATH
+        else Path(unanswered_report_path).parent / DEFAULT_AVITO_POLLER_LOG_PATH.name
     )
     checks: list[OpsCheck] = []
 
@@ -224,6 +231,30 @@ def build_ops_status_report(
             "error",
             "No failed delayed autoreplies." if failed == 0 else f"{failed} delayed autoreplies failed.",
             unanswered,
+        )
+    )
+    poller = read_avito_poller_status(
+        resolved_avito_poller_log_path,
+        expected_chat_limit=_env_int("AVITO_POLLER_CHAT_LIMIT", _env_int("AVITO_UNANSWERED_CHAT_LIMIT", 150)),
+        stale_after_seconds=max(300, _env_int("AVITO_POLLER_INTERVAL_SECONDS", 60) * 5),
+        now=generated_at,
+    )
+    poller_recent = bool(poller.get("recent"))
+    poller_chats_ok = bool(poller.get("chats_ok"))
+    checks.append(
+        OpsCheck(
+            "avito_missed_poller_coverage",
+            poller_recent and poller_chats_ok,
+            "error" if poller_recent and not poller_chats_ok else "warning",
+            "Avito missed-poller recently scanned enough chats."
+            if poller_recent and poller_chats_ok
+            else (
+                f"Avito missed-poller latest summary scanned {poller.get('last_chats', 0)} chats; "
+                f"expected at least {poller.get('expected_chat_limit', 0)}."
+                if poller_recent
+                else f"Avito missed-poller summary is stale or missing; age={poller.get('age_seconds', 0)}s."
+            ),
+            poller,
         )
     )
 
@@ -403,6 +434,9 @@ def build_ops_status_report(
         "avito_max_critical_followup_age_seconds": max_critical_followup_age,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
+        "avito_poller_last_chats": poller.get("last_chats", 0),
+        "avito_poller_expected_chats": poller.get("expected_chat_limit", 0),
+        "avito_poller_age_seconds": poller.get("age_seconds", 0),
         "handoff_open": handoff_open,
         "handoff_critical": handoff_critical,
         "handoff_draft_pending": handoff_status.get("draft_pending_count", 0),
@@ -521,6 +555,64 @@ def read_care_crm_status(path: Path, *, now: int | None = None) -> dict[str, Any
             )
     except sqlite3.Error as exc:
         result["error"] = type(exc).__name__
+    return result
+
+
+def read_avito_poller_status(
+    path: Path,
+    *,
+    expected_chat_limit: int,
+    stale_after_seconds: int,
+    now: int | None = None,
+) -> dict[str, Any]:
+    now_ts = int(time.time()) if now is None else int(now)
+    expected = max(1, int(expected_chat_limit or 1))
+    stale_after = max(1, int(stale_after_seconds or 1))
+    result: dict[str, Any] = {
+        "exists": Path(path).exists(),
+        "path": str(path),
+        "expected_chat_limit": expected,
+        "last_chats": 0,
+        "last_ts": 0,
+        "age_seconds": stale_after + 1,
+        "recent": False,
+        "chats_ok": False,
+    }
+    if not Path(path).exists():
+        return result
+    latest: dict[str, Any] = {}
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or row.get("event") != "summary":
+                    continue
+                if int(row.get("ts") or 0) >= int(latest.get("ts") or 0):
+                    latest = row
+    except OSError as exc:
+        result["error"] = type(exc).__name__
+        return result
+    if not latest:
+        return result
+    last_ts = int(latest.get("ts") or 0)
+    last_chats = int(latest.get("chats") or 0)
+    age = max(0, now_ts - last_ts) if last_ts else stale_after + 1
+    result.update(
+        {
+            "last_ts": last_ts,
+            "last_chats": last_chats,
+            "age_seconds": age,
+            "recent": age <= stale_after,
+            "chats_ok": last_chats >= expected,
+            "processed": int(latest.get("processed") or 0),
+            "skipped": int(latest.get("skipped") or 0),
+            "errors": int(latest.get("errors") or 0),
+            "skip_reasons": latest.get("skip_reasons") if isinstance(latest.get("skip_reasons"), dict) else {},
+        }
+    )
     return result
 
 
@@ -820,6 +912,11 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f" draft_pending={summary.get('handoff_draft_pending', 0)}"
             f" manual_no_client_reply={summary.get('handoff_manual_closed_without_client_reply', 0)}"
             f" oldest={int(int(summary.get('handoff_oldest_age_seconds') or 0) / 3600)}h"
+        ),
+        (
+            f"Poller: chats={summary.get('avito_poller_last_chats', 0)}"
+            f"/{summary.get('avito_poller_expected_chats', 0)}"
+            f" age={summary.get('avito_poller_age_seconds', 0)}s"
         ),
         (
             f"RAG: approved={summary.get('rag_approved', 0)}"

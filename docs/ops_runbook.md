@@ -256,6 +256,8 @@ AVITO_POLLER_MESSAGES_PER_CHAT=50
 
 Если эти переменные не заданы, poller использует такие же production-defaults и проходит чаты страницами через `offset`.
 
+`ops_status` проверяет последний `summary` в `data/avito_poller.log`. В строке `Poller: chats=X/150 age=Ys` должно быть не меньше `150/150`, а summary должен быть свежим. Если видно `chats=20/150`, сервис, скорее всего, запущен со старым окружением или старым unit/env; нужно обновить `.env`, перезапустить `yclients-avito-missed-poller.service` и проверить новый summary в логах.
+
 ### `avito_unanswered_report_fresh`
 
 Monitor может зависнуть или перестать обновлять отчёт.

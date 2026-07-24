@@ -73,6 +73,13 @@ def build_production_readiness_report(
     ops_summary = ops_payload.get("summary") if isinstance(ops_payload.get("summary"), dict) else {}
     handoff_manual_no_reply = int(ops_summary.get("handoff_manual_closed_without_client_reply") or 0)
     avito_manual_no_reply = int(ops_summary.get("avito_manual_closed_without_client_reply") or 0)
+    poller_last_chats = int(ops_summary.get("avito_poller_last_chats") or 0)
+    poller_expected_chats = int(ops_summary.get("avito_poller_expected_chats") or 0)
+    poller_age_seconds = int(ops_summary.get("avito_poller_age_seconds") or 0)
+    if poller_expected_chats and poller_last_chats < poller_expected_chats:
+        manual_actions.append(
+            f"Fix Avito missed-poller coverage: latest summary scanned {poller_last_chats}/{poller_expected_chats} chats; check .env/systemd and restart the poller."
+        )
     if handoff_manual_no_reply > 0:
         manual_actions.append(
             f"Review {handoff_manual_no_reply} Telegram handoff closures marked closed_manual_no_client_reply in Avito audit history."
@@ -121,6 +128,11 @@ def build_production_readiness_report(
         "manual_closure_audit": {
             "handoff_manual_closed_without_client_reply": handoff_manual_no_reply,
             "avito_manual_closed_without_client_reply": avito_manual_no_reply,
+        },
+        "poller_coverage": {
+            "last_chats": poller_last_chats,
+            "expected_chats": poller_expected_chats,
+            "age_seconds": poller_age_seconds,
         },
         "open_handoff_samples": handoffs.get("items", [])[: min(10, handoff_limit)],
         "temporal_rag_cleanup": {
@@ -181,10 +193,15 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
     for item in samples[:5]:
         lines.append(f"- `{item.get('avito_chat_id') or '-'}` {item.get('client_name') or 'Без имени'}: {item.get('age_hours')}h, critical={item.get('critical')}")
     temporal = report.get("temporal_rag_cleanup") if isinstance(report.get("temporal_rag_cleanup"), dict) else {}
+    poller = report.get("poller_coverage") if isinstance(report.get("poller_coverage"), dict) else {}
     backup = report.get("backup_restore_verify") if isinstance(report.get("backup_restore_verify"), dict) else {}
     logrotate = report.get("logrotate") if isinstance(report.get("logrotate"), dict) else {}
     lines.extend(
         [
+            "",
+            "## Avito Missed Poller",
+            "",
+            f"Latest chats: `{poller.get('last_chats', 0)}/{poller.get('expected_chats', 0)}`, age: `{poller.get('age_seconds', 0)}s`",
             "",
             "## RAG Temporal Cleanup",
             "",

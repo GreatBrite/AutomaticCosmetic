@@ -119,6 +119,7 @@ from src.freelance_leads_bot.integrations.ops_status import (
     build_ops_status_report,
     format_ops_status_report,
     ops_status_exit_code,
+    read_avito_poller_status,
     read_data_footprint,
     read_disk_status,
     read_telegram_handoff_status,
@@ -9460,6 +9461,100 @@ def test_ops_status_warns_on_critical_pending_avito_promises_before_overdue(tmp_
     assert "No immediate action required" not in text
 
 
+def test_ops_status_errors_when_avito_poller_scans_too_few_chats(tmp_path, monkeypatch) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    poller_log = tmp_path / "avito_poller.log"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    monkeypatch.setenv("AVITO_POLLER_CHAT_LIMIT", "150")
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    poller_log.write_text(
+        json.dumps(
+            {
+                "ts": 1780000000,
+                "event": "summary",
+                "processed": 0,
+                "skipped": 259,
+                "errors": 0,
+                "chats": 20,
+                "skip_reasons": {"too_old": 259},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    status = read_avito_poller_status(poller_log, expected_chat_limit=150, stale_after_seconds=300, now=1780000100)
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        avito_poller_log_path=poller_log,
+        rag_db_path=rag_path,
+        now=1780000100,
+    )
+    check = next(check for check in report.checks if check.name == "avito_missed_poller_coverage")
+    text = format_ops_status_report(report)
+
+    assert status["recent"] is True
+    assert status["chats_ok"] is False
+    assert check.ok is False
+    assert check.severity == "error"
+    assert report.summary["avito_poller_last_chats"] == 20
+    assert report.summary["avito_poller_expected_chats"] == 150
+    assert "Poller: chats=20/150" in text
+    assert ops_status_exit_code(report, strict=True) == 1
+
+
+def test_ops_status_accepts_recent_avito_poller_full_coverage(tmp_path, monkeypatch) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    poller_log = tmp_path / "avito_poller.log"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    monkeypatch.setenv("AVITO_POLLER_CHAT_LIMIT", "150")
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    poller_log.write_text(
+        json.dumps({"ts": 1780000000, "event": "summary", "processed": 0, "skipped": 1, "errors": 0, "chats": 150})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        avito_poller_log_path=poller_log,
+        rag_db_path=rag_path,
+        now=1780000100,
+    )
+    check = next(check for check in report.checks if check.name == "avito_missed_poller_coverage")
+    text = format_ops_status_report(report)
+
+    assert check.ok is True
+    assert report.summary["avito_poller_last_chats"] == 150
+    assert "Poller: chats=150/150" in text
+
+
 def test_ops_status_reports_open_telegram_handoffs_without_mutating_refs(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"
@@ -9984,10 +10079,12 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     CareCrmStore(care_path)
     report_path = tmp_path / "avito_unanswered_report.json"
     state_path = tmp_path / "avito_unanswered_monitor_state.json"
+    poller_log = tmp_path / "avito_poller.log"
     handoff_path = tmp_path / "telegram_handoff_refs.json"
     rag_path = tmp_path / "expert.sqlite3"
     report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
     state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    poller_log.write_text(json.dumps({"ts": 1000 + 4 * 60 * 60, "event": "summary", "chats": 20}) + "\n", encoding="utf-8")
     handoff_path.write_text(
         json.dumps(
             {
@@ -10054,11 +10151,15 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert "ops_status --strict is not green" in report["blockers"]
     assert "1 open Olga handoffs need manual review" in report["blockers"]
     assert "1 temporal RAG autoanswer items need cleanup decision" in report["blockers"]
+    assert report["poller_coverage"]["last_chats"] == 20
+    assert report["poller_coverage"]["expected_chats"] == 150
     assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
     assert report["backup_restore_verify"]["ok"] is True
     assert report["logrotate"]["ok"] is True
     assert "Status: `BLOCKED`" in markdown
     assert "Review open Olga handoffs" in markdown
+    assert "Fix Avito missed-poller coverage: latest summary scanned 20/150 chats" in "\n".join(report["manual_actions"])
+    assert "Latest chats: `20/150`" in markdown
     assert "Review 1 Telegram handoff closures marked closed_manual_no_client_reply" in "\n".join(report["manual_actions"])
     assert "Manual closures without client reply: `handoff=1`, `avito_promises=0`" in markdown
 
