@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/AutomaticCosmetic
 Environment=PATH=/root/.local/bin:/root/AutomaticCosmetic/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AVITO_POLLER_CHAT_LIMIT=150
+Environment=AVITO_POLLER_MESSAGES_PER_CHAT=50
 ExecStart=/root/AutomaticCosmetic/.venv/bin/python /root/AutomaticCosmetic/scripts/avito_missed_message_poller.py
 Restart=always
 RestartSec=10

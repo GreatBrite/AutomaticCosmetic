@@ -9770,6 +9770,14 @@ def test_webhook_runners_disable_uvicorn_access_logs() -> None:
         assert "--no-access-log" in path.read_text(encoding="utf-8")
 
 
+def test_missed_poller_systemd_unit_sets_production_limits() -> None:
+    root = Path(__file__).resolve().parents[1]
+    unit = (root / "deploy/systemd/yclients-avito-missed-poller.service").read_text(encoding="utf-8")
+
+    assert "Environment=AVITO_POLLER_CHAT_LIMIT=150" in unit
+    assert "Environment=AVITO_POLLER_MESSAGES_PER_CHAT=50" in unit
+
+
 def test_ops_status_reports_temporal_rag_cleanup_separately(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"
