@@ -46,7 +46,12 @@ def remember_avito_outgoing(store: LeadStore | None, chat_id: str, text: str) ->
 
 
 def sent_successfully(result: Any) -> bool:
-    return isinstance(result, dict) and bool(result.get("sent"))
+    if not isinstance(result, dict) or not result.get("sent"):
+        return False
+    caption_result = result.get("caption_result")
+    if caption_result is not None:
+        return sent_successfully(caption_result)
+    return True
 
 
 def _greeted_today(history: list[dict[str, Any]]) -> bool:

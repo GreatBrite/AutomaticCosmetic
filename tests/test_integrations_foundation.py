@@ -38,7 +38,7 @@ from src.freelance_leads_bot.integrations.client_handlers import RagAnswerServic
 from src.freelance_leads_bot.integrations.client_router import route_client_message
 from src.freelance_leads_bot.integrations.booking_flow import AvitoBookingFlow, BookingRequest, extract_date
 from src.freelance_leads_bot.integrations.avito_sender import AvitoSdkSender, PreviewAvitoSender
-from src.freelance_leads_bot.integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing
+from src.freelance_leads_bot.integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
 from src.freelance_leads_bot.integrations.avito_turn_buffer import batch_to_inbound_message
 from src.freelance_leads_bot.integrations.care_crm import (
     CareLearningService,
@@ -3468,6 +3468,72 @@ async def test_automation_toolbox_exposes_avito_read_tools(tmp_path) -> None:
     assert image_sent.data["send_result"]["sent"] is True
     assert file_sent.ok is True
     assert file_sent.data["send_result"]["caption"] == "Фото до/после"
+
+
+@pytest.mark.anyio
+async def test_avito_file_tool_does_not_close_handoff_when_caption_fails(tmp_path, monkeypatch) -> None:
+    import src.freelance_leads_bot.integrations.agent_tools as agent_tools_module
+
+    class PartialFileSender:
+        async def send_file(self, account_id, chat_id, file_path, caption=""):
+            return {
+                "sent": True,
+                "image_id": "img-1",
+                "caption_result": {"sent": False, "error": "caption failed"},
+            }
+
+    closed: list[tuple[str, str]] = []
+    monkeypatch.setattr(agent_tools_module, "update_latest_handoff_for_chat", lambda chat_id, status: closed.append((chat_id, status)) or "handoff-1")
+    history = LeadStore(tmp_path / "history.sqlite3")
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"image")
+    toolbox = AutomationToolbox(
+        DryRunYClientsGateway(),
+        avito_image_sender=PartialFileSender(),
+        avito_account_id=355,
+        history_store=history,
+    )
+
+    result = await toolbox.execute("avito.messages.send_file", {"chat_id": "chat-1", "file_path": str(image_path), "caption": "Фото до/после"})
+
+    assert result.ok is True
+    assert sent_successfully(result.data["send_result"]) is False
+    assert closed == []
+    assert history.recent_codex_chat(10, "avito:client:chat-1") == []
+
+
+@pytest.mark.anyio
+async def test_avito_file_tool_closes_handoff_after_image_and_caption_success(tmp_path, monkeypatch) -> None:
+    import src.freelance_leads_bot.integrations.agent_tools as agent_tools_module
+
+    class SuccessfulFileSender:
+        async def send_file(self, account_id, chat_id, file_path, caption=""):
+            return {
+                "sent": True,
+                "image_id": "img-1",
+                "caption_result": {"sent": True, "response": {"id": "caption-1"}},
+            }
+
+    closed: list[tuple[str, str]] = []
+    monkeypatch.setattr(agent_tools_module, "update_latest_handoff_for_chat", lambda chat_id, status: closed.append((chat_id, status)) or "handoff-1")
+    history = LeadStore(tmp_path / "history.sqlite3")
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"image")
+    toolbox = AutomationToolbox(
+        DryRunYClientsGateway(),
+        avito_image_sender=SuccessfulFileSender(),
+        avito_account_id=355,
+        history_store=history,
+    )
+
+    result = await toolbox.execute("avito.messages.send_file", {"chat_id": "chat-1", "file_path": str(image_path), "caption": "Фото до/после"})
+    history_rows = history.recent_codex_chat(10, "avito:client:chat-1")
+
+    assert result.ok is True
+    assert sent_successfully(result.data["send_result"]) is True
+    assert closed == [("chat-1", "closed")]
+    assert "[file] photo.jpg" in history_rows[-1]["content"]
+    assert "Фото до/после" in history_rows[-1]["content"]
 
 
 @pytest.mark.anyio
