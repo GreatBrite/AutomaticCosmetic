@@ -173,6 +173,7 @@ from scripts.avito_unanswered_monitor import (
 from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
+from scripts.export_open_handoffs import build_open_handoffs_export, format_open_handoffs_markdown
 from scripts.avito_live_telegram_relay import (
     compact_handoff_event,
     compact_relay_event,
@@ -355,6 +356,92 @@ def test_read_open_handoff_refs_is_read_only_and_classifies_business_critical(tm
     assert before == after
     assert rows[0]["handoff_id"]
     assert handoff_ref_is_critical(rows[0]) is True
+
+
+def test_export_open_handoffs_is_read_only_and_includes_avito_evidence(tmp_path) -> None:
+    refs_path = tmp_path / "telegram_handoff_refs.json"
+    webhook_log = tmp_path / "avito_webhook.log"
+    poller_log = tmp_path / "avito_poller.log"
+    refs_path.write_text(
+        json.dumps(
+            {
+                "admin:10": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "10",
+                    "telegram_message_thread_id": "77",
+                    "avito_chat_id": "chat-critical",
+                    "client_name": "Милена",
+                    "handoff_text": "Клиент спрашивает: запись на 28 июля у нас в силе? Адрес не напишите?",
+                    "status": "open",
+                    "created_at": 100,
+                    "updated_at": 100,
+                },
+                "admin:11": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "11",
+                    "avito_chat_id": "chat-ordinary",
+                    "client_name": "Олеся",
+                    "handoff_text": "Нужна ручная консультация по уходу",
+                    "status": "open",
+                    "created_at": 500,
+                    "updated_at": 500,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    webhook_log.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "processed",
+                        "chat_id": "chat-critical",
+                        "message_id": "in-1",
+                        "ts": 650,
+                        "message": {"text": "Запись в силе? Адрес напишите"},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "event": "ignored",
+                        "reason": "own_message",
+                        "chat_id": "chat-critical",
+                        "message_id": "out-1",
+                        "ts": 700,
+                        "text_preview": "Да, запись подтверждена, адрес отправили.",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    poller_log.write_text("", encoding="utf-8")
+    before = refs_path.read_text(encoding="utf-8")
+
+    report = build_open_handoffs_export(
+        refs_path=refs_path,
+        webhook_log_path=webhook_log,
+        poller_log_path=poller_log,
+        now=1000,
+    )
+    rendered = format_open_handoffs_markdown(report)
+    after = refs_path.read_text(encoding="utf-8")
+
+    assert before == after
+    assert report["open_count"] == 2
+    assert report["critical_count"] == 1
+    assert report["items"][0]["avito_chat_id"] == "chat-critical"
+    assert report["items"][0]["critical"] is True
+    assert report["items"][0]["last_incoming"]["text"] == "Запись в силе? Адрес напишите"
+    assert report["items"][0]["last_outgoing"]["text"] == "Да, запись подтверждена, адрес отправили."
+    assert "CRITICAL" in rendered
+    assert "Avito opened and latest incoming/outgoing checked" in rendered
 
 
 def test_send_open_handoff_cards_reissues_each_handoff_in_current_topic(tmp_path, monkeypatch) -> None:
