@@ -75,6 +75,7 @@ from src.freelance_leads_bot.integrations.avito_webhook import (
     get_settings,
     get_voice_resolver,
     process_avito_message,
+    processing_outcome_from_result,
     processed_events,
 )
 from src.freelance_leads_bot.integrations.avito_media import enrich_reply_handoff_photos
@@ -173,6 +174,7 @@ from scripts.avito_unanswered_monitor import (
     sync_pending_followups,
 )
 from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
+from scripts.avito_missed_message_poller import _dedup_allowed as missed_poller_dedup_allowed
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.export_open_handoffs import (
@@ -5719,6 +5721,24 @@ def test_avito_webhook_rejects_bad_token() -> None:
         assert response.status_code == 403
     finally:
         avito_app.dependency_overrides.clear()
+
+
+def test_processing_outcome_controls_dedup_for_webhook_and_missed_poller() -> None:
+    processed = processing_outcome_from_result({"ok": True, "processing_status": "processed"})
+    queued = processing_outcome_from_result({"ok": True, "processing_status": "queued"})
+    safe_ignore = processing_outcome_from_result({"ok": True, "processing_status": "ignored", "ignored": True, "reason": "own_message"})
+    unsafe_ignore = processing_outcome_from_result({"ok": True, "processing_status": "ignored", "ignored": True, "reason": "unknown_silent_skip"})
+    retryable = processing_outcome_from_result({"ok": False, "processing_status": "retryable_error", "reason": "telegram_down"})
+
+    assert processed.safe_to_dedup is True
+    assert queued.safe_to_dedup is True
+    assert safe_ignore.safe_to_dedup is True
+    assert unsafe_ignore.safe_to_dedup is False
+    assert unsafe_ignore.ok is False
+    assert retryable.safe_to_dedup is False
+    assert missed_poller_dedup_allowed({"ok": False, "processing_status": "retryable_error"}) is False
+    assert missed_poller_dedup_allowed({"ok": True, "processing_status": "ignored", "ignored": True, "reason": "not_message_event"}) is True
+    assert missed_poller_dedup_allowed({"ok": True, "processing_status": "ignored", "ignored": True, "reason": "unknown_silent_skip"}) is False
 
 
 def test_avito_webhook_processes_booking_decision_and_deduplicates() -> None:

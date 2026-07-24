@@ -25,7 +25,7 @@ from src.freelance_leads_bot.integrations.avito_media import AvitoApiPhotoResolv
 from src.freelance_leads_bot.integrations.avito_sender import avito_sender_from_settings
 from src.freelance_leads_bot.integrations.avito_turn_buffer import enqueue_avito_turn_message
 from src.freelance_leads_bot.integrations.avito_voice import AvitoApiVoiceResolver
-from src.freelance_leads_bot.integrations.avito_webhook import _is_own_message, process_avito_message
+from src.freelance_leads_bot.integrations.avito_webhook import _is_own_message, process_avito_message, processing_outcome_from_result
 from src.freelance_leads_bot.integrations.codex_planner import CodexPlannerRunner
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import ExpertRagStore
@@ -370,11 +370,7 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
 
 
 def _dedup_allowed(result: dict[str, Any]) -> bool:
-    if not isinstance(result, dict):
-        return False
-    if result.get("ok") is not True:
-        return False
-    return str(result.get("processing_status") or "processed") in {"processed", "queued", "ignored"}
+    return processing_outcome_from_result(result).safe_to_dedup
 
 
 async def _list_recent_chats(reader: AvitoReadClient, account_id: int, *, chat_limit: int) -> list[dict[str, Any]]:

@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,36 @@ SAFE_IGNORE_REASONS = {
     "own_message",
     "empty",
 }
+
+
+@dataclass(frozen=True)
+class ProcessingOutcome:
+    """Shared processing decision for webhook, debounce worker and missed-poller dedup."""
+
+    status: str
+    ok: bool
+    safe_to_dedup: bool
+    reason: str = ""
+
+
+def processing_outcome_from_result(result: dict[str, Any]) -> ProcessingOutcome:
+    if not isinstance(result, dict):
+        return ProcessingOutcome(status="retryable_error", ok=False, safe_to_dedup=False, reason="invalid_result")
+    status = str(result.get("processing_status") or "").strip()
+    if not status:
+        if result.get("ignored"):
+            status = "ignored"
+        elif result.get("ok") is True:
+            status = "processed"
+        else:
+            status = "retryable_error"
+    reason = str(result.get("reason") or "").strip()
+    if status in {"processed", "queued"}:
+        return ProcessingOutcome(status=status, ok=True, safe_to_dedup=True, reason=reason)
+    if status == "ignored":
+        safe = reason in SAFE_IGNORE_REASONS
+        return ProcessingOutcome(status=status, ok=bool(result.get("ok")) and safe, safe_to_dedup=safe, reason=reason)
+    return ProcessingOutcome(status="retryable_error", ok=False, safe_to_dedup=False, reason=reason or status)
 
 
 def _log_webhook(row: dict[str, Any]) -> None:
@@ -804,12 +834,7 @@ def _processing_error(send_result: Any, handoff_result: Any, had_handoff: bool, 
 
 
 def _dedup_allowed(result: dict[str, Any]) -> bool:
-    status = str(result.get("processing_status") or "")
-    if status in {"processed", "queued"}:
-        return True
-    if status == "ignored":
-        return str(result.get("reason") or "") in SAFE_IGNORE_REASONS
-    return bool(result.get("ok") and result.get("ignored") and str(result.get("reason") or "") in SAFE_IGNORE_REASONS)
+    return processing_outcome_from_result(result).safe_to_dedup
 
 
 def _is_empty_chat_prompt(message: Any) -> bool:
