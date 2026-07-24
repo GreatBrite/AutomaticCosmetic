@@ -35,10 +35,13 @@ JSON для автоматизации:
 - `avito_autoreply_failures`: failed delayed auto-reply попытки. Это error.
 - `expert_rag`: есть ли approved RAG-знания.
 - `expert_rag_needs_review`: есть знания, которые бот не должен использовать сам, пока их не подтвердили.
+- `expert_rag_temporal_cleanup`: approved-знания с датами, временем, окнами, адресами, акциями или конкретными договорённостями без expiry.
 - `data_footprint`: размер `data/` и крупнейшие файлы/директории.
 - `disk_free_space`: свободное место на диске.
 
 В строке `RAG` поле `high_risk_approved` показывает approved-знания с медицинским/рисковым контекстом. Поле `excluded_from_avito_autoanswer` должно совпадать с ним: такие знания не передаются в Avito autoanswer/planner context и остаются только для контролируемого review/аналитики.
+
+Поля `temporal_without_expiry` и `temporal_needs_cleanup` нужны для старых дат/окон/адресов: такие знания должны быть либо `autoanswer_allowed=false`, либо иметь `expires_at`/`valid_until`. Новые временные ответы Ольги сохраняются как память, но автоматически блокируются от autoanswer без expiry.
 
 ## Текущий нормальный WARN
 

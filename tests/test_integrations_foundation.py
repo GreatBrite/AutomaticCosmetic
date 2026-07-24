@@ -9207,6 +9207,50 @@ def test_ops_status_json_redacts_secrets_and_keeps_secret_required_flag(tmp_path
     assert payload["flags"]["yclients_integration_secret_required"] is True
 
 
+def test_ops_status_reports_temporal_rag_cleanup_separately(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(rag_path)
+    store.upsert_from_handoff(
+        question="Когда можно на губы?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    store.upsert_from_handoff(
+        question="Какой адрес завтра?",
+        answer_client="Адрес завтра уточняем отдельно.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": False},
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    check = next(check for check in report.checks if check.name == "expert_rag_temporal_cleanup")
+    text = format_ops_status_report(report)
+
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert report.summary["rag_approved_temporal_without_expiry"] == 2
+    assert report.summary["rag_temporal_blocked_from_autoanswer"] == 1
+    assert report.summary["rag_temporal_needs_cleanup"] == 1
+    assert "temporal_without_expiry=2" in text
+    assert "temporal_needs_cleanup=1" in text
+
+
 def test_ops_status_human_summary_marks_high_risk_rag_as_excluded_from_avito_autoanswer(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"

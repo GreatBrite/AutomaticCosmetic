@@ -29,6 +29,15 @@ DEFAULT_DISK_FREE_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_DISK_FREE_WARNING_RATIO = 0.10
 SENSITIVE_QUERY_RE = re.compile(r"([?&](?:secret|token|access_token|client_secret|api_key|key)=)[^&#\s]+", re.IGNORECASE)
 SAFE_SECRET_FLAG_KEYS = {"secret_required", "yclients_integration_secret_required"}
+TEMPORAL_RAG_RE = re.compile(
+    r"(?iu)\b("
+    r"сегодня|завтра|послезавтра|вчера|"
+    r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|"
+    r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|"
+    r"\d{1,2}:\d{2}|"
+    r"окн[оа]|слот|запис[ьи]|адрес|акци[яи]|скидк|договор[её]н"
+    r")\b"
+)
 
 DEFAULT_SERVICES = (
     "freelance-leads-bot.service",
@@ -270,6 +279,8 @@ def build_ops_status_report(
     rag = read_rag_status(rag_db)
     rag_approved = int(rag.get("approved_count") or 0)
     rag_needs_review = int(rag.get("needs_review_count") or 0)
+    rag_temporal_without_expiry = int(rag.get("approved_temporal_without_expiry_count") or 0)
+    rag_temporal_needs_cleanup = int(rag.get("temporal_needs_cleanup_count") or 0)
     rag_needs_review_ids = rag.get("needs_review_ids") if isinstance(rag.get("needs_review_ids"), list) else []
     checks.append(
         OpsCheck(
@@ -296,6 +307,17 @@ def build_ops_status_report(
                 "python -m src.freelance_leads_bot.integrations.expert_rag_review decisions data/expert_rag_review.md; "
                 "then add --apply only after the dry-run is correct."
             ),
+            rag,
+        )
+    )
+    checks.append(
+        OpsCheck(
+            "expert_rag_temporal_cleanup",
+            rag_temporal_needs_cleanup == 0,
+            "warning",
+            "No approved temporal expert RAG items can autoanswer without expiry."
+            if rag_temporal_needs_cleanup == 0
+            else f"{rag_temporal_needs_cleanup} approved temporal expert RAG items need autoanswer cleanup.",
             rag,
         )
     )
@@ -370,6 +392,9 @@ def build_ops_status_report(
         "rag_high_risk_excluded_from_avito_autoanswer": rag.get("approved_high_risk_count", 0),
         "rag_needs_review": rag_needs_review,
         "rag_needs_review_ids": rag_needs_review_ids,
+        "rag_approved_temporal_without_expiry": rag_temporal_without_expiry,
+        "rag_temporal_blocked_from_autoanswer": rag.get("temporal_blocked_from_autoanswer_count", 0),
+        "rag_temporal_needs_cleanup": rag_temporal_needs_cleanup,
         "data_total_bytes": data_total,
         "data_largest_path": largest_entry.get("path", ""),
         "data_largest_bytes": largest_entry_size,
@@ -610,10 +635,31 @@ def read_telegram_handoff_status(path: Path, *, now: int | None = None) -> dict[
 
 def read_rag_status(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"exists": False, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0, "needs_review_ids": []}
-    result = {"exists": True, "path": str(path), "approved_count": 0, "approved_high_risk_count": 0, "needs_review_count": 0, "needs_review_ids": []}
+        return {
+            "exists": False,
+            "path": str(path),
+            "approved_count": 0,
+            "approved_high_risk_count": 0,
+            "needs_review_count": 0,
+            "needs_review_ids": [],
+            "approved_temporal_without_expiry_count": 0,
+            "temporal_blocked_from_autoanswer_count": 0,
+            "temporal_needs_cleanup_count": 0,
+        }
+    result = {
+        "exists": True,
+        "path": str(path),
+        "approved_count": 0,
+        "approved_high_risk_count": 0,
+        "needs_review_count": 0,
+        "needs_review_ids": [],
+        "approved_temporal_without_expiry_count": 0,
+        "temporal_blocked_from_autoanswer_count": 0,
+        "temporal_needs_cleanup_count": 0,
+    }
     try:
         with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
             for status, risk_level, count in conn.execute(
                 "SELECT status, risk_level, COUNT(*) FROM expert_answers GROUP BY status, risk_level"
             ):
@@ -628,6 +674,22 @@ def read_rag_status(path: Path) -> dict[str, Any]:
                 int(row[0])
                 for row in conn.execute("SELECT id FROM expert_answers WHERE status = ? ORDER BY updated_at DESC, id DESC LIMIT 5", ("needs_review",)).fetchall()
             ]
+            for row in conn.execute(
+                """
+                SELECT question_canonical, answer_client, answer_internal, topic, expires_at, metadata
+                FROM expert_answers
+                WHERE status = 'approved'
+                """
+            ):
+                metadata = _parse_metadata(row["metadata"])
+                text = "\n".join(str(row[key] or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
+                has_expiry = bool(str(row["expires_at"] or "") or metadata.get("valid_until") or metadata.get("expires_at"))
+                if not has_expiry and TEMPORAL_RAG_RE.search(text):
+                    result["approved_temporal_without_expiry_count"] += 1
+                    if metadata.get("autoanswer_allowed") is False:
+                        result["temporal_blocked_from_autoanswer_count"] += 1
+                    else:
+                        result["temporal_needs_cleanup_count"] += 1
     except sqlite3.Error as exc:
         result.update({"error": type(exc).__name__, "approved_count": 0, "needs_review_ids": []})
     return result
@@ -648,6 +710,16 @@ def _parse_iso_timestamp(value: str) -> int:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return int(parsed.timestamp())
+
+
+def _parse_metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def read_systemd_service_states(services: tuple[str, ...] = DEFAULT_SERVICES) -> dict[str, str]:
@@ -718,6 +790,8 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f" high_risk_approved={summary.get('rag_high_risk_approved', 0)}"
             f" excluded_from_avito_autoanswer={summary.get('rag_high_risk_excluded_from_avito_autoanswer', 0)}"
             f" needs_review={summary.get('rag_needs_review', 0)}"
+            f" temporal_without_expiry={summary.get('rag_approved_temporal_without_expiry', 0)}"
+            f" temporal_needs_cleanup={summary.get('rag_temporal_needs_cleanup', 0)}"
         ),
         (
             f"Care: stale_visit_details={summary.get('care_stale_needs_details', 0)}"
