@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     temporal_parser.add_argument("--limit", type=int, default=200, help="Maximum approved items to scan.")
     temporal_parser.add_argument("--apply", action="store_true", help="Apply metadata changes. Default is dry-run.")
+    temporal_parser.add_argument("--output", type=Path, help="Write dry-run/apply review report to this file.")
 
     return parser
 
@@ -168,6 +169,7 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
             limit=args.limit,
             apply=args.apply,
             as_json=args.json,
+            output_path=args.output,
         )
 
     return 2, "Unsupported command."
@@ -354,6 +356,7 @@ def _run_temporal_cleanup_command(
     limit: int,
     apply: bool,
     as_json: bool,
+    output_path: Path | None = None,
 ) -> tuple[int, str]:
     planned = _temporal_cleanup_plan(store, limit=limit)
     applied: list[dict[str, Any]] = []
@@ -380,6 +383,15 @@ def _run_temporal_cleanup_command(
         "applied_count": len(applied),
         "planned": applied if apply else planned,
     }
+    if output_path:
+        content = json.dumps(payload, ensure_ascii=False, indent=2) if as_json else _format_temporal_cleanup_markdown(payload)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content + "\n", encoding="utf-8")
+        return 0, _json_or_text(
+            as_json,
+            {"ok": True, "path": str(output_path), "planned_count": len(planned), "applied_count": len(applied), "dry_run": not apply},
+            f"Exported temporal RAG cleanup report to {output_path}. Planned={len(planned)}, applied={len(applied)}.",
+        )
     return 0, _json_or_text(as_json, payload, _format_temporal_cleanup(payload))
 
 
@@ -400,6 +412,11 @@ def _temporal_cleanup_plan(store: ExpertRagStore, *, limit: int) -> list[dict[st
                 "status": item.status,
                 "question": item.question_canonical,
                 "answer_client": item.answer_client,
+                "answer_internal": item.answer_internal,
+                "topic": item.topic,
+                "service": item.service,
+                "city": item.city,
+                "risk_level": item.risk_level,
                 "reason": "temporal_without_expiry",
             }
         )
@@ -533,6 +550,60 @@ def _format_temporal_cleanup(payload: dict[str, Any]) -> str:
             lines.append(f"  A: {_short(str(entry['answer_client']), 120)}")
     if payload.get("dry_run") and planned:
         lines.append("No changes were applied. Re-run with --apply to set autoanswer_allowed=false.")
+    return "\n".join(lines)
+
+
+def _format_temporal_cleanup_markdown(payload: dict[str, Any]) -> str:
+    planned = payload.get("planned") if isinstance(payload.get("planned"), list) else []
+    mode = "DRY RUN" if payload.get("dry_run") else "APPLY"
+    lines = [
+        "# Expert RAG Temporal Cleanup",
+        "",
+        f"Mode: `{mode}`",
+        f"Planned: `{payload.get('planned_count', 0)}`, applied: `{payload.get('applied_count', 0)}`",
+        "",
+        "These approved RAG items contain dates, time windows, address/slot wording, promos, or one-off agreements without expiry. They should not be used as factual Avito autoanswers until Olga explicitly approves a stable formulation.",
+        "",
+        "Checklist before `--apply`:",
+        "",
+        "- [ ] Checked that items below are time-specific or one-off",
+        "- [ ] Confirmed they should remain available as context/style, not direct autoanswer",
+        "- [ ] If an item is actually a stable rule, edit it separately with an expiry or reusable wording before cleanup",
+    ]
+    if not planned:
+        lines.extend(["", "No approved temporal autoanswer items need cleanup."])
+        return "\n".join(lines)
+    for index, entry in enumerate(planned, start=1):
+        labels = ", ".join(
+            str(value)
+            for value in (
+                entry.get("topic"),
+                entry.get("service"),
+                entry.get("city"),
+                entry.get("risk_level"),
+            )
+            if value
+        )
+        lines.extend(
+            [
+                "",
+                f"## {index}. #{entry.get('id')} `{entry.get('reason') or 'temporal_without_expiry'}`",
+                "",
+                f"- Status: `{entry.get('status') or '-'}`",
+                f"- Labels: `{labels or '-'}`",
+                f"- Applied: `{bool(entry.get('applied'))}`",
+                "",
+                "Question:",
+                "",
+                f"> {_quote_markdown(str(entry.get('question') or '-'))}",
+                "",
+                "Client answer:",
+                "",
+                f"> {_quote_markdown(str(entry.get('answer_client') or '-'))}",
+            ]
+        )
+        if entry.get("answer_internal"):
+            lines.extend(["", "Internal note:", "", f"> {_quote_markdown(str(entry.get('answer_internal') or '-'))}"])
     return "\n".join(lines)
 
 

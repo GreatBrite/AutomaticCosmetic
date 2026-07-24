@@ -6848,6 +6848,32 @@ def test_expert_rag_review_temporal_cleanup_dry_run_and_apply(tmp_path) -> None:
     assert "temporal_cleanup" in audit_path.read_text(encoding="utf-8")
 
 
+def test_expert_rag_review_temporal_cleanup_exports_markdown_without_mutation(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    output_path = tmp_path / "temporal_cleanup.md"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Когда есть окно на губы в Ростове?",
+        answer_client="Завтра есть окно на 15:00 в Ростове.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+
+    code, output = run_review_command(["--db", str(db_path), "temporal-cleanup", "--output", str(output_path)])
+    markdown = output_path.read_text(encoding="utf-8")
+    unchanged = store.get(item.id)
+
+    assert code == 0
+    assert "Exported temporal RAG cleanup report" in output
+    assert "# Expert RAG Temporal Cleanup" in markdown
+    assert f"#{item.id}" in markdown
+    assert "Checklist before `--apply`" in markdown
+    assert "Завтра есть окно на 15:00 в Ростове." in markdown
+    assert unchanged is not None
+    assert unchanged.metadata["autoanswer_allowed"] is True
+
+
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     expert = ExpertRagStore(tmp_path / "expert.sqlite3")

@@ -46,9 +46,11 @@ JSON для автоматизации:
 Почистить старые временные approved-знания безопасно через dry-run:
 
 ```bash
-.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --output data/expert_rag_temporal_cleanup.md
 .venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --apply
 ```
+
+Сначала открой `data/expert_rag_temporal_cleanup.md`: там перечислены approved-знания с датами, окнами, адресами, акциями или разовыми договорённостями без expiry. Dry-run export ничего не меняет в базе. `--apply` только выставляет `autoanswer_allowed=false`, `temporal_fact=true` и `autoanswer_block_reason=temporal_without_expiry`, то есть знание остаётся в памяти как контекст/пример, но перестаёт быть прямым factual autoanswer.
 
 ## Текущий нормальный WARN
 
