@@ -133,9 +133,14 @@ def build_production_readiness_report(
         "ops_status": ops_payload,
         "ops_status_text": format_ops_status_report(ops_report),
         "open_handoffs": {
-            key: value
-            for key, value in handoffs.items()
-            if key not in {"items"}
+            **{
+                key: value
+                for key, value in handoffs.items()
+                if key not in {"items"}
+            },
+            "export_command": "python scripts/export_open_handoffs.py --output data/open_handoffs_review.md",
+            "dry_run_decisions_command": "python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md",
+            "apply_decisions_command": "python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md --apply-decisions",
         },
         "manual_closure_audit": {
             "handoff_manual_closed_without_client_reply": handoff_manual_no_reply,
@@ -213,6 +218,16 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
     samples = report.get("open_handoff_samples") if isinstance(report.get("open_handoff_samples"), list) else []
     for item in samples[:5]:
         lines.append(f"- `{item.get('avito_chat_id') or '-'}` {item.get('client_name') or 'Без имени'}: {item.get('age_hours')}h, critical={item.get('critical')}")
+    lines.extend(
+        [
+            "",
+            "```bash",
+            str(handoffs.get("export_command") or ""),
+            str(handoffs.get("dry_run_decisions_command") or ""),
+            str(handoffs.get("apply_decisions_command") or ""),
+            "```",
+        ]
+    )
     temporal = report.get("temporal_rag_cleanup") if isinstance(report.get("temporal_rag_cleanup"), dict) else {}
     poller = report.get("poller_coverage") if isinstance(report.get("poller_coverage"), dict) else {}
     avito_promises = report.get("avito_promises") if isinstance(report.get("avito_promises"), dict) else {}

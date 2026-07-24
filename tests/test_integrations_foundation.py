@@ -10335,6 +10335,8 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert report["avito_promises"]["pending"] == 1
     assert report["avito_promises"]["critical"] == 1
     assert report["avito_promises"]["overdue"] == 1
+    assert report["open_handoffs"]["export_command"] == "python scripts/export_open_handoffs.py --output data/open_handoffs_review.md"
+    assert "--decisions data/open_handoffs_review.md" in report["open_handoffs"]["dry_run_decisions_command"]
     assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
     assert "--decisions data/expert_rag_temporal_cleanup.md" in report["temporal_rag_cleanup"]["dry_run_decisions_command"]
     assert report["backup_restore_verify"]["ok"] is True
@@ -10343,6 +10345,8 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert "Review open Olga handoffs" in markdown
     assert "Review /avito_followups: pending=1, critical=1, overdue=1" in "\n".join(report["manual_actions"])
     assert "Pending: `1`, critical: `1`, overdue: `1`" in markdown
+    assert "python scripts/export_open_handoffs.py --output data/open_handoffs_review.md" in markdown
+    assert "python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md --apply-decisions" in markdown
     assert "Fix Avito missed-poller coverage: latest summary scanned 20/150 chats" in "\n".join(report["manual_actions"])
     assert "mark per-item decisions" in "\n".join(report["manual_actions"])
     assert "Latest chats: `20/150`" in markdown
