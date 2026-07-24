@@ -343,6 +343,8 @@ def sync_pending_followups(
             classification = _classify_client_message(client_text)
             key = _followup_key(account_id=account_id, chat_id=chat_id, message_id=message_id)
             row = pending.get(key) if isinstance(pending.get(key), dict) else {}
+            if _followup_row_is_manually_closed(row):
+                continue
             row.update(
                 {
                     "account_id": account_id,
@@ -427,6 +429,18 @@ def pending_followup_rows(state: dict[str, Any], *, now: int, include_resolved: 
         rows.append(item)
     rows.sort(key=lambda item: (0 if item.get("business_status") == "overdue" else 1, -int(item.get("urgent") is True), int(item.get("promised_at") or 0)))
     return rows
+
+
+def _followup_row_is_manually_closed(row: dict[str, Any]) -> bool:
+    if not isinstance(row, dict) or not row.get("business_resolved"):
+        return False
+    status = str(row.get("business_status") or "").strip()
+    reason = str(row.get("close_reason") or "").strip()
+    return status in {"not_relevant", "manual_closed", "closed_manual_no_client_reply"} or reason in {
+        "not_relevant",
+        "manual_closed",
+        "closed_manual_no_client_reply",
+    }
 
 
 def _state_key(item: UnansweredChat) -> str:

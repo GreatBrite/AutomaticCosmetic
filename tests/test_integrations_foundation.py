@@ -2371,6 +2371,46 @@ def test_client_message_router_routes_high_confidence_rag_answer() -> None:
     assert route.service_key == "yagodicy"
 
 
+def test_client_message_router_handoffs_aesthetic_volume_expectations() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-expectation",
+            chat_id="chat-expectation",
+            text="300 мл хватит на грудь, будет плюс один размер?",
+        )
+    )
+
+    assert route.route == "expert_expectation_handoff"
+    assert route.handoff_reason == HandoffReason.MISSING_DATA.value
+    assert route.block_autoanswer_reason == "aesthetic_expectation_guard"
+    assert route.metadata["reason"] == "нельзя автообещать результат по мл"
+
+
+def test_client_message_router_allows_price_only_volume_rag_answer() -> None:
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-price-volume",
+        chat_id="chat-price-volume",
+        text="Сколько стоит 300 мл ягодицы?",
+    )
+
+    route = route_client_message(
+        message,
+        retrieved_expert_answers=[
+            {
+                "answer_client": "300 мл Tesoro Body стоит 75 000.",
+                "score": 0.91,
+                "_retrieval_safe_for_autoanswer": True,
+            }
+        ],
+        autoanswer_threshold=0.82,
+    )
+
+    assert route.route == "rag_answer"
+    assert route.service_key == "yagodicy"
+
+
 def test_client_message_router_blocks_risk_address_and_media() -> None:
     risk = route_client_message(
         InboundMessage(
@@ -2452,6 +2492,26 @@ async def test_avito_consultant_creates_booking_critical_handoff(tmp_path) -> No
     assert reply.handoff is not None
     assert reply.handoff.reason == HandoffReason.BOOKING_CRITICAL
     assert "подтверж" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_handoffs_aesthetic_volume_expectation(tmp_path) -> None:
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-expectation",
+            "content": {"text": "300 мл хватит на грудь? Будет заметный результат?"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.MISSING_DATA
+    assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
+    assert "нельзя автообещать результат по мл" in reply.handoff.summary
 
 
 @pytest.mark.anyio
@@ -3674,12 +3734,12 @@ async def test_codex_tool_loop_allows_silent_handoff_for_before_after_assets() -
     reply = await consultant.respond(message)
 
     assert reply.action == "handoff"
-    assert reply.reply == ""
+    assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
     assert reply.handoff is not None
     assert reply.handoff.reason == "missing_data"
-    assert "Клиенту пока ничего не писали" in reply.handoff.summary
+    assert "Клиенту уже ответили" in reply.handoff.summary
     assert "Нужно у Ольги" not in reply.handoff.summary
-    assert "Нужно: фото до/после" in reply.handoff.summary
+    assert "нельзя автообещать результат по мл" in reply.handoff.summary
 
 
 @pytest.mark.anyio
@@ -5924,6 +5984,47 @@ def test_shared_rag_retrieval_blocks_temporal_autoanswer_without_expiry(tmp_path
     assert result.handoff_reason == "no_approved_knowledge"
 
 
+def test_shared_rag_retrieval_blocks_aesthetic_volume_result_promise(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="grud", title="Грудь", aliases=("грудь",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="300 мл даст плюс один размер груди?",
+        answer_client="300 мл по груди даст заметный результат и примерно +1 размер.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "grud", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="300 мл даст плюс один размер груди?", min_score=0.0)
+    )
+
+    assert result.answers == ()
+    assert result.safe_for_autoanswer is False
+    assert result.handoff_reason == "no_approved_knowledge"
+
+
+def test_shared_rag_retrieval_allows_price_only_volume_answer(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="yagodicy", title="Ягодицы", aliases=("ягодицы",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="Сколько стоит 300 мл ягодицы?",
+        answer_client="300 мл Tesoro Body стоит 75 000.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "yagodicy", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="Сколько стоит 300 мл ягодицы?", min_score=0.0)
+    )
+
+    assert result.answers
+    assert result.safe_for_autoanswer is True
+
+
 @pytest.mark.anyio
 async def test_telegram_rag_plan_cancel_and_details_callbacks(tmp_path) -> None:
     class FakeBot:
@@ -6762,6 +6863,32 @@ def test_pending_followup_keeps_client_photo_urls_for_olga_card() -> None:
 
     assert rows[0]["last_client_message"] == "[фото]"
     assert rows[0]["last_client_photo_urls"] == ["https://img.example/big.jpg"]
+
+
+def test_pending_followup_not_relevant_does_not_reopen_same_promise() -> None:
+    chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Анна"}]}
+    messages = [
+        {"id": "m-client-1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "Жду адрес"}},
+        {"id": "m-bot-1", "author_id": 1, "direction": "out", "type": "text", "created": 160, "content": {"text": "Уточню точный адрес и вернусь с ответом."}},
+    ]
+    state: dict[str, object] = {}
+    sync_pending_followups(account_id=1, chat=chat, messages=messages, state=state, now=4000, reminder_seconds=1800, escalation_seconds=7200)
+    key = next(iter(state["pending_followups"]))  # type: ignore[index]
+    state["pending_followups"][key].update(  # type: ignore[index]
+        {
+            "business_status": "not_relevant",
+            "business_resolved": True,
+            "close_reason": "not_relevant",
+            "closed_by": "olga",
+        }
+    )
+
+    sync_pending_followups(account_id=1, chat=chat, messages=messages, state=state, now=5000, reminder_seconds=1800, escalation_seconds=7200)
+
+    assert pending_followup_rows(state, now=5000) == []
+    all_rows = pending_followup_rows(state, now=5000, include_resolved=True)
+    assert all_rows[0]["business_status"] == "not_relevant"
+    assert all_rows[0]["business_resolved"] is True
 
 
 def test_pending_followup_alert_includes_business_context_and_action() -> None:
@@ -8415,6 +8542,34 @@ def test_codex_review_can_revise_or_handoff_bad_draft() -> None:
     assert handoff.action == "handoff"
     assert handoff.handoff is not None
     assert handoff.handoff.reason == "missing_data"
+
+
+def test_codex_review_guard_handoffs_aesthetic_volume_promise() -> None:
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-review", "text": "300 мл хватит на грудь?"})
+    decision = AvitoConsultantReply(action="codex_reply", reply="300 мл по груди даст заметный результат и примерно плюс один размер.")
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "ok"})
+
+    assert reviewed.action == "handoff"
+    assert reviewed.handoff is not None
+    assert reviewed.handoff.reason == HandoffReason.MISSING_DATA
+    assert reviewed.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
+    assert reviewed.metadata["aesthetic_expectation_guard"]["reason"] == "aesthetic_expectation_guard"
+
+
+def test_codex_review_guard_allows_explicit_olga_aesthetic_formula() -> None:
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-review", "text": "Что даст 300 мл?"})
+    decision = AvitoConsultantReply(
+        action="codex_reply",
+        reply="300 мл для ягодиц — минимальный объём: можно скорректировать небольшие дефекты, выраженный результат по фото и ожиданиям оценивает Ольга.",
+        metadata={"olga_approved_aesthetic_formula": True},
+    )
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "approved Olga wording"})
+
+    assert reviewed.action == "codex_reply"
+    assert "минимальный объём" in reviewed.reply
+    assert "aesthetic_expectation_guard" not in reviewed.metadata
 
 
 def test_consultation_guard_removes_offline_and_final_hedge() -> None:

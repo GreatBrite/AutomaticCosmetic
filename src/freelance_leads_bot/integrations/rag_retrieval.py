@@ -15,6 +15,11 @@ TEMPORAL_FACT_RE = re.compile(
     r"\b\d{1,2}\s*(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b|"
     r"\b\d{1,2}:\d{2}\b|есть\s+окн|свободн|можно\s+запис|адрес)"
 )
+AESTHETIC_PROMISE_RE = re.compile(
+    r"(?iu)(?=.*(?:\b\d{2,5}\s*(?:мл|милли?литр\w*)\b|(?:^|[^\d])(?:300|400|1200)(?:[^\d]|$)|объ[её]м))"
+    r"(?=.*(?:груд|ягод|поп|тесоро|tesoro))"
+    r"(?=.*(?:размер|\+\s*1|плюс\s+один|заметн\w+|ярк\w+|выраженн\w+|результат|увелич\w+|хватит|достаточн\w+|до\s*/?\s*после))"
+)
 
 
 @dataclass(frozen=True)
@@ -147,9 +152,11 @@ def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
     if answer.get("status") != APPROVED or metadata.get("autoanswer_allowed") is False:
         return False
+    text = "\n".join(str(answer.get(key) or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
+    if metadata.get("olga_approved_aesthetic_formula") is not True and AESTHETIC_PROMISE_RE.search(text):
+        return False
     if answer.get("expires_at") or metadata.get("valid_until") or metadata.get("expires_at"):
         return True
-    text = "\n".join(str(answer.get(key) or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
     return not TEMPORAL_FACT_RE.search(text)
 
 

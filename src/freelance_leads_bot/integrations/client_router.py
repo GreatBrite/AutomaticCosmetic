@@ -41,6 +41,12 @@ BOOKING_CRITICAL_RE = re.compile(
     r"жд[уеё]т|я жду|вы забыли|забыли|не ответил|долго|что делать|отзыв|жалоб|"
     r"сегодня.*приход|завтра.*приход|можно.*опозда|опозда)"
 )
+AESTHETIC_VOLUME_RE = re.compile(r"(?iu)(?:\b\d{2,5}\s*(?:мл|милли?литр\w*)\b|(?:^|[^\d])(?:300|400|1200)(?:[^\d]|$)|объ[её]м)")
+AESTHETIC_RESULT_RE = re.compile(
+    r"(?iu)(размер|\+\s*1|плюс\s+один|заметн\w+|ярк\w+|выраженн\w+|результат|"
+    r"увелич\w+|хватит|достаточн\w+|как\s+будет|до\s*/?\s*после|сколько\s+надо|сколько\s+нужно)"
+)
+AESTHETIC_BODY_RE = re.compile(r"(?iu)(груд|ягод|поп|тесоро|tesoro)")
 
 
 def route_client_message(
@@ -55,6 +61,17 @@ def route_client_message(
     city = _explicit_city(text, conversation_history)
     service_key = _service_key_from_text(text)
     has_service_hint = bool(SERVICE_HINT_RE.search(lowered) or _history_service_hint(conversation_history))
+
+    if _aesthetic_expectation_question(lowered, conversation_history):
+        return ClientRoute(
+            route="expert_expectation_handoff",
+            city=city,
+            service_key=service_key,
+            risk_flags=("expert_expectation",),
+            handoff_reason=HandoffReason.MISSING_DATA.value,
+            block_autoanswer_reason="aesthetic_expectation_guard",
+            metadata={"guard": "aesthetic_expectation_guard", "reason": "нельзя автообещать результат по мл"},
+        )
 
     if _booking_critical(lowered, conversation_history):
         return ClientRoute(
@@ -139,6 +156,17 @@ def _has_media(message: InboundMessage) -> bool:
         or has_unresolved_voice
         or metadata.get("voice_transcription_error")
     )
+
+
+def _aesthetic_expectation_question(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
+    history_text = " ".join(str(item.get("content") or "") for item in conversation_history[-8:]).casefold().replace("ё", "е")
+    source = " ".join(part for part in (lowered, history_text) if part)
+    has_volume = bool(AESTHETIC_VOLUME_RE.search(lowered))
+    has_result = bool(AESTHETIC_RESULT_RE.search(lowered))
+    has_body = bool(AESTHETIC_BODY_RE.search(source))
+    if has_volume and has_result:
+        return True
+    return has_body and has_result and bool(re.search(r"(?iu)(фото|до\s*/?\s*после|как\s+будет|сколько\s+надо|сколько\s+нужно)", lowered))
 
 
 def _booking_critical(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:

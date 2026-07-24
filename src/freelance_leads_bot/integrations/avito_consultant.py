@@ -305,6 +305,13 @@ class AvitoConsultant:
                 reply=_booking_critical_client_reply(context.message),
                 reason=HandoffReason.BOOKING_CRITICAL,
             )
+        if route.route == "expert_expectation_handoff":
+            return self._route_handoff_reply(
+                context,
+                route,
+                reply="По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее.",
+                reason=HandoffReason.MISSING_DATA,
+            )
         if route.route in {"booking_read", "address"}:
             return await self._fallback_response(context)
         return None
@@ -317,15 +324,19 @@ class AvitoConsultant:
         reply: str,
         reason: HandoffReason,
     ) -> AvitoConsultantReply:
+        summary = self.handoff_composer.compose(
+            message=context.message,
+            route=route,
+            retrieved_answers=context.retrieved_expert_answers,
+            client_replied=bool(reply),
+        )
+        guard_reason = str((route.metadata or {}).get("reason") or "").strip()
+        if guard_reason:
+            summary = f"{summary}\nПричина guard: {guard_reason}"
         handoff = Handoff(
             reason=reason,
             message=context.message,
-            summary=self.handoff_composer.compose(
-                message=context.message,
-                route=route,
-                retrieved_answers=context.retrieved_expert_answers,
-                client_replied=bool(reply),
-            ),
+            summary=summary,
         )
         return AvitoConsultantReply(
             action="handoff",
