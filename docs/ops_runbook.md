@@ -337,17 +337,42 @@ sudo systemctl enable --now automaticcosmetic-backup.timer
 
 SQLite копируется через безопасный sqlite backup API в `backups/sqlite-*/`. JSON-state и `.env` архивируются отдельно в `backups/runtime-json-env-*.tar.gz` с правами `0600`.
 
-Restore:
+Проверка restore без записи в live `data/`:
 
 ```bash
-systemctl stop freelance-leads-bot.service yclients-avito-webhook.service yclients-yclients-integration.service
+.venv/bin/python scripts/verify_runtime_backup.py --backup-dir backups --restore-dir /tmp/automaticcosmetic-restore-check
+```
+
+Команда распаковывает `runtime-json-env-*.tar.gz` в отдельную папку, копирует SQLite из `sqlite-*` туда же и прогоняет `PRAGMA integrity_check`. Если нужно проверить конкретную дату, укажи stamp:
+
+```bash
+.venv/bin/python scripts/verify_runtime_backup.py --backup-dir backups --stamp YYYYMMDDTHHMMSSZ --restore-dir /tmp/automaticcosmetic-restore-check
+```
+
+Backup содержит `.env` и может содержать `data/mfa_totp.json`, то есть внутри есть реальные секреты. Такой архив нельзя отправлять подрядчикам, в GitHub issue или в чат без шифрования/очистки.
+
+Реальный restore в production делать только после успешной проверки выше:
+
+```bash
+systemctl stop freelance-leads-bot.service \
+  yclients-avito-webhook.service \
+  yclients-avito-missed-poller.service \
+  yclients-avito-unanswered-monitor.service \
+  yclients-yclients-integration.service \
+  yclients-visit-confirmations.timer \
+  yclients-visit-confirmations.service
 cp backups/sqlite-YYYYMMDDTHHMMSSZ/*.sqlite3 data/
 tar -xzf backups/runtime-json-env-YYYYMMDDTHHMMSSZ.tar.gz -C /root/AutomaticCosmetic
-systemctl start yclients-yclients-integration.service yclients-avito-webhook.service freelance-leads-bot.service
+systemctl start yclients-yclients-integration.service \
+  yclients-avito-webhook.service \
+  yclients-avito-missed-poller.service \
+  yclients-avito-unanswered-monitor.service \
+  freelance-leads-bot.service
+systemctl start yclients-visit-confirmations.timer
 .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
 ```
 
-Перед restore проверить, что архив именно нужной даты.
+Перед restore проверить, что архив именно нужной даты, и сохранить копию текущего `data/`/`.env` отдельно, если есть риск отката не туда.
 
 ## Log rotation
 

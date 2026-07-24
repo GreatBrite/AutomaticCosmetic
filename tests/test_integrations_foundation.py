@@ -174,6 +174,7 @@ from scripts.avito_missed_message_poller import _list_recent_chats as list_recen
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.export_open_handoffs import build_open_handoffs_export, format_open_handoffs_markdown
+from scripts.verify_runtime_backup import verify_runtime_backup
 from scripts.avito_live_telegram_relay import (
     compact_handoff_event,
     compact_relay_event,
@@ -9604,6 +9605,38 @@ def test_backup_runtime_data_copies_sqlite_and_archives_json_env(tmp_path) -> No
         names = archive.getnames()
     assert "data/state.json" in names
     assert ".env" in names
+
+
+def test_verify_runtime_backup_restores_to_isolated_dir_and_checks_integrity(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    db_path = data_dir / "care.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO sample (name) VALUES ('olga')")
+    (data_dir / "state.json").write_text('{"ok": true}', encoding="utf-8")
+    (data_dir / "mfa_totp.json").write_text('{"secret": "totp"}', encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("TOKEN=secret\n", encoding="utf-8")
+    backup_dir = tmp_path / "backups"
+    backup_runtime_data(data_dir=data_dir, output_dir=backup_dir, env_path=env_path, now=1780000000)
+
+    result = verify_runtime_backup(
+        backup_dir=backup_dir,
+        restore_dir=tmp_path / "restore-check",
+        stamp="20260528T202640Z",
+    )
+
+    assert result["ok"] is True
+    assert result["restore_dir_persistent"] is True
+    assert result["contains_env"] is True
+    assert result["contains_mfa_totp"] is True
+    assert result["contains_sensitive_runtime_secrets"] is True
+    assert result["sqlite"][0]["integrity_check"] == "ok"
+    restored_db = Path(result["restore_dir"]) / "sqlite" / "care.sqlite3"
+    restored_state = Path(result["restore_dir"]) / "runtime" / "data" / "state.json"
+    assert restored_db.exists()
+    assert restored_state.read_text(encoding="utf-8") == '{"ok": true}'
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:
