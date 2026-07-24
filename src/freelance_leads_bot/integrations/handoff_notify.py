@@ -546,7 +546,7 @@ async def process_handoff_sla(
         if can_send_reminder:
             result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="reminder"))
             notifications.append(result)
-            if result.get("sent") or not result.get("error"):
+            if _notification_delivered(result):
                 ref["reminder_sent_at"] = now
                 ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
                 ref["updated_at"] = now
@@ -561,7 +561,7 @@ async def process_handoff_sla(
         if can_send_escalation:
             result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="escalation"))
             notifications.append(result)
-            if result.get("sent") or not result.get("error"):
+            if _notification_delivered(result):
                 ref["escalation_sent_at"] = now
                 ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
                 ref["updated_at"] = now
@@ -578,6 +578,16 @@ async def process_handoff_sla(
         "deduped": deduped,
         "notifications": notifications,
     }
+
+
+def _notification_delivered(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("sent") is True:
+        return True
+    if result.get("ok") is True and not result.get("error"):
+        return True
+    return result.get("reason") == "preview_only" and bool(result.get("outbox") or result.get("outbox_path"))
 
 
 def _canonical_handoff_sla_refs(refs: dict[str, dict], *, now: int) -> tuple[list[dict], int]:

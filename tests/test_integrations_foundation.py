@@ -9162,6 +9162,46 @@ async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(
 
 
 @pytest.mark.anyio
+async def test_handoff_sla_does_not_mark_failed_notifications_as_sent(tmp_path) -> None:
+    class EmptyNotifier:
+        def __init__(self) -> None:
+            self.texts = []
+
+        async def notify_text(self, text):
+            self.texts.append(text)
+            return {}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-critical",
+        handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
+        urgency="critical",
+        reason="booking_critical",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 5 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+
+    result = await process_handoff_sla(
+        EmptyNotifier(),
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=60 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+    )
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
+
+    assert result["reminders"] == 0
+    assert result["escalations"] == 0
+    assert updated.get("reminder_sent_at", 0) == 0
+    assert updated.get("escalation_sent_at", 0) == 0
+
+
+@pytest.mark.anyio
 async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(tmp_path) -> None:
     class FakeNotifier:
         def __init__(self) -> None:
