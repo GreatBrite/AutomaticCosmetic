@@ -8315,6 +8315,73 @@ def test_avito_turn_buffer_retries_failed_batch_before_removing_it(tmp_path) -> 
     assert after_processed == []
 
 
+def test_avito_webhook_deduplicates_after_successful_turn_debounce_queue(monkeypatch) -> None:
+    queued_calls: list[str] = []
+
+    def fake_enqueue(message, **kwargs):
+        queued_calls.append(message.message_id)
+        return {"queued": True, "chat_id": message.chat_id, "message_id": message.message_id, "messages": 1, "process_after": 1780000000}
+
+    monkeypatch.setattr(avito_webhook_module, "enqueue_avito_turn_message", fake_enqueue)
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: replace(_settings(), avito_turn_debounce_seconds=30)
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    event = {
+        "type": "message",
+        "message_id": "debounce-1",
+        "chat_id": "chat-debounce",
+        "content": {"text": "Здравствуйте"},
+    }
+    try:
+        client = TestClient(avito_app)
+        first = client.post("/avito/webhook?token=webhook", json=event)
+        second = client.post("/avito/webhook?token=webhook", json=event)
+
+        assert first.status_code == 200
+        assert first.json()["processing_status"] == "queued"
+        assert first.json()["queued"] is True
+        assert second.json()["ignored"] is True
+        assert second.json()["reason"] == "duplicate"
+        assert queued_calls == ["debounce-1"]
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
+def test_avito_webhook_does_not_dedup_failed_turn_debounce_queue(monkeypatch) -> None:
+    queued_calls: list[str] = []
+
+    def fake_enqueue(message, **kwargs):
+        queued_calls.append(message.message_id)
+        return {"queued": False, "reason": "disk_full"}
+
+    monkeypatch.setattr(avito_webhook_module, "enqueue_avito_turn_message", fake_enqueue)
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: replace(_settings(), avito_turn_debounce_seconds=30)
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    event = {
+        "type": "message",
+        "message_id": "debounce-fail-1",
+        "chat_id": "chat-debounce-fail",
+        "content": {"text": "Здравствуйте"},
+    }
+    try:
+        client = TestClient(avito_app)
+        first = client.post("/avito/webhook?token=webhook", json=event)
+        second = client.post("/avito/webhook?token=webhook", json=event)
+
+        assert first.status_code == 200
+        assert first.json()["processing_status"] == "retryable_error"
+        assert first.json()["ok"] is False
+        assert second.json()["processing_status"] == "retryable_error"
+        assert queued_calls == ["debounce-fail-1", "debounce-fail-1"]
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
 def test_extract_date_ignores_invalid_dates() -> None:
     assert extract_date("Запишите на 15.99", today=date(2026, 7, 1)) == ""
     assert extract_date("Запишите на 2026-99-15", today=date(2026, 7, 1)) == ""

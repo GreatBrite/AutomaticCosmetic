@@ -380,16 +380,27 @@ async def avito_webhook(
             max_wait_seconds=settings.avito_turn_max_wait_seconds,
             max_messages=settings.avito_turn_batch_max_messages,
         )
+        queue_ok = bool(queued.get("queued"))
+        result = {
+            "ok": queue_ok,
+            "processing_status": "queued" if queue_ok else "retryable_error",
+            "queued": queue_ok,
+            "reason": "turn_debounce" if queue_ok else str(queued.get("reason") or "turn_debounce_queue_failed"),
+            "message_id": message.message_id,
+            "queue": queued,
+        }
         _log_webhook(
             {
-                "event": "queued",
-                "reason": "turn_debounce",
+                "event": "queued" if queue_ok else "retryable_error",
+                "reason": result["reason"],
                 "chat_id": message.chat_id,
                 "message_id": message.message_id,
                 "queue": queued,
             }
         )
-        return {"ok": True, "processing_status": "queued", "queued": True, "reason": "turn_debounce", "message_id": message.message_id, "queue": queued}
+        if _dedup_allowed(result):
+            processed_events.mark_once(dedup_key)
+        return result
 
     result = await process_avito_message(
         message=message,
