@@ -256,6 +256,16 @@ LLM-понимание свободных команд Ольги использ
 journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
 ```
 
+Для ручного разбора через Markdown:
+
+```bash
+.venv/bin/python scripts/export_avito_followups.py --output data/avito_followups_review.md
+.venv/bin/python scripts/export_avito_followups.py --decisions data/avito_followups_review.md
+.venv/bin/python scripts/export_avito_followups.py --decisions data/avito_followups_review.md --apply-decisions
+```
+
+В `data/avito_followups_review.md` по каждой задаче отмечай ровно одно решение: `resolved`, `not_relevant`, `remind_later` или `still_needs_action`. Решения `resolved` и `not_relevant` требуют причину после `:`. Сначала всегда запускай dry-run без `--apply-decisions`; если есть ошибки, apply не делает частичных изменений.
+
 После ручного ответа в Avito монитор должен запомнить исходящее сообщение и закрыть открытую задачу, если ответ похож на финальный.
 
 Если нажали `Закрыто` по критичной карточке, а монитор не видит исходящего ответа клиенту после создания задачи, карточка получает статус `closed_manual_no_client_reply`. Это не дёргает Ольгу повторно, но остаётся warning в `ops_status`: такой случай нужно отдельно проверить в Avito.
