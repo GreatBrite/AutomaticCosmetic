@@ -6107,6 +6107,66 @@ async def test_avito_poller_lists_recent_chats_with_pagination() -> None:
     assert reader.calls == [(100, 0), (50, 100)]
 
 
+@pytest.mark.anyio
+async def test_missed_poller_debounce_queue_failure_is_retryable_and_not_deduped(tmp_path, monkeypatch) -> None:
+    import scripts.avito_missed_message_poller as poller
+
+    class FakeReader:
+        async def list_chats(self, account_id, *, limit=20, offset=0):
+            return {"chats": [{"id": "chat-queue-fail", "users": [{"id": 222, "name": "Анна"}]}]}
+
+        async def get_chat_messages(self, account_id, chat_id, *, limit=20):
+            return {
+                "messages": [
+                    {
+                        "id": "m-queue-fail",
+                        "author_id": 222,
+                        "direction": "in",
+                        "type": "text",
+                        "created": int(time.time()),
+                        "content": {"text": "Здравствуйте, хочу записаться"},
+                    }
+                ]
+            }
+
+    class FakeDedup:
+        def __init__(self) -> None:
+            self.marked: list[str] = []
+
+        def contains(self, key: str) -> bool:
+            return False
+
+        def mark_once(self, key: str) -> bool:
+            self.marked.append(key)
+            return True
+
+    dedup = FakeDedup()
+
+    def fake_enqueue(message, **kwargs):
+        return {"queued": False, "reason": "disk_full", "chat_id": message.chat_id, "message_id": message.message_id}
+
+    monkeypatch.setattr(poller, "LOG_PATH", tmp_path / "poller.log")
+    monkeypatch.setattr(poller, "AvitoReadClient", lambda settings: FakeReader())
+    monkeypatch.setattr(poller, "PersistentProcessedEventStore", lambda: dedup)
+    monkeypatch.setattr(poller, "enqueue_avito_turn_message", fake_enqueue)
+    settings = replace(
+        _settings(),
+        avito_turn_debounce_seconds=60,
+        telegram_admin_history_db_path=tmp_path / "history.sqlite3",
+        rag_expert_db_path=tmp_path / "expert.sqlite3",
+    )
+
+    summary = await poller.run_once(settings, lookback_seconds=3600, chat_limit=1, messages_per_chat=10)
+
+    assert summary["processed"] == 0
+    assert summary["skipped"] == 0
+    assert summary["errors"] == 1
+    assert summary["skip_reasons"]["disk_full"] == 1
+    assert dedup.marked == []
+    log_text = (tmp_path / "poller.log").read_text(encoding="utf-8")
+    assert '"event": "retryable_error"' in log_text
+
+
 def test_expert_rag_approved_answer_is_retrieved_and_deprecated_ignored(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     approved = store.upsert_from_handoff(

@@ -295,13 +295,18 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
                     max_wait_seconds=settings.avito_turn_max_wait_seconds,
                     max_messages=settings.avito_turn_batch_max_messages,
                 )
-                dedup.mark_once(key)
-                skipped += 1
-                skip_reasons["turn_debounce_queued"] += 1
+                queue_ok = bool(queued.get("queued"))
+                if queue_ok:
+                    dedup.mark_once(key)
+                    skipped += 1
+                    skip_reasons["turn_debounce_queued"] += 1
+                else:
+                    errors += 1
+                    skip_reasons[str(queued.get("reason") or "turn_debounce_queue_failed")] += 1
                 _log(
                     {
-                        "event": "queued",
-                        "reason": "turn_debounce",
+                        "event": "queued" if queue_ok else "retryable_error",
+                        "reason": "turn_debounce" if queue_ok else str(queued.get("reason") or "turn_debounce_queue_failed"),
                         "chat_id": chat_id,
                         "message_id": message.message_id,
                         "message": asdict(message),
