@@ -11273,3 +11273,24 @@ async def test_avito_sdk_sender_uploads_and_sends_image(tmp_path) -> None:
     call = fake_client._transport.calls[0]
     assert call["path_template"] == "/messenger/v1/accounts/{user_id}/chats/{chat_id}/messages/image"
     assert call["json_body"] == {"image_id": "abc-image-id"}
+
+
+@pytest.mark.anyio
+async def test_avito_sdk_sender_file_reports_caption_failure(tmp_path) -> None:
+    class CaptionFailSender(AvitoSdkSender):
+        async def send_image(self, account_id, chat_id, image_path):
+            return {"sent": True, "image_id": "img-1"}
+
+        async def send_message(self, account_id, chat_id, text):
+            return {"sent": False, "error": "caption down"}
+
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"image-bytes")
+    sender = CaptionFailSender(_settings(), client=object())
+
+    result = await sender.send_file(123, "chat-1", image_path, "Фото до/после")
+
+    assert result["sent"] is False
+    assert result["reason"] == "caption_send_failed"
+    assert result["image_id"] == "img-1"
+    assert result["caption_result"]["error"] == "caption down"
