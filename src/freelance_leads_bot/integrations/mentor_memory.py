@@ -10,6 +10,16 @@ from .avito_consultant import AvitoConsultantReply
 from .expert_rag import ExpertAnswer, ExpertRagStore
 from .models import InboundMessage
 
+TEMPORAL_MEMORY_RE = re.compile(
+    r"(?iu)\b("
+    r"сегодня|завтра|послезавтра|вчера|"
+    r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|"
+    r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|"
+    r"\d{1,2}:\d{2}|"
+    r"окн[оа]|слот|запис[ьи]|адрес|акци[яи]|скидк|договор[её]н"
+    r")\b"
+)
+
 
 @dataclass(frozen=True)
 class MentorMemoryResult:
@@ -43,6 +53,7 @@ class MentorMemoryService:
         if self.expert_rag and _looks_reusable_answer(text):
             question = _question_from_context(context) or str(context.get("question") or context.get("handoff_text") or "")
             if question:
+                metadata = {"source": source, "actor": actor, **_autoanswer_metadata_for_memory(question, text)}
                 expert_answers.append(
                     self.expert_rag.upsert_from_handoff(
                         question=question,
@@ -52,7 +63,7 @@ class MentorMemoryService:
                         source_message_id=str(context.get("source_message_id") or ""),
                         olga_reply_message_id=str(context.get("olga_reply_message_id") or ""),
                         approved_by=actor,
-                        metadata={"source": source, "actor": actor, "autoanswer_allowed": True},
+                        metadata=metadata,
                     )
                 )
         return MentorMemoryResult(created=result.created, expert_answers=expert_answers, skipped=result.skipped)
@@ -171,6 +182,13 @@ def _lessons_from_authoritative_reply(text: str, context: dict[str, Any]) -> lis
             }
         )
     return lessons
+
+
+def _autoanswer_metadata_for_memory(question: str, answer: str) -> dict[str, Any]:
+    text = f"{question}\n{answer}"
+    if TEMPORAL_MEMORY_RE.search(text):
+        return {"autoanswer_allowed": False, "temporal_fact": True, "autoanswer_block_reason": "temporal_without_expiry"}
+    return {"autoanswer_allowed": True}
 
 
 def _lessons_from_successful_bot_reply(message: InboundMessage, decision: AvitoConsultantReply) -> list[dict[str, Any]]:

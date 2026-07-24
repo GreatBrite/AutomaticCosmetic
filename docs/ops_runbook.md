@@ -178,11 +178,21 @@ LLM-понимание свободных команд Ольги использ
 
 Если клиент пишет про запись, адрес, оплату, перенос или “я записана, всё в силе?”, это считается критичным: задачу нельзя закрывать обещанием “уточню”, нужен финальный ответ клиенту или явное решение Ольги.
 
+### `telegram_open_handoffs`
+
+`ops_status` отдельно проверяет открытые Telegram-карточки Ольги из `data/telegram_handoff_refs.json`. Проверка read-only: запуск статуса не чинит и не перезаписывает этот файл.
+
+Нерешённые статусы: `open`, `in_progress`, `draft_pending`, `rejected`, `expired_critical`.
+
+Критичными считаются карточки про запись, перенос, отмену, адрес, подтверждение даты/времени, вопрос “в силе?”, фото/вложения, voice, жалобу, негативный отзыв или медицинский вопрос. Если critical handoff старше 1 часа, это warning; старше 3 часов — error. Обычный handoff старше 24 часов — warning, старше 48 часов — error. `expired_critical` всегда error.
+
+Если `ops_status` пишет `Immediate action required: review open Olga handoffs.`, нужно открыть `/open_cards` или тему клиента и дать клиенту финальный ответ/закрыть карточку с понятной причиной. Массово закрывать старые карточки без проверки последнего входящего и исходящего Avito нельзя.
+
 ### `avito_pending_followups`
 
 Это зависшие обещания бота после фраз вроде “уточню”, “проверю”, “подтвержу”.
 
-Если обещание просрочено дольше `AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS`, `ops_status --strict` возвращает error. По умолчанию SLA — 3 часа.
+Если есть critical followup, `ops_status` даёт минимум warning даже до просрочки. Если critical/overdue обещание старше `AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS`, `ops_status --strict` возвращает error. По умолчанию SLA — 3 часа.
 
 Проверить хвосты:
 
@@ -198,6 +208,15 @@ journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
 Фото и вложения из Avito бот пересылает в тему клиента. Статусы хранятся в `data/telegram_handoff_refs.json`: `received`, `downloaded`, `sent_to_olga`, `download_failed`, `manual_avito_check_required`. Если фото/файл не удалось переслать после retry, Ольга получает текстовую карточку “открыть Avito и проверить вложение вручную”.
 
 Голосовые сообщения расшифровываются webhook/missed-poller. Если расшифровка упала, сообщение не считается обработанным молча: создаётся handoff Ольге, а при падении handoff сообщение остаётся retryable.
+
+Missed-poller должен проверять минимум 150 последних чатов:
+
+```env
+AVITO_POLLER_CHAT_LIMIT=150
+AVITO_POLLER_MESSAGES_PER_CHAT=50
+```
+
+Если эти переменные не заданы, poller использует такие же production-defaults и проходит чаты страницами через `offset`.
 
 ### `avito_unanswered_report_fresh`
 

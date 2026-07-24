@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -63,6 +63,10 @@ class YClientsIntegrationService:
             "registration_redirect_url": f"{base_url}/yclients/register",
         }
 
+    @property
+    def redacted_integration_urls(self) -> dict[str, str]:
+        return {key: _redact_url(value) for key, value in self.integration_urls.items()}
+
     def is_valid_secret(self, secret: str | None) -> bool:
         expected = self.settings.yclients_integration_secret.strip()
         return not expected or secret == expected
@@ -99,7 +103,7 @@ def get_integration_service(
 async def health(service: YClientsIntegrationService = Depends(get_integration_service)) -> dict[str, Any]:
     return {
         "ok": True,
-        "integration_urls": service.integration_urls,
+        "integration_urls": service.redacted_integration_urls,
         "secret_required": bool(service.settings.yclients_integration_secret.strip()),
     }
 
@@ -204,6 +208,19 @@ def _headers(request: Request) -> dict[str, str]:
 
 def _query(request: Request) -> dict[str, str]:
     return {key: value for key, value in request.query_params.items()}
+
+
+def _redact_url(url: str) -> str:
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    query = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key.lower() in {"secret", "token", "key", "access_token", "client_secret"}:
+            query.append((key, "***"))
+        else:
+            query.append((key, value))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _check_secret(service: YClientsIntegrationService, request: Request) -> None:

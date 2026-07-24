@@ -39,6 +39,9 @@ from src.freelance_leads_bot.storage import LeadStore
 LOG_PATH = Path("data/avito_poller.log")
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 DEFAULT_ACCESS_ERROR_BACKOFF_SECONDS = 1800
+DEFAULT_POLLER_CHAT_LIMIT = 150
+DEFAULT_POLLER_MESSAGES_PER_CHAT = 50
+DEFAULT_POLLER_PAGE_SIZE = 100
 
 
 def _env_int(name: str, default: int) -> int:
@@ -239,8 +242,7 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
     expert_rag = ExpertRagStore(settings.rag_expert_db_path) if settings.rag_retrieval_enabled else None
 
     since_ts = int(time.time()) - lookback_seconds
-    chats_payload = await reader.list_chats(account_id, limit=chat_limit)
-    chats = _items(chats_payload, "chats", "items")
+    chats = await _list_recent_chats(reader, account_id, chat_limit=chat_limit)
     update_client_name_cache({str(chat.get("id") or ""): client_name_from_chat(chat, account_id=account_id) for chat in chats})
     processed = 0
     skipped = 0
@@ -375,13 +377,36 @@ def _dedup_allowed(result: dict[str, Any]) -> bool:
     return str(result.get("processing_status") or "processed") in {"processed", "queued", "ignored"}
 
 
+async def _list_recent_chats(reader: AvitoReadClient, account_id: int, *, chat_limit: int) -> list[dict[str, Any]]:
+    target = max(0, int(chat_limit or 0))
+    if target <= 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    page_size = min(DEFAULT_POLLER_PAGE_SIZE, target)
+    while len(rows) < target:
+        limit = min(page_size, target - len(rows))
+        payload = await reader.list_chats(account_id, limit=limit, offset=offset)
+        page = _items(payload, "chats", "items")
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < limit:
+            break
+        offset += len(page)
+    return rows[:target]
+
+
 async def main() -> None:
     settings = IntegrationSettings.from_env()
     interval = _env_int("AVITO_POLLER_INTERVAL_SECONDS", 60)
     access_error_backoff = _env_int("AVITO_POLLER_ACCESS_ERROR_BACKOFF_SECONDS", DEFAULT_ACCESS_ERROR_BACKOFF_SECONDS)
     lookback = _env_int("AVITO_POLLER_LOOKBACK_SECONDS", 3600)
-    chat_limit = _env_int("AVITO_POLLER_CHAT_LIMIT", 20)
-    messages_per_chat = _env_int("AVITO_POLLER_MESSAGES_PER_CHAT", 20)
+    chat_limit = _env_int("AVITO_POLLER_CHAT_LIMIT", _env_int("AVITO_UNANSWERED_CHAT_LIMIT", DEFAULT_POLLER_CHAT_LIMIT))
+    messages_per_chat = _env_int(
+        "AVITO_POLLER_MESSAGES_PER_CHAT",
+        _env_int("AVITO_UNANSWERED_MESSAGES_PER_CHAT", DEFAULT_POLLER_MESSAGES_PER_CHAT),
+    )
     once = os.getenv("AVITO_POLLER_ONCE", "").lower() in {"1", "true", "yes", "on"}
 
     while True:

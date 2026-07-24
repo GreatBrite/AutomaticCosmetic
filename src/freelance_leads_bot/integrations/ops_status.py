@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import IntegrationSettings
+from .handoff_refs import DEFAULT_HANDOFF_REFS_PATH, handoff_ref_is_critical, read_open_handoff_refs
 
 
 DEFAULT_UNANSWERED_REPORT_PATH = Path("data/avito_unanswered_report.json")
@@ -25,6 +27,8 @@ DEFAULT_DATA_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_DATA_ENTRY_WARNING_BYTES = 512 * 1024 * 1024
 DEFAULT_DISK_FREE_WARNING_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_DISK_FREE_WARNING_RATIO = 0.10
+SENSITIVE_QUERY_RE = re.compile(r"([?&](?:secret|token|access_token|client_secret|api_key|key)=)[^&#\s]+", re.IGNORECASE)
+SAFE_SECRET_FLAG_KEYS = {"secret_required", "yclients_integration_secret_required"}
 
 DEFAULT_SERVICES = (
     "freelance-leads-bot.service",
@@ -61,6 +65,7 @@ def build_ops_status_report(
     yclients_health: dict[str, Any] | None = None,
     unanswered_report_path: Path = DEFAULT_UNANSWERED_REPORT_PATH,
     unanswered_state_path: Path = DEFAULT_UNANSWERED_STATE_PATH,
+    handoff_refs_path: Path | None = None,
     care_crm_path: Path = DEFAULT_CARE_CRM_PATH,
     rag_db_path: Path | None = None,
     data_path: Path = DEFAULT_DATA_PATH,
@@ -74,6 +79,11 @@ def build_ops_status_report(
     settings = settings or IntegrationSettings.from_env()
     generated_at = int(time.time()) if now is None else int(now)
     rag_db = rag_db_path or settings.rag_expert_db_path
+    resolved_handoff_refs_path = handoff_refs_path or (
+        DEFAULT_HANDOFF_REFS_PATH
+        if Path(unanswered_report_path) == DEFAULT_UNANSWERED_REPORT_PATH
+        else Path(unanswered_report_path).parent / DEFAULT_HANDOFF_REFS_PATH.name
+    )
     checks: list[OpsCheck] = []
 
     services = service_states if service_states is not None else read_systemd_service_states(DEFAULT_SERVICES)
@@ -116,14 +126,22 @@ def build_ops_status_report(
     critical_unanswered = int(unanswered.get("critical_unanswered_count") or 0)
     pending_followups = int(unanswered.get("pending_followup_count") or 0)
     overdue_followups = int(unanswered.get("overdue_followup_count") or 0)
+    critical_followups = int(unanswered.get("critical_followup_count") or 0)
     manual_closed_without_client_reply = int(unanswered.get("manual_closed_without_client_reply_count") or 0)
     max_overdue_followup_age = int(unanswered.get("max_overdue_followup_age_seconds") or 0)
+    max_critical_followup_age = int(unanswered.get("max_critical_followup_age_seconds") or 0)
     overdue_error_after = (
         _env_int("AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS", 3 * 60 * 60)
         if overdue_followup_error_after_seconds is None
         else max(0, int(overdue_followup_error_after_seconds))
     )
-    overdue_followup_severity = "error" if overdue_followups > 0 and max_overdue_followup_age >= overdue_error_after else "warning"
+    followup_is_ok = overdue_followups == 0 and critical_followups == 0
+    followup_severity = (
+        "error"
+        if (overdue_followups > 0 and max_overdue_followup_age >= overdue_error_after)
+        or (critical_followups > 0 and max_critical_followup_age >= overdue_error_after)
+        else "warning"
+    )
     failed = int(unanswered.get("failed_count") or 0)
     report_is_stale = bool(unanswered.get("report_is_stale"))
     report_age = int(unanswered.get("report_age_seconds") or 0)
@@ -150,15 +168,16 @@ def build_ops_status_report(
     checks.append(
         OpsCheck(
             "avito_pending_followups",
-            overdue_followups == 0,
-            overdue_followup_severity,
-            "No overdue Avito bot promises."
-            if overdue_followups == 0
+            followup_is_ok,
+            followup_severity,
+            "No critical or overdue Avito bot promises."
+            if followup_is_ok
             else (
-                f"{overdue_followups} Avito bot promises are overdue"
+                f"{pending_followups} Avito bot promises are pending; "
+                f"critical={critical_followups}, overdue={overdue_followups}"
                 + (
-                    f" for up to {int(max_overdue_followup_age / 60)} min; exceeds error SLA {int(overdue_error_after / 60)} min."
-                    if overdue_followup_severity == "error"
+                    f"; exceeds error SLA {int(overdue_error_after / 60)} min."
+                    if followup_severity == "error"
                     else "."
                 )
             ),
@@ -183,6 +202,29 @@ def build_ops_status_report(
             "error",
             "No failed delayed autoreplies." if failed == 0 else f"{failed} delayed autoreplies failed.",
             unanswered,
+        )
+    )
+
+    handoff_status = read_telegram_handoff_status(resolved_handoff_refs_path, now=generated_at)
+    handoff_open = int(handoff_status.get("open_count") or 0)
+    handoff_critical = int(handoff_status.get("critical_count") or 0)
+    handoff_oldest_age = int(handoff_status.get("oldest_age_seconds") or 0)
+    handoff_error_count = int(handoff_status.get("error_count") or 0)
+    handoff_warning_count = int(handoff_status.get("warning_count") or 0)
+    handoff_ok = handoff_error_count == 0 and handoff_warning_count == 0
+    checks.append(
+        OpsCheck(
+            "telegram_open_handoffs",
+            handoff_ok,
+            "error" if handoff_error_count else "warning",
+            "No open Olga handoffs are over SLA."
+            if handoff_ok
+            else (
+                f"{handoff_open} open Olga handoffs need review; "
+                f"critical={handoff_critical}, draft_pending={handoff_status.get('draft_pending_count', 0)}, "
+                f"oldest={int(handoff_oldest_age / 3600)}h."
+            ),
+            handoff_status,
         )
     )
 
@@ -307,11 +349,19 @@ def build_ops_status_report(
         "avito_actionable": actionable,
         "avito_critical_unanswered": critical_unanswered,
         "avito_pending_followups": pending_followups,
+        "avito_critical_followups": critical_followups,
         "avito_overdue_followups": overdue_followups,
         "avito_manual_closed_without_client_reply": manual_closed_without_client_reply,
         "avito_max_overdue_followup_age_seconds": max_overdue_followup_age,
+        "avito_max_critical_followup_age_seconds": max_critical_followup_age,
         "avito_autoreply_failed": failed,
         "avito_unanswered_report_age_seconds": report_age,
+        "handoff_open": handoff_open,
+        "handoff_critical": handoff_critical,
+        "handoff_draft_pending": handoff_status.get("draft_pending_count", 0),
+        "handoff_oldest_age_seconds": handoff_oldest_age,
+        "handoff_warning_count": handoff_warning_count,
+        "handoff_error_count": handoff_error_count,
         "care_stale_needs_details": stale_visit_details,
         "care_due_needs_channel": due_needs_channel,
         "care_due_blocked_risk": due_blocked_risk,
@@ -442,6 +492,11 @@ def read_unanswered_status(
         for row in pending_followups
         if isinstance(row, dict) and (row.get("overdue") or row.get("business_status") == "overdue")
     ]
+    critical_rows = [
+        row
+        for row in pending_followups
+        if isinstance(row, dict) and (row.get("severity") == "critical" or row.get("critical") or row.get("is_critical"))
+    ]
     failed = state.get("failed") if isinstance(state.get("failed"), dict) else {}
     handled = state.get("handled") if isinstance(state.get("handled"), dict) else {}
     report_created_at = str(report.get("created_at") or "")
@@ -477,9 +532,79 @@ def read_unanswered_status(
             )
         ),
         "max_overdue_followup_age_seconds": max((int(row.get("age_seconds") or 0) for row in overdue_rows), default=0),
+        "max_critical_followup_age_seconds": max((int(row.get("age_seconds") or 0) for row in critical_rows), default=0),
         "handled_count": len(handled),
         "failed_count": len(failed),
         "activated_at": int(state.get("activated_at") or 0),
+    }
+
+
+def read_telegram_handoff_status(path: Path, *, now: int | None = None) -> dict[str, Any]:
+    now_ts = int(time.time()) if now is None else int(now)
+    rows = read_open_handoff_refs(path)
+    open_count = len(rows)
+    critical_rows = [row for row in rows if handoff_ref_is_critical(row)]
+    draft_rows = [row for row in rows if str(row.get("status") or "") == "draft_pending"]
+    expired_critical_rows = [row for row in rows if str(row.get("status") or "") == "expired_critical"]
+    oldest_age = 0
+    warning_count = 0
+    error_count = 0
+    samples: list[dict[str, Any]] = []
+    for row in rows:
+        created_at = int(row.get("created_at") or row.get("updated_at") or now_ts)
+        age = max(0, now_ts - created_at)
+        oldest_age = max(oldest_age, age)
+        is_critical = handoff_ref_is_critical(row)
+        status = str(row.get("status") or "open")
+        level = ""
+        reason = ""
+        if status == "expired_critical":
+            level = "error"
+            reason = "expired_critical"
+        elif is_critical and age >= 3 * 60 * 60:
+            level = "error"
+            reason = "critical_over_3h"
+        elif not is_critical and age >= 48 * 60 * 60:
+            level = "error"
+            reason = "ordinary_over_48h"
+        elif is_critical and age >= 60 * 60:
+            level = "warning"
+            reason = "critical_over_1h"
+        elif status == "draft_pending" and age >= 3 * 60 * 60:
+            level = "warning"
+            reason = "draft_pending_over_3h"
+        elif not is_critical and age >= 24 * 60 * 60:
+            level = "warning"
+            reason = "ordinary_over_24h"
+        if level == "error":
+            error_count += 1
+        elif level == "warning":
+            warning_count += 1
+        if level and len(samples) < 8:
+            samples.append(
+                {
+                    "handoff_id": row.get("handoff_id", ""),
+                    "avito_chat_id": row.get("avito_chat_id", ""),
+                    "client_name": row.get("client_name", ""),
+                    "status": status,
+                    "critical": is_critical,
+                    "age_seconds": age,
+                    "reason": reason,
+                    "handoff_reason": row.get("reason", ""),
+                    "client_waits_for": row.get("client_waits_for", ""),
+                }
+            )
+    return {
+        "exists": Path(path).exists(),
+        "path": str(path),
+        "open_count": open_count,
+        "critical_count": len(critical_rows),
+        "draft_pending_count": len(draft_rows),
+        "expired_critical_count": len(expired_critical_rows),
+        "oldest_age_seconds": oldest_age,
+        "warning_count": warning_count,
+        "error_count": error_count,
+        "samples": samples,
     }
 
 
@@ -554,7 +679,7 @@ def fetch_json(url: str, *, timeout: float = 5.0) -> dict[str, Any]:
 def report_data(report: OpsStatusReport) -> dict[str, Any]:
     data = asdict(report)
     data["checks"] = [asdict(check) for check in report.checks]
-    return data
+    return _redact_sensitive(data)
 
 
 def ops_status_exit_code(report: OpsStatusReport, *, strict: bool = False) -> int:
@@ -576,9 +701,17 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             + ("active" if summary.get("services_active") else "attention needed")
             + f" | Avito actionable={summary.get('avito_actionable', 0)}"
             + f" critical={summary.get('avito_critical_unanswered', 0)}"
+            + f" pending_promises={summary.get('avito_pending_followups', 0)}"
+            + f" critical_promises={summary.get('avito_critical_followups', 0)}"
             + f" overdue_promises={summary.get('avito_overdue_followups', 0)}"
             + f" failed_autoreplies={summary.get('avito_autoreply_failed', 0)}"
             + f" report_age={summary.get('avito_unanswered_report_age_seconds', 0)}s"
+        ),
+        (
+            f"Handoff: open={summary.get('handoff_open', 0)}"
+            f" critical={summary.get('handoff_critical', 0)}"
+            f" draft_pending={summary.get('handoff_draft_pending', 0)}"
+            f" oldest={int(int(summary.get('handoff_oldest_age_seconds') or 0) / 3600)}h"
         ),
         (
             f"RAG: approved={summary.get('rag_approved', 0)}"
@@ -612,6 +745,8 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
     if failing_warnings:
         lines.append("Warnings:")
         lines.extend(f"- {check.name}: {check.detail}" for check in failing_warnings)
+    if summary.get("handoff_error_count") or summary.get("handoff_warning_count") or summary.get("avito_critical_followups"):
+        lines.append("Immediate action required: review open Olga handoffs.")
     if not failing_errors and not failing_warnings:
         lines.append("No immediate action required.")
     return "\n".join(lines)
@@ -622,6 +757,27 @@ def _health_check(name: str, payload: dict[str, Any], *, required_flags: tuple[s
     ok = bool(payload.get("ok")) and not missing
     detail = "Health endpoint is OK." if ok else "Health endpoint failed or required flags are false."
     return OpsCheck(name, ok, "error", detail, {"missing_flags": missing, "ok": payload.get("ok"), **{flag: payload.get(flag) for flag in required_flags}})
+
+
+def _redact_sensitive(value: Any, *, key: str = "") -> Any:
+    normalized_key = str(key or "").casefold()
+    if normalized_key not in SAFE_SECRET_FLAG_KEYS and _is_sensitive_key(normalized_key):
+        return "***"
+    if isinstance(value, dict):
+        return {item_key: _redact_sensitive(item_value, key=str(item_key)) for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive(item) for item in value)
+    if isinstance(value, str):
+        return SENSITIVE_QUERY_RE.sub(r"\1***", value)
+    return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    return key in {"secret", "token", "access_token", "client_secret", "api_key", "key"} or key.endswith(
+        ("_secret", "_token", "_access_token", "_client_secret", "_api_key")
+    )
 
 
 def _on_off(value: Any) -> str:

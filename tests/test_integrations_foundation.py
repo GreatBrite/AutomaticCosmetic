@@ -93,9 +93,11 @@ from src.freelance_leads_bot.integrations.avito_history_import import import_tel
 from src.freelance_leads_bot.integrations.handoff_notify import PreviewHandoffNotifier, format_handoff_message, process_handoff_sla
 from src.freelance_leads_bot.integrations.handoff_refs import (
     find_telegram_handoff_ref,
+    handoff_ref_is_critical,
     latest_unresolved_handoff_ref_for_chat,
     load_telegram_handoff_refs,
     open_handoff_refs,
+    read_open_handoff_refs,
     remember_telegram_handoff_ref,
     save_telegram_handoff_refs,
     update_handoff_status,
@@ -118,6 +120,8 @@ from src.freelance_leads_bot.integrations.ops_status import (
     ops_status_exit_code,
     read_data_footprint,
     read_disk_status,
+    read_telegram_handoff_status,
+    report_data,
 )
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, review_suggestion, run_review_command, resolve_audit_log_path
@@ -166,6 +170,7 @@ from scripts.avito_unanswered_monitor import (
     pending_followup_rows,
     sync_pending_followups,
 )
+from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.avito_live_telegram_relay import (
@@ -319,6 +324,37 @@ def test_open_handoff_refs_keeps_only_latest_card_per_avito_chat(tmp_path) -> No
     assert rows[0]["handoff_id"] == second["handoff_id"]
     assert rows[0]["handoff_id"] != first["handoff_id"]
     assert after_close == []
+
+
+def test_read_open_handoff_refs_is_read_only_and_classifies_business_critical(tmp_path) -> None:
+    path = tmp_path / "refs.json"
+    path.write_text(
+        json.dumps(
+            {
+                "admin:10": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "10",
+                    "avito_chat_id": "chat-address",
+                    "handoff_text": "Клиент спрашивает: запись на 28 июля у нас в силе? Адрес не напишите?",
+                    "status": "open",
+                    "created_at": 100,
+                    "updated_at": 100,
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_text(encoding="utf-8")
+
+    rows = read_open_handoff_refs(path)
+    after = path.read_text(encoding="utf-8")
+
+    assert rows
+    assert before == after
+    assert rows[0]["handoff_id"]
+    assert handoff_ref_is_critical(rows[0]) is True
 
 
 def test_send_open_handoff_cards_reissues_each_handoff_in_current_topic(tmp_path, monkeypatch) -> None:
@@ -5608,6 +5644,24 @@ def test_avito_poller_accepts_voice_messages_for_transcription() -> None:
     assert reason == ""
 
 
+@pytest.mark.anyio
+async def test_avito_poller_lists_recent_chats_with_pagination() -> None:
+    class FakeReader:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def list_chats(self, account_id, *, limit=20, offset=0):
+            self.calls.append((limit, offset))
+            return {"chats": [{"id": f"chat-{index}"} for index in range(offset, min(offset + limit, 150))]}
+
+    reader = FakeReader()
+
+    chats = await list_recent_missed_avito_chats(reader, 123, chat_limit=150)
+
+    assert len(chats) == 150
+    assert reader.calls == [(100, 0), (50, 100)]
+
+
 def test_expert_rag_approved_answer_is_retrieved_and_deprecated_ignored(tmp_path) -> None:
     store = ExpertRagStore(tmp_path / "expert.sqlite3")
     approved = store.upsert_from_handoff(
@@ -5729,6 +5783,21 @@ def test_expert_rag_admin_remember_freeform_creates_reusable_answer(tmp_path) ->
     assert created.status == APPROVED
     assert created.metadata["autoanswer_allowed"] is True
     assert "онлайн-консультация" in created.answer_client
+
+
+def test_expert_rag_admin_temporal_freeform_is_not_autoanswer(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    service = ExpertRagAdminService(store, plans_path=tmp_path / "plans.json", audit_path=tmp_path / "audit.jsonl")
+
+    plan = service.plan_change("Запомни вот так: завтра окно на губы в 15:00, адрес Ленина 1", actor="olga")
+    applied = service.apply_plan(plan.id, actor="olga")
+    created = store.get(applied.metadata["created_ids"][0])
+
+    assert created is not None
+    assert created.status == APPROVED
+    assert created.metadata["autoanswer_allowed"] is False
+    assert created.metadata["temporal_fact"] is True
+    assert created.metadata["autoanswer_block_reason"] == "temporal_without_expiry"
 
 
 def test_expert_rag_admin_ambiguous_price_increase_needs_clarification(tmp_path) -> None:
@@ -6618,6 +6687,25 @@ def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> Non
     matches = expert.search("какой препарат для увеличения ягодиц", min_score=0.1)
     assert matches
     assert "Tesoro Body" in matches[0][0].answer_client
+
+
+def test_mentor_memory_blocks_temporal_olga_answer_from_autoanswer(tmp_path) -> None:
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    expert = ExpertRagStore(tmp_path / "expert.sqlite3")
+    memory = MentorMemoryService(knowledge, expert_rag=expert)
+
+    result = memory.observe_avito_send(
+        chat_id="chat-1",
+        text="Да, запись завтра есть на 15:00, адрес Ленина 1.",
+        actor="olga",
+        context={"client_message": "Можно записаться завтра?"},
+    )
+
+    assert result.expert_answers
+    answer = result.expert_answers[0]
+    assert answer.metadata["autoanswer_allowed"] is False
+    assert answer.metadata["temporal_fact"] is True
+    assert answer.metadata["autoanswer_block_reason"] == "temporal_without_expiry"
 
 
 @pytest.mark.anyio
@@ -7836,8 +7924,8 @@ def test_new_yclients_integration_endpoints_match_legacy_contract(tmp_path) -> N
 
         health = client.get("/health")
         assert health.status_code == 200
-        assert health.json()["integration_urls"]["webhook_url"] == "https://olgatihcosmo.com/yclients/webhook?secret=secret123"
-        assert health.json()["integration_urls"]["callback_url"] == "https://olgatihcosmo.com/yclients/callback?secret=secret123"
+        assert health.json()["integration_urls"]["webhook_url"] == "https://olgatihcosmo.com/yclients/webhook?secret=%2A%2A%2A"
+        assert health.json()["integration_urls"]["callback_url"] == "https://olgatihcosmo.com/yclients/callback?secret=%2A%2A%2A"
         assert health.json()["integration_urls"]["registration_redirect_url"] == "https://olgatihcosmo.com/yclients/register"
 
         assert client.get("/yclients/webhook").json() == {"ok": True}
@@ -8269,6 +8357,53 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     assert any("Последнее от клиента: Я не получила ответ по записи" in text for text in notifier.texts)
     assert any("Контекст: Нужно проверить наличие записи клиента" in text for text in notifier.texts)
     assert any("Детали записи: Увеличение губ | Краснодар" in text for text in notifier.texts)
+
+
+@pytest.mark.anyio
+async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(tmp_path) -> None:
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.texts = []
+
+        async def notify_text(self, text):
+            self.texts.append(text)
+            return {"sent": True, "text": text}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    ref = remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-critical",
+        handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
+        urgency="critical",
+        reason="booking_critical",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 5 * 60 * 60
+    refs["admin-chat:1"]["reminder_sent_at"] = now - 7 * 60 * 60
+    refs["admin-chat:1"]["escalation_sent_at"] = now - 3 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    notifier = FakeNotifier()
+
+    result = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=60 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+        reminder_repeat_seconds=6 * 60 * 60,
+        escalation_repeat_seconds=2 * 60 * 60,
+    )
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
+
+    assert result["reminders"] == 1
+    assert result["escalations"] == 1
+    assert updated["handoff_id"] == ref["handoff_id"]
+    assert updated["reminder_count"] == 1
+    assert updated["escalation_count"] == 1
+    assert len(load_telegram_handoff_refs(ref_path)) == 1
 
 
 @pytest.mark.anyio
@@ -8916,6 +9051,160 @@ def test_ops_status_errors_when_overdue_avito_promises_exceed_sla(tmp_path) -> N
     assert check.severity == "error"
     assert report.summary["avito_max_overdue_followup_age_seconds"] == 7200
     assert ops_status_exit_code(report, strict=True) == 1
+
+
+def test_ops_status_warns_on_critical_pending_avito_promises_before_overdue(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "created_at": "1970-01-01T00:03:20+00:00",
+                "count": 0,
+                "actionable_count": 0,
+                "pending_followup_count": 1,
+                "critical_followup_count": 1,
+                "overdue_followup_count": 0,
+                "items": [],
+                "pending_followups": [{"severity": "critical", "age_seconds": 1200}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+    check = next(check for check in report.checks if check.name == "avito_pending_followups")
+    text = format_ops_status_report(report)
+
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert report.summary["avito_critical_followups"] == 1
+    assert "critical_promises=1" in text
+    assert "No immediate action required" not in text
+
+
+def test_ops_status_reports_open_telegram_handoffs_without_mutating_refs(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    handoff_path = tmp_path / "telegram_handoff_refs.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "admin:10": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "10",
+                    "avito_chat_id": "chat-booking",
+                    "handoff_text": "Сообщение: Запись на 28 июля у нас в силе? Адрес напишите.",
+                    "status": "open",
+                    "created_at": 1000,
+                    "updated_at": 1000,
+                },
+                "admin:11": {
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "11",
+                    "avito_chat_id": "chat-draft",
+                    "handoff_text": "Нужна ручная проверка",
+                    "status": "draft_pending",
+                    "created_at": 1000,
+                    "updated_at": 1000,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = handoff_path.read_text(encoding="utf-8")
+
+    report = build_ops_status_report(
+        _settings(),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True},
+        yclients_health={"ok": True, "secret_required": True},
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        handoff_refs_path=handoff_path,
+        rag_db_path=rag_path,
+        now=1000 + 4 * 60 * 60,
+    )
+    after = handoff_path.read_text(encoding="utf-8")
+    check = next(check for check in report.checks if check.name == "telegram_open_handoffs")
+    status = read_telegram_handoff_status(handoff_path, now=1000 + 4 * 60 * 60)
+    text = format_ops_status_report(report)
+
+    assert before == after
+    assert check.ok is False
+    assert check.severity == "error"
+    assert status["open_count"] == 2
+    assert status["critical_count"] == 1
+    assert status["draft_pending_count"] == 1
+    assert report.summary["handoff_open"] == 2
+    assert "Handoff: open=2 critical=1 draft_pending=1 oldest=4h" in text
+    assert "Immediate action required: review open Olga handoffs." in text
+    assert ops_status_exit_code(report, strict=True) == 1
+
+
+def test_ops_status_json_redacts_secrets_and_keeps_secret_required_flag(tmp_path) -> None:
+    report_path = tmp_path / "unanswered_report.json"
+    state_path = tmp_path / "unanswered_state.json"
+    rag_path = tmp_path / "expert.sqlite3"
+    ExpertRagStore(rag_path).upsert_from_handoff(
+        question="Какой препарат для ягодиц?",
+        answer_client="Используем Tesoro Body.",
+        status=APPROVED,
+        approved_by="olga",
+    )
+    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
+
+    report = build_ops_status_report(
+        replace(_settings(), yclients_integration_secret="real-secret"),
+        service_states={"freelance-leads-bot.service": "active"},
+        avito_health={"ok": True, "avito_ready": True, "handoff_notify_ready": True, "debug_url": "https://x.test/hook?token=abc123"},
+        yclients_health={
+            "ok": True,
+            "secret_required": True,
+            "integration_urls": {"webhook_url": "https://x.test/yclients/webhook?secret=real-secret"},
+        },
+        unanswered_report_path=report_path,
+        unanswered_state_path=state_path,
+        rag_db_path=rag_path,
+        now=200,
+    )
+
+    payload = report_data(report)
+    rendered = json.dumps(payload, ensure_ascii=False)
+
+    assert "real-secret" not in rendered
+    assert "abc123" not in rendered
+    assert payload["flags"]["yclients_integration_secret_required"] is True
 
 
 def test_ops_status_human_summary_marks_high_risk_rag_as_excluded_from_avito_autoanswer(tmp_path) -> None:

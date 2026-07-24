@@ -1,5 +1,6 @@
 /root/AutomaticCosmetic/data/*.log
 /root/AutomaticCosmetic/data/*.jsonl
+/root/AutomaticCosmetic/data/codex_chat/*.debug.log
 /root/AutomaticCosmetic/data/traces/*.jsonl
 /root/AutomaticCosmetic/data/audit/*.jsonl
 /root/AutomaticCosmetic/data/outbox/*.jsonl {
@@ -12,4 +13,3 @@
     copytruncate
     create 0640 root root
 }
-

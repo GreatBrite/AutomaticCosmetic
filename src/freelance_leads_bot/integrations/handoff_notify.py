@@ -18,6 +18,7 @@ from .booking_flow import extract_date, extract_time
 from .handoff_refs import (
     DEFAULT_HANDOFF_REFS_PATH,
     UNRESOLVED_HANDOFF_STATUSES,
+    handoff_ref_is_critical,
     latest_unresolved_handoff_ref_for_chat,
     load_telegram_handoff_refs,
     remember_telegram_handoff_ref,
@@ -195,7 +196,15 @@ class TelegramHandoffNotifier:
         telegram_message_id = _telegram_message_id(result) if isinstance(result, dict) else ""
         ref = {}
         if telegram_message_id:
-            task_fields = _booking_task_fields(handoff) if urgent else {}
+            task_fields = _booking_task_fields(handoff) if urgent else _handoff_task_fields(handoff)
+            reason = str(getattr(handoff.reason, "value", handoff.reason))
+            is_critical = urgent or reason in {
+                "booking_ambiguous",
+                "photo_consultation",
+                "complaint_or_risk",
+                "medical_question",
+                "voice_transcription_failed",
+            }
             ref = await asyncio.to_thread(
                 remember_telegram_handoff_ref,
                 telegram_chat_id=self.chat_id,
@@ -205,9 +214,12 @@ class TelegramHandoffNotifier:
                 client_name=str((handoff.message.metadata or {}).get("client_name") or ""),
                 handoff_text=handoff_text,
                 source_message_id=str(handoff.message.message_id or ""),
-                urgency="critical" if urgent else "",
-                deadline_at=int(time.time()) + 60 * 60 if urgent else 0,
-                escalation_at=int(time.time()) + 3 * 60 * 60 if urgent else 0,
+                reason=reason,
+                urgency="critical" if is_critical else "",
+                sla="critical" if is_critical else "",
+                client_waits_for=str(task_fields.get("client_waits_for") or ""),
+                deadline_at=int(time.time()) + 60 * 60 if is_critical else 0,
+                escalation_at=int(time.time()) + 3 * 60 * 60 if is_critical else 0,
                 phone=str(task_fields.get("phone") or ""),
                 city=str(task_fields.get("city") or ""),
                 service=str(task_fields.get("service") or ""),
@@ -338,6 +350,7 @@ class TelegramHandoffNotifier:
             handoff_id=handoff_id,
             source_message_id=str(handoff.message.message_id or ""),
             status=str(existing_ref.get("status") or "open"),
+            reason=str(getattr(handoff.reason, "value", handoff.reason)),
             path=self.ref_path,
         )
         topic_params = {"message_thread_id": str(existing_ref.get("telegram_message_thread_id") or "")} if existing_ref.get("telegram_message_thread_id") else {}
@@ -492,6 +505,8 @@ async def process_handoff_sla(
     reminder_after_seconds: int = 60 * 60,
     escalation_after_seconds: int = 3 * 60 * 60,
     expire_after_seconds: int = 7 * 24 * 60 * 60,
+    reminder_repeat_seconds: int = 6 * 60 * 60,
+    escalation_repeat_seconds: int = 2 * 60 * 60,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else int(now)
     refs = await asyncio.to_thread(load_telegram_handoff_refs, ref_path)
@@ -510,7 +525,7 @@ async def process_handoff_sla(
         created_at = int(ref.get("created_at") or ref.get("updated_at") or now)
         age = max(0, now - created_at)
         if age >= expire_after_seconds:
-            if _ref_is_critical(ref):
+            if handoff_ref_is_critical(ref):
                 ref["status"] = "expired_critical"
                 ref["expired_at"] = now
                 expired_critical += 1
@@ -521,19 +536,31 @@ async def process_handoff_sla(
             ref["updated_at"] = now
             changed = True
             continue
-        if age >= reminder_after_seconds and not int(ref.get("reminder_sent_at") or 0):
+        reminder_sent_at = int(ref.get("reminder_sent_at") or 0)
+        can_send_reminder = age >= reminder_after_seconds and (
+            not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
+        )
+        if can_send_reminder:
             result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="reminder"))
             notifications.append(result)
             if result.get("sent") or not result.get("error"):
                 ref["reminder_sent_at"] = now
+                ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
                 ref["updated_at"] = now
                 reminders += 1
                 changed = True
-        if _ref_is_critical(ref) and age >= escalation_after_seconds and not int(ref.get("escalation_sent_at") or 0):
+        escalation_sent_at = int(ref.get("escalation_sent_at") or 0)
+        can_send_escalation = (
+            handoff_ref_is_critical(ref)
+            and age >= escalation_after_seconds
+            and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
+        )
+        if can_send_escalation:
             result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="escalation"))
             notifications.append(result)
             if result.get("sent") or not result.get("error"):
                 ref["escalation_sent_at"] = now
+                ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
                 ref["updated_at"] = now
                 escalations += 1
                 changed = True
@@ -563,9 +590,12 @@ def handoff_notifier_from_settings(settings: IntegrationSettings) -> HandoffNoti
 def format_handoff_message(handoff: Handoff) -> str:
     message = handoff.message
     listing = message.listing
-    urgent = _is_booking_critical(handoff)
+    urgent = _handoff_is_critical(handoff)
+    heading = "Нужна ручная проверка"
+    if urgent:
+        heading = "СРОЧНО: клиент ждёт подтверждение записи/адрес" if _is_booking_critical(handoff) else "СРОЧНО: Нужна ручная проверка"
     lines = [
-        "СРОЧНО: клиент ждёт подтверждение записи/адрес" if urgent else "Нужна ручная проверка",
+        heading,
         f"Причина: {handoff.reason.value}",
         "Статус: open",
         f"Канал: {message.channel.value}",
@@ -600,8 +630,19 @@ def _is_booking_critical(handoff: Handoff) -> bool:
     return str(getattr(handoff.reason, "value", handoff.reason)) == "booking_critical"
 
 
+def _handoff_is_critical(handoff: Handoff) -> bool:
+    return str(getattr(handoff.reason, "value", handoff.reason)) in {
+        "booking_critical",
+        "booking_ambiguous",
+        "photo_consultation",
+        "complaint_or_risk",
+        "medical_question",
+        "voice_transcription_failed",
+    }
+
+
 def _ref_is_critical(ref: dict[str, Any]) -> bool:
-    return str(ref.get("urgency") or "").strip() == "critical" or "booking_critical" in str(ref.get("handoff_text") or "")
+    return handoff_ref_is_critical(ref)
 
 
 def _format_handoff_sla_notification(ref: dict[str, Any], *, event: str) -> str:
@@ -697,6 +738,33 @@ def _booking_task_fields(handoff: Handoff) -> dict[str, str]:
         "booking_date": str(metadata.get("booking_date") or extract_date(text)),
         "booking_time": str(metadata.get("booking_time") or extract_time(text)),
         "confirmation_needed": _confirmation_needed(text),
+        "assignee": str(metadata.get("assignee") or "Ольга/админ"),
+    }
+
+
+def _handoff_task_fields(handoff: Handoff) -> dict[str, str]:
+    message = handoff.message
+    metadata = message.metadata or {}
+    text = str(message.text or "")
+    listing = message.listing
+    reason = str(getattr(handoff.reason, "value", handoff.reason))
+    waits_for = ""
+    if reason == "photo_consultation" or message.has_photo:
+        waits_for = "оценка фото/вложения"
+    elif reason in {"complaint_or_risk", "medical_question"}:
+        waits_for = "экспертный ответ Ольги"
+    elif reason == "voice_transcription_failed":
+        waits_for = "ручная проверка голосового сообщения"
+    elif "передам" in text.casefold() or "уточ" in text.casefold():
+        waits_for = "финальный ответ после обещания уточнить"
+    return {
+        "client_waits_for": waits_for,
+        "phone": str(metadata.get("phone") or _phone_from_text(text)),
+        "city": str(metadata.get("city") or (listing.city if listing else "") or _city_from_text(text)),
+        "service": str(metadata.get("service") or metadata.get("service_title") or (listing.title if listing else "")),
+        "booking_date": str(metadata.get("booking_date") or extract_date(text)),
+        "booking_time": str(metadata.get("booking_time") or extract_time(text)),
+        "confirmation_needed": _confirmation_needed(text) if reason in {"booking_ambiguous", "booking_critical"} else "",
         "assignee": str(metadata.get("assignee") or "Ольга/админ"),
     }
 
