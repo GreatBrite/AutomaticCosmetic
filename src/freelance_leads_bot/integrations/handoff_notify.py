@@ -514,9 +514,11 @@ async def process_handoff_sla(
     escalations = 0
     expired = 0
     expired_critical = 0
+    deduped = 0
     notifications: list[dict[str, Any]] = []
     changed = False
-    for ref in refs.values():
+    candidates, deduped = _canonical_handoff_sla_refs(refs, now=now)
+    for ref in candidates:
         if not isinstance(ref, dict):
             continue
         status = str(ref.get("status") or "open")
@@ -572,8 +574,50 @@ async def process_handoff_sla(
         "escalations": escalations,
         "expired": expired,
         "expired_critical": expired_critical,
+        "deduped": deduped,
         "notifications": notifications,
     }
+
+
+def _canonical_handoff_sla_refs(refs: dict[str, dict], *, now: int) -> tuple[list[dict], int]:
+    grouped: dict[str, dict] = {}
+    unresolved = 0
+    for fallback_key, ref in refs.items():
+        if not isinstance(ref, dict):
+            continue
+        if str(ref.get("status") or "open") not in UNRESOLVED_HANDOFF_STATUSES:
+            continue
+        unresolved += 1
+        group_key = _handoff_sla_group_key(ref, fallback_key=str(fallback_key))
+        current = grouped.get(group_key)
+        if current is None or _handoff_sla_priority(ref, now=now) > _handoff_sla_priority(current, now=now):
+            grouped[group_key] = ref
+    rows = list(grouped.values())
+    rows.sort(key=lambda ref: _handoff_sla_priority(ref, now=now), reverse=True)
+    return rows, max(0, unresolved - len(rows))
+
+
+def _handoff_sla_group_key(ref: dict[str, Any], *, fallback_key: str) -> str:
+    avito_chat_id = str(ref.get("avito_chat_id") or "").strip()
+    if avito_chat_id:
+        return f"chat:{avito_chat_id}"
+    handoff_id = str(ref.get("handoff_id") or "").strip()
+    if handoff_id:
+        return f"handoff:{handoff_id}"
+    return f"ref:{fallback_key}"
+
+
+def _handoff_sla_priority(ref: dict[str, Any], *, now: int) -> tuple[int, int, int, int]:
+    status = str(ref.get("status") or "open")
+    created_at = int(ref.get("created_at") or ref.get("updated_at") or now)
+    updated_at = int(ref.get("updated_at") or created_at)
+    age = max(0, now - created_at)
+    return (
+        1 if status == "expired_critical" else 0,
+        1 if handoff_ref_is_critical(ref) else 0,
+        age,
+        updated_at,
+    )
 
 
 def handoff_notifier_from_settings(settings: IntegrationSettings) -> HandoffNotifier:
