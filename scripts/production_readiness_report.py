@@ -73,6 +73,9 @@ def build_production_readiness_report(
     ops_summary = ops_payload.get("summary") if isinstance(ops_payload.get("summary"), dict) else {}
     handoff_manual_no_reply = int(ops_summary.get("handoff_manual_closed_without_client_reply") or 0)
     avito_manual_no_reply = int(ops_summary.get("avito_manual_closed_without_client_reply") or 0)
+    avito_pending_promises = int(ops_summary.get("avito_pending_followups") or 0)
+    avito_critical_promises = int(ops_summary.get("avito_critical_followups") or 0)
+    avito_overdue_promises = int(ops_summary.get("avito_overdue_followups") or 0)
     poller_last_chats = int(ops_summary.get("avito_poller_last_chats") or 0)
     poller_expected_chats = int(ops_summary.get("avito_poller_expected_chats") or 0)
     poller_age_seconds = int(ops_summary.get("avito_poller_age_seconds") or 0)
@@ -87,6 +90,13 @@ def build_production_readiness_report(
     if avito_manual_no_reply > 0:
         manual_actions.append(
             f"Review {avito_manual_no_reply} Avito pending promises closed manually without a confirmed client reply."
+        )
+    if avito_critical_promises > 0 or avito_overdue_promises > 0:
+        blockers.append(
+            f"{max(avito_critical_promises, avito_overdue_promises)} critical/overdue Avito bot promises need final reply"
+        )
+        manual_actions.append(
+            f"Review /avito_followups: pending={avito_pending_promises}, critical={avito_critical_promises}, overdue={avito_overdue_promises}; close only after a final client reply or explicit not-relevant decision."
         )
 
     handoffs = build_open_handoffs_export(
@@ -135,6 +145,12 @@ def build_production_readiness_report(
             "last_chats": poller_last_chats,
             "expected_chats": poller_expected_chats,
             "age_seconds": poller_age_seconds,
+        },
+        "avito_promises": {
+            "pending": avito_pending_promises,
+            "critical": avito_critical_promises,
+            "overdue": avito_overdue_promises,
+            "manual_closed_without_client_reply": avito_manual_no_reply,
         },
         "open_handoff_samples": handoffs.get("items", [])[: min(10, handoff_limit)],
         "temporal_rag_cleanup": {
@@ -199,6 +215,7 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- `{item.get('avito_chat_id') or '-'}` {item.get('client_name') or 'Без имени'}: {item.get('age_hours')}h, critical={item.get('critical')}")
     temporal = report.get("temporal_rag_cleanup") if isinstance(report.get("temporal_rag_cleanup"), dict) else {}
     poller = report.get("poller_coverage") if isinstance(report.get("poller_coverage"), dict) else {}
+    avito_promises = report.get("avito_promises") if isinstance(report.get("avito_promises"), dict) else {}
     backup = report.get("backup_restore_verify") if isinstance(report.get("backup_restore_verify"), dict) else {}
     logrotate = report.get("logrotate") if isinstance(report.get("logrotate"), dict) else {}
     lines.extend(
@@ -207,6 +224,10 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
             "## Avito Missed Poller",
             "",
             f"Latest chats: `{poller.get('last_chats', 0)}/{poller.get('expected_chats', 0)}`, age: `{poller.get('age_seconds', 0)}s`",
+            "",
+            "## Avito Pending Promises",
+            "",
+            f"Pending: `{avito_promises.get('pending', 0)}`, critical: `{avito_promises.get('critical', 0)}`, overdue: `{avito_promises.get('overdue', 0)}`, manual_no_client_reply: `{avito_promises.get('manual_closed_without_client_reply', 0)}`",
             "",
             "## RAG Temporal Cleanup",
             "",

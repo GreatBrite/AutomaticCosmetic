@@ -9294,7 +9294,28 @@ def test_ops_status_failed_autoreply_is_error(tmp_path) -> None:
         status=APPROVED,
         approved_by="olga",
     )
-    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+                "pending_followup_count": 1,
+                "critical_followup_count": 1,
+                "overdue_followup_count": 1,
+                "pending_followups": [
+                    {
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "overdue": True,
+                        "age_seconds": 7200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     state_path.write_text(json.dumps({"handled": {}, "failed": {"chat:msg": {"error": "boom"}}, "activated_at": 100}), encoding="utf-8")
 
     report = build_ops_status_report(
@@ -9559,7 +9580,28 @@ def test_ops_status_errors_when_avito_poller_scans_too_few_chats(tmp_path, monke
         approved_by="olga",
     )
     monkeypatch.setenv("AVITO_POLLER_CHAT_LIMIT", "150")
-    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+                "pending_followup_count": 1,
+                "critical_followup_count": 1,
+                "overdue_followup_count": 1,
+                "pending_followups": [
+                    {
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "overdue": True,
+                        "age_seconds": 7200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
     poller_log.write_text(
         json.dumps(
@@ -9614,7 +9656,28 @@ def test_ops_status_accepts_recent_avito_poller_full_coverage(tmp_path, monkeypa
         approved_by="olga",
     )
     monkeypatch.setenv("AVITO_POLLER_CHAT_LIMIT", "150")
-    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+                "pending_followup_count": 1,
+                "critical_followup_count": 1,
+                "overdue_followup_count": 1,
+                "pending_followups": [
+                    {
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "overdue": True,
+                        "age_seconds": 7200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
     poller_log.write_text(
         json.dumps({"ts": 1780000000, "event": "summary", "processed": 0, "skipped": 1, "errors": 0, "chats": 150})
@@ -10176,7 +10239,28 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     poller_log = tmp_path / "avito_poller.log"
     handoff_path = tmp_path / "telegram_handoff_refs.json"
     rag_path = tmp_path / "expert.sqlite3"
-    report_path.write_text(json.dumps({"ok": True, "count": 0, "actionable_count": 0, "items": []}), encoding="utf-8")
+    report_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "count": 0,
+                "actionable_count": 0,
+                "items": [],
+                "pending_followup_count": 1,
+                "critical_followup_count": 1,
+                "overdue_followup_count": 1,
+                "pending_followups": [
+                    {
+                        "business_status": "overdue",
+                        "severity": "critical",
+                        "overdue": True,
+                        "age_seconds": 7200,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     state_path.write_text(json.dumps({"handled": {}, "failed": {}, "activated_at": 100}), encoding="utf-8")
     poller_log.write_text(json.dumps({"ts": 1000 + 4 * 60 * 60, "event": "summary", "chats": 20}) + "\n", encoding="utf-8")
     handoff_path.write_text(
@@ -10243,16 +10327,22 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
 
     assert report["ok"] is False
     assert "ops_status --strict is not green" in report["blockers"]
+    assert "1 critical/overdue Avito bot promises need final reply" in report["blockers"]
     assert "1 open Olga handoffs need manual review" in report["blockers"]
     assert "1 temporal RAG autoanswer items need cleanup decision" in report["blockers"]
     assert report["poller_coverage"]["last_chats"] == 20
     assert report["poller_coverage"]["expected_chats"] == 150
+    assert report["avito_promises"]["pending"] == 1
+    assert report["avito_promises"]["critical"] == 1
+    assert report["avito_promises"]["overdue"] == 1
     assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
     assert "--decisions data/expert_rag_temporal_cleanup.md" in report["temporal_rag_cleanup"]["dry_run_decisions_command"]
     assert report["backup_restore_verify"]["ok"] is True
     assert report["logrotate"]["ok"] is True
     assert "Status: `BLOCKED`" in markdown
     assert "Review open Olga handoffs" in markdown
+    assert "Review /avito_followups: pending=1, critical=1, overdue=1" in "\n".join(report["manual_actions"])
+    assert "Pending: `1`, critical: `1`, overdue: `1`" in markdown
     assert "Fix Avito missed-poller coverage: latest summary scanned 20/150 chats" in "\n".join(report["manual_actions"])
     assert "mark per-item decisions" in "\n".join(report["manual_actions"])
     assert "Latest chats: `20/150`" in markdown
