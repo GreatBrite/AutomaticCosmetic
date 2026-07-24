@@ -639,11 +639,15 @@ def test_send_open_handoff_cards_marks_critical_sla(tmp_path, monkeypatch) -> No
 
 
 @pytest.fixture(autouse=True)
-def isolate_avito_processed_events(tmp_path):
+def isolate_avito_processed_events(tmp_path, monkeypatch):
     old_path = processed_events.path
     old_seen = processed_events.seen
     old_webhook_log_path = avito_webhook_module.WEBHOOK_LOG_PATH
     old_history_override = avito_app.dependency_overrides.get(get_history_store)
+    runtime_dir = tmp_path / "runtime"
+    monkeypatch.setenv("AUTOMATICCOSMETIC_TEST_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv("TELEGRAM_ADMIN_HISTORY_DB_PATH", str(runtime_dir / "leads.sqlite3"))
+    monkeypatch.setenv("RAG_EXPERT_DB_PATH", str(runtime_dir / "expert_rag.sqlite3"))
     processed_events.path = tmp_path / "avito_processed_events.json"
     processed_events.seen = {}
     avito_webhook_module.WEBHOOK_LOG_PATH = tmp_path / "avito_webhook.log"
@@ -5177,6 +5181,9 @@ def test_telegram_admin_codex_timeout_defaults_are_longer(tmp_path, monkeypatch)
 
 
 def _settings(allow_mutations: bool = False) -> IntegrationSettings:
+    runtime_dir = Path(os.getenv("AUTOMATICCOSMETIC_TEST_RUNTIME_DIR", ""))
+    history_db_path = (runtime_dir / "leads.sqlite3") if runtime_dir else Path("data/leads.sqlite3")
+    expert_db_path = (runtime_dir / "expert_rag.sqlite3") if runtime_dir else Path("data/expert_rag.sqlite3")
     return IntegrationSettings(
         public_base_url="https://olgatihcosmo.com",
         cities=("Ростов-на-Дону", "Москва"),
@@ -5194,7 +5201,7 @@ def _settings(allow_mutations: bool = False) -> IntegrationSettings:
         telegram_admin_live_draft_interval_seconds=1.2,
         telegram_admin_history_enabled=True,
         telegram_admin_history_limit=8,
-        telegram_admin_history_db_path=Path("data/leads.sqlite3"),
+        telegram_admin_history_db_path=history_db_path,
         openrouter_api_key="openrouter",
         default_model="model",
         avito_codex_enabled=False,
@@ -5211,7 +5218,7 @@ def _settings(allow_mutations: bool = False) -> IntegrationSettings:
         rag_retrieval_enabled=True,
         rag_autoanswer_threshold=0.82,
         rag_handoff_threshold=0.65,
-        rag_expert_db_path=Path("data/expert_rag.sqlite3"),
+        rag_expert_db_path=expert_db_path,
         yclients_api_key="api-key",
         yclients_user_token="user-token",
         yclients_company_id=123,
@@ -5240,6 +5247,15 @@ def _settings(allow_mutations: bool = False) -> IntegrationSettings:
 
 def _settings_with_city_company_ids(city_company_ids: dict[str, int]) -> IntegrationSettings:
     return replace(_settings(), yclients_city_company_ids=city_company_ids)
+
+
+def test_default_test_settings_use_isolated_runtime_paths(tmp_path) -> None:
+    settings = _settings()
+
+    assert not str(settings.telegram_admin_history_db_path).startswith("data/")
+    assert not str(settings.rag_expert_db_path).startswith("data/")
+    assert Path(os.environ["AUTOMATICCOSMETIC_TEST_RUNTIME_DIR"]) in settings.telegram_admin_history_db_path.parents
+    assert Path(os.environ["AUTOMATICCOSMETIC_TEST_RUNTIME_DIR"]) in settings.rag_expert_db_path.parents
 
 
 @pytest.mark.anyio
