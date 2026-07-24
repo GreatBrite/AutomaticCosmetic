@@ -208,6 +208,22 @@ LLM-понимание свободных команд Ольги использ
 
 Дальше по каждому пункту в `data/open_handoffs_review.md` нужно открыть Avito/тему клиента, проверить последний входящий и исходящий, затем закрыть карточку только с понятным результатом: клиент получил финальный ответ, Ольга обработала вручную, вопрос явно неактуален или задача всё ещё требует действия.
 
+В review-файле у каждой карточки есть блок `Decision, mark exactly one after manual review`. После проверки нужно отметить ровно одну строку `- [x]` и оставить причину после двоеточия. Закрывающие решения без причины не применяются.
+
+Сначала всегда dry-run:
+
+```bash
+.venv/bin/python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md
+```
+
+Если dry-run не показывает ошибок, можно применить решения:
+
+```bash
+.venv/bin/python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md --apply-decisions
+```
+
+Команда сохраняет в `data/telegram_handoff_refs.json` статус, `closed_at`, `resolution_note`, `resolution_source` и `resolution_action`. Решение `still_needs_action` state не закрывает: такая карточка остаётся видимой в `ops_status` и `/open_cards`.
+
 ### `avito_pending_followups`
 
 Это зависшие обещания бота после фраз вроде “уточню”, “проверю”, “подтвержу”.

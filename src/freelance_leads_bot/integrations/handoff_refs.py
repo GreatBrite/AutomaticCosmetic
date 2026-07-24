@@ -15,8 +15,10 @@ CLOSED_HANDOFF_STATUSES = {
     "answered",
     "resolved",
     "closed",
+    "manual_closed",
     "closed_manual",
     "closed_manual_no_client_reply",
+    "not_relevant",
     "expired",
 }
 CRITICAL_HANDOFF_REASONS = {
@@ -152,6 +154,9 @@ def update_handoff_status(
     status: str,
     *,
     draft_id: str = "",
+    resolution_note: str = "",
+    resolution_source: str = "",
+    resolution_action: str = "",
     path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
 ) -> bool:
     handoff_id = str(handoff_id or "").strip()
@@ -166,6 +171,12 @@ def update_handoff_status(
         ref["status"] = status
         ref["draft_id"] = str(draft_id or ref.get("draft_id") or "")
         ref["closed_at"] = now if status in CLOSED_HANDOFF_STATUSES else 0
+        if resolution_note:
+            ref["resolution_note"] = str(resolution_note).strip()[:1000]
+        if resolution_source:
+            ref["resolution_source"] = str(resolution_source).strip()[:120]
+        if resolution_action:
+            ref["resolution_action"] = str(resolution_action).strip()[:120]
         ref["updated_at"] = now
         changed = True
     if changed:

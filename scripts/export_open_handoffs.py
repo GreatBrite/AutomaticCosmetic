@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -15,13 +16,28 @@ if str(ROOT) not in sys.path:
 
 from src.freelance_leads_bot.integrations.handoff_refs import (  # noqa: E402
     DEFAULT_HANDOFF_REFS_PATH,
+    load_telegram_handoff_refs,
     handoff_ref_is_critical,
     read_open_handoff_refs,
+    update_handoff_status,
 )
 
 
 DEFAULT_WEBHOOK_LOG_PATH = Path("data/avito_webhook.log")
 DEFAULT_POLLER_LOG_PATH = Path("data/avito_poller.log")
+DECISION_SOURCE = "open_handoffs_markdown"
+DECISION_ACTION_TO_STATUS = {
+    "resolved": "closed",
+    "closed_manual": "closed_manual",
+    "closed_manual_no_client_reply": "closed_manual_no_client_reply",
+    "not_relevant": "not_relevant",
+}
+DECISION_RE = re.compile(
+    r"^\s*-\s*\[[xX]\]\s*"
+    r"(?P<action>resolved|closed_manual|closed_manual_no_client_reply|not_relevant|still_needs_action)"
+    r"\s+#(?P<handoff_id>[A-Za-z0-9_.:-]+)"
+    r"(?:\s*:\s*(?P<note>.*))?\s*$"
+)
 
 
 def build_open_handoffs_export(
@@ -104,6 +120,7 @@ def format_open_handoffs_markdown(report: dict[str, Any]) -> str:
                 "",
                 f"## {index}. {item.get('client_name') or 'Без имени'}",
                 "",
+                f"- Handoff id: `#{item.get('handoff_id') or '-'}`",
                 f"- Flags: `{', '.join(flags)}`",
                 f"- Age: `{item.get('age_hours')}h`, created: `{item.get('created_at_iso')}`",
                 f"- Avito chat_id: `{item.get('avito_chat_id') or '-'}`",
@@ -132,10 +149,147 @@ def format_open_handoffs_markdown(report: dict[str, Any]) -> str:
                 "- [ ] Avito opened and latest incoming/outgoing checked",
                 "- [ ] Final client reply sent or Olga confirmed manual handling",
                 "- [ ] Close reason written down",
+                "",
+                "Decision, mark exactly one after manual review:",
+                "",
+                f"- [ ] resolved #{item.get('handoff_id')}: client received a final Avito reply; note time/text",
+                f"- [ ] closed_manual #{item.get('handoff_id')}: Olga handled it outside the bot; note what happened",
+                f"- [ ] closed_manual_no_client_reply #{item.get('handoff_id')}: critical task reviewed, no client reply was sent; note why this is acceptable",
+                f"- [ ] not_relevant #{item.get('handoff_id')}: no longer relevant; note why",
+                f"- [ ] still_needs_action #{item.get('handoff_id')}: still needs Olga/client action; note next step",
             ]
         )
     if report.get("truncated"):
         lines.append("\nReport was truncated by --limit.")
+    return "\n".join(lines)
+
+
+def parse_open_handoff_decisions(markdown: str) -> list[dict[str, str]]:
+    decisions: list[dict[str, str]] = []
+    for line_no, line in enumerate(str(markdown or "").splitlines(), start=1):
+        match = DECISION_RE.match(line)
+        if not match:
+            continue
+        decisions.append(
+            {
+                "line": str(line_no),
+                "action": match.group("action"),
+                "handoff_id": match.group("handoff_id"),
+                "note": str(match.group("note") or "").strip(),
+            }
+        )
+    return decisions
+
+
+def build_handoff_decision_review(
+    *,
+    decisions_path: Path,
+    refs_path: Path = DEFAULT_HANDOFF_REFS_PATH,
+    apply: bool = False,
+    now: int | None = None,
+) -> dict[str, Any]:
+    now_ts = int(time.time()) if now is None else int(now)
+    try:
+        markdown = decisions_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {
+            "ok": False,
+            "generated_at": now_ts,
+            "generated_at_iso": _iso(now_ts),
+            "decisions_path": str(decisions_path),
+            "refs_path": str(refs_path),
+            "error": f"cannot_read_decisions: {exc}",
+            "items": [],
+        }
+    decisions = parse_open_handoff_decisions(markdown)
+    refs = load_telegram_handoff_refs(refs_path)
+    refs_by_handoff_id = {
+        str(ref.get("handoff_id") or "").strip(): ref
+        for ref in refs.values()
+        if isinstance(ref, dict) and str(ref.get("handoff_id") or "").strip()
+    }
+    seen: dict[str, dict[str, str]] = {}
+    items: list[dict[str, Any]] = []
+    ok = True
+    for decision in decisions:
+        handoff_id = decision["handoff_id"]
+        action = decision["action"]
+        note = decision["note"]
+        status = DECISION_ACTION_TO_STATUS.get(action, "")
+        current = refs_by_handoff_id.get(handoff_id)
+        item = {
+            "line": int(decision["line"]),
+            "handoff_id": handoff_id,
+            "action": action,
+            "target_status": status or "",
+            "note": note,
+            "applied": False,
+            "error": "",
+        }
+        if handoff_id in seen:
+            item["error"] = f"duplicate_decision:first_seen_line={seen[handoff_id]['line']}"
+        elif not current:
+            item["error"] = "handoff_not_found"
+        elif action != "still_needs_action" and not note:
+            item["error"] = "missing_close_reason"
+        elif action == "still_needs_action":
+            item["target_status"] = str(current.get("status") or "open")
+        seen[handoff_id] = decision
+        if item["error"]:
+            ok = False
+        items.append(item)
+    if ok and apply:
+        for item in items:
+            if item["action"] == "still_needs_action":
+                continue
+            item["applied"] = update_handoff_status(
+                str(item["handoff_id"]),
+                str(item["target_status"]),
+                resolution_note=str(item["note"]),
+                resolution_source=DECISION_SOURCE,
+                resolution_action=str(item["action"]),
+                path=refs_path,
+            )
+            if not item["applied"]:
+                item["error"] = "update_failed"
+                ok = False
+    return {
+        "ok": ok,
+        "apply": bool(apply),
+        "generated_at": now_ts,
+        "generated_at_iso": _iso(now_ts),
+        "decisions_path": str(decisions_path),
+        "refs_path": str(refs_path),
+        "decision_count": len(decisions),
+        "applied_count": sum(1 for item in items if item.get("applied")),
+        "error_count": sum(1 for item in items if item.get("error")),
+        "items": items,
+    }
+
+
+def format_handoff_decision_review(review: dict[str, Any]) -> str:
+    lines = [
+        "# Open Handoff Decision Review",
+        "",
+        f"Generated: `{review.get('generated_at_iso')}`",
+        f"Mode: `{'apply' if review.get('apply') else 'dry-run'}`",
+        f"Decisions: `{review.get('decision_count', 0)}`, applied: `{review.get('applied_count', 0)}`, errors: `{review.get('error_count', 0)}`",
+    ]
+    if review.get("error"):
+        lines.extend(["", f"Error: `{review.get('error')}`"])
+        return "\n".join(lines)
+    items = review.get("items") if isinstance(review.get("items"), list) else []
+    if not items:
+        lines.extend(["", "No checked decision lines found."])
+        return "\n".join(lines)
+    lines.extend(["", "Items:"])
+    for item in items:
+        result = "applied" if item.get("applied") else "planned"
+        if item.get("error"):
+            result = f"ERROR {item.get('error')}"
+        lines.append(
+            f"- line `{item.get('line')}`: `{item.get('action')}` `#{item.get('handoff_id')}` -> `{item.get('target_status') or '-'}` ({result})"
+        )
     return "\n".join(lines)
 
 
@@ -259,7 +413,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--decisions",
+        type=Path,
+        help="Read checked decision lines from a previously exported Markdown review file.",
+    )
+    parser.add_argument(
+        "--apply-decisions",
+        action="store_true",
+        help="Apply checked decision lines from --decisions. Without this flag the command is a dry-run.",
+    )
     args = parser.parse_args(argv)
+    if args.decisions:
+        review = build_handoff_decision_review(
+            decisions_path=args.decisions,
+            refs_path=args.refs,
+            apply=args.apply_decisions,
+        )
+        content = json.dumps(review, ensure_ascii=False, indent=2) if args.json else format_handoff_decision_review(review)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(content + "\n", encoding="utf-8")
+            print(f"Reviewed {review.get('decision_count', 0)} handoff decisions from {args.decisions}")
+        else:
+            print(content)
+        return 0 if review.get("ok") else 1
     report = build_open_handoffs_export(
         refs_path=args.refs,
         webhook_log_path=args.webhook_log,

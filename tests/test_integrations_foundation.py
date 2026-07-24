@@ -174,7 +174,12 @@ from scripts.avito_unanswered_monitor import (
 from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
-from scripts.export_open_handoffs import build_open_handoffs_export, format_open_handoffs_markdown
+from scripts.export_open_handoffs import (
+    build_handoff_decision_review,
+    build_open_handoffs_export,
+    format_open_handoffs_markdown,
+    parse_open_handoff_decisions,
+)
 from scripts.production_readiness_report import build_production_readiness_report, format_production_readiness_markdown
 from scripts.verify_runtime_backup import verify_runtime_backup
 from scripts.verify_logrotate_config import verify_logrotate_config
@@ -446,6 +451,135 @@ def test_export_open_handoffs_is_read_only_and_includes_avito_evidence(tmp_path)
     assert report["items"][0]["last_outgoing"]["text"] == "Да, запись подтверждена, адрес отправили."
     assert "CRITICAL" in rendered
     assert "Avito opened and latest incoming/outgoing checked" in rendered
+    assert f"resolved #{report['items'][0]['handoff_id']}" in rendered
+
+
+def test_open_handoff_decision_review_dry_run_and_apply_with_reasons(tmp_path) -> None:
+    refs_path = tmp_path / "telegram_handoff_refs.json"
+    first = remember_telegram_handoff_ref(
+        telegram_chat_id="admin",
+        telegram_message_id="10",
+        avito_chat_id="chat-critical",
+        source_message_id="in-1",
+        client_name="Милена",
+        handoff_text="Клиент спрашивает: запись на 28 июля у нас в силе? Адрес не напишите?",
+        status="open",
+        path=refs_path,
+    )
+    second = remember_telegram_handoff_ref(
+        telegram_chat_id="admin",
+        telegram_message_id="11",
+        avito_chat_id="chat-old",
+        source_message_id="in-2",
+        client_name="Олеся",
+        handoff_text="Нужна ручная консультация",
+        status="draft_pending",
+        path=refs_path,
+    )
+    decisions_path = tmp_path / "review.md"
+    decisions_path.write_text(
+        "\n".join(
+            [
+                f"- [x] resolved #{first['handoff_id']}: ответ в Avito отправлен в 12:10",
+                f"- [x] not_relevant #{second['handoff_id']}: клиент уже отменил вопрос",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = json.loads(refs_path.read_text(encoding="utf-8"))
+
+    decisions = parse_open_handoff_decisions(decisions_path.read_text(encoding="utf-8"))
+    dry_run = build_handoff_decision_review(decisions_path=decisions_path, refs_path=refs_path, apply=False)
+    after_dry_run = json.loads(refs_path.read_text(encoding="utf-8"))
+
+    assert len(decisions) == 2
+    assert dry_run["ok"] is True
+    assert dry_run["applied_count"] == 0
+    assert before == after_dry_run
+
+    applied = build_handoff_decision_review(decisions_path=decisions_path, refs_path=refs_path, apply=True)
+    refs = load_telegram_handoff_refs(refs_path)
+    first_ref = next(ref for ref in refs.values() if ref["handoff_id"] == first["handoff_id"])
+    second_ref = next(ref for ref in refs.values() if ref["handoff_id"] == second["handoff_id"])
+
+    assert applied["ok"] is True
+    assert applied["applied_count"] == 2
+    assert first_ref["status"] == "closed"
+    assert first_ref["closed_at"] > 0
+    assert first_ref["resolution_note"] == "ответ в Avito отправлен в 12:10"
+    assert first_ref["resolution_source"] == "open_handoffs_markdown"
+    assert first_ref["resolution_action"] == "resolved"
+    assert second_ref["status"] == "not_relevant"
+    assert second_ref["closed_at"] > 0
+
+
+def test_open_handoff_decision_review_requires_close_reason(tmp_path) -> None:
+    refs_path = tmp_path / "telegram_handoff_refs.json"
+    ref = remember_telegram_handoff_ref(
+        telegram_chat_id="admin",
+        telegram_message_id="10",
+        avito_chat_id="chat-critical",
+        source_message_id="in-1",
+        handoff_text="Клиент спрашивает: запись в силе?",
+        status="open",
+        path=refs_path,
+    )
+    decisions_path = tmp_path / "review.md"
+    decisions_path.write_text(f"- [x] closed_manual #{ref['handoff_id']}\n", encoding="utf-8")
+
+    review = build_handoff_decision_review(decisions_path=decisions_path, refs_path=refs_path, apply=True)
+    refs = load_telegram_handoff_refs(refs_path)
+    current = next(row for row in refs.values() if row["handoff_id"] == ref["handoff_id"])
+
+    assert review["ok"] is False
+    assert review["items"][0]["error"] == "missing_close_reason"
+    assert review["applied_count"] == 0
+    assert current["status"] == "open"
+    assert current["closed_at"] == 0
+
+
+def test_open_handoff_decision_review_does_not_partially_apply_invalid_file(tmp_path) -> None:
+    refs_path = tmp_path / "telegram_handoff_refs.json"
+    first = remember_telegram_handoff_ref(
+        telegram_chat_id="admin",
+        telegram_message_id="10",
+        avito_chat_id="chat-one",
+        source_message_id="in-1",
+        handoff_text="Клиент получил ответ",
+        status="open",
+        path=refs_path,
+    )
+    second = remember_telegram_handoff_ref(
+        telegram_chat_id="admin",
+        telegram_message_id="11",
+        avito_chat_id="chat-two",
+        source_message_id="in-2",
+        handoff_text="Клиент спрашивает адрес",
+        status="open",
+        path=refs_path,
+    )
+    decisions_path = tmp_path / "review.md"
+    decisions_path.write_text(
+        "\n".join(
+            [
+                f"- [x] resolved #{first['handoff_id']}: ответ отправлен",
+                f"- [x] closed_manual #{second['handoff_id']}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    review = build_handoff_decision_review(decisions_path=decisions_path, refs_path=refs_path, apply=True)
+    refs = load_telegram_handoff_refs(refs_path)
+    first_ref = next(row for row in refs.values() if row["handoff_id"] == first["handoff_id"])
+    second_ref = next(row for row in refs.values() if row["handoff_id"] == second["handoff_id"])
+
+    assert review["ok"] is False
+    assert review["applied_count"] == 0
+    assert first_ref["status"] == "open"
+    assert second_ref["status"] == "open"
 
 
 def test_send_open_handoff_cards_reissues_each_handoff_in_current_topic(tmp_path, monkeypatch) -> None:
