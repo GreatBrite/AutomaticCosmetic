@@ -70,6 +70,17 @@ def build_production_readiness_report(
     ops_payload = report_data(ops_report)
     if ops_status_exit_code(ops_report, strict=True) != 0:
         blockers.append("ops_status --strict is not green")
+    ops_summary = ops_payload.get("summary") if isinstance(ops_payload.get("summary"), dict) else {}
+    handoff_manual_no_reply = int(ops_summary.get("handoff_manual_closed_without_client_reply") or 0)
+    avito_manual_no_reply = int(ops_summary.get("avito_manual_closed_without_client_reply") or 0)
+    if handoff_manual_no_reply > 0:
+        manual_actions.append(
+            f"Review {handoff_manual_no_reply} Telegram handoff closures marked closed_manual_no_client_reply in Avito audit history."
+        )
+    if avito_manual_no_reply > 0:
+        manual_actions.append(
+            f"Review {avito_manual_no_reply} Avito pending promises closed manually without a confirmed client reply."
+        )
 
     handoffs = build_open_handoffs_export(
         refs_path=resolved_handoff_refs_path,
@@ -106,6 +117,10 @@ def build_production_readiness_report(
             key: value
             for key, value in handoffs.items()
             if key not in {"items"}
+        },
+        "manual_closure_audit": {
+            "handoff_manual_closed_without_client_reply": handoff_manual_no_reply,
+            "avito_manual_closed_without_client_reply": avito_manual_no_reply,
         },
         "open_handoff_samples": handoffs.get("items", [])[: min(10, handoff_limit)],
         "temporal_rag_cleanup": {
@@ -152,9 +167,15 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
         ]
     )
     handoffs = report.get("open_handoffs") if isinstance(report.get("open_handoffs"), dict) else {}
+    manual_closure_audit = report.get("manual_closure_audit") if isinstance(report.get("manual_closure_audit"), dict) else {}
     lines.append(
         f"Open: `{handoffs.get('open_count', 0)}`, critical: `{handoffs.get('critical_count', 0)}`, "
         f"draft_pending: `{handoffs.get('draft_pending_count', 0)}`, oldest: `{round(int(handoffs.get('oldest_age_seconds') or 0) / 3600, 1)}h`"
+    )
+    lines.append(
+        "Manual closures without client reply: "
+        f"`handoff={manual_closure_audit.get('handoff_manual_closed_without_client_reply', 0)}`, "
+        f"`avito_promises={manual_closure_audit.get('avito_manual_closed_without_client_reply', 0)}`"
     )
     samples = report.get("open_handoff_samples") if isinstance(report.get("open_handoff_samples"), list) else []
     for item in samples[:5]:

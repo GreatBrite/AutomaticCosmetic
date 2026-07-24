@@ -818,6 +818,7 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
             f"Handoff: open={summary.get('handoff_open', 0)}"
             f" critical={summary.get('handoff_critical', 0)}"
             f" draft_pending={summary.get('handoff_draft_pending', 0)}"
+            f" manual_no_client_reply={summary.get('handoff_manual_closed_without_client_reply', 0)}"
             f" oldest={int(int(summary.get('handoff_oldest_age_seconds') or 0) / 3600)}h"
         ),
         (

@@ -9525,7 +9525,7 @@ def test_ops_status_reports_open_telegram_handoffs_without_mutating_refs(tmp_pat
     assert status["critical_count"] == 1
     assert status["draft_pending_count"] == 1
     assert report.summary["handoff_open"] == 2
-    assert "Handoff: open=2 critical=1 draft_pending=1 oldest=4h" in text
+    assert "Handoff: open=2 critical=1 draft_pending=1 manual_no_client_reply=0 oldest=4h" in text
     assert "Immediate action required: review open Olga handoffs." in text
     assert ops_status_exit_code(report, strict=True) == 1
 
@@ -9589,6 +9589,7 @@ def test_ops_status_reports_telegram_manual_closed_without_client_reply(tmp_path
     assert status["open_count"] == 0
     assert status["manual_closed_without_client_reply_count"] == 1
     assert report.summary["handoff_manual_closed_without_client_reply"] == 1
+    assert "manual_no_client_reply=1" in format_ops_status_report(report)
     assert ops_status_exit_code(report, strict=False) == 0
     assert ops_status_exit_code(report, strict=True) == 1
 
@@ -9998,6 +9999,18 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
                     "status": "open",
                     "created_at": 100,
                     "updated_at": 100,
+                },
+                "admin:11": {
+                    "handoff_id": "handoff-no-reply",
+                    "telegram_chat_id": "admin",
+                    "telegram_message_id": "11",
+                    "avito_chat_id": "chat-manual",
+                    "handoff_text": "Сообщение: Клиент ждал подтверждение, но Ольга закрыла вручную.",
+                    "status": "closed_manual_no_client_reply",
+                    "resolution_note": "закрыто вручную после проверки Авито",
+                    "created_at": 120,
+                    "updated_at": 130,
+                    "closed_at": 140,
                 }
             },
             ensure_ascii=False,
@@ -10041,10 +10054,13 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert "ops_status --strict is not green" in report["blockers"]
     assert "1 open Olga handoffs need manual review" in report["blockers"]
     assert "1 temporal RAG autoanswer items need cleanup decision" in report["blockers"]
+    assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
     assert report["backup_restore_verify"]["ok"] is True
     assert report["logrotate"]["ok"] is True
     assert "Status: `BLOCKED`" in markdown
     assert "Review open Olga handoffs" in markdown
+    assert "Review 1 Telegram handoff closures marked closed_manual_no_client_reply" in "\n".join(report["manual_actions"])
+    assert "Manual closures without client reply: `handoff=1`, `avito_promises=0`" in markdown
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:
