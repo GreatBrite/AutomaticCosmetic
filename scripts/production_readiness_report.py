@@ -101,7 +101,9 @@ def build_production_readiness_report(
     temporal = _temporal_cleanup_status(rag_db_path=rag_db_path, limit=temporal_limit)
     if int(temporal.get("planned_count") or 0) > 0:
         blockers.append(f"{temporal.get('planned_count')} temporal RAG autoanswer items need cleanup decision")
-        manual_actions.append("Review temporal RAG cleanup export, then run --apply only after approval.")
+        manual_actions.append(
+            "Review temporal RAG cleanup export, mark per-item decisions, dry-run --decisions, then apply only checked block_autoanswer decisions."
+        )
 
     backup = _backup_status(backup_dir, enabled=include_backup_verify)
     if include_backup_verify and not backup.get("ok"):
@@ -140,6 +142,9 @@ def build_production_readiness_report(
             "dry_run": temporal.get("dry_run"),
             "planned_count": temporal.get("planned_count", 0),
             "sample_ids": [item.get("id") for item in temporal.get("planned", [])[:10] if isinstance(item, dict)],
+            "export_command": "python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --output data/expert_rag_temporal_cleanup.md",
+            "dry_run_decisions_command": "python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md",
+            "apply_decisions_command": "python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md --apply",
         },
         "backup_restore_verify": backup,
         "logrotate": logrotate,
@@ -206,6 +211,12 @@ def format_production_readiness_markdown(report: dict[str, Any]) -> str:
             "## RAG Temporal Cleanup",
             "",
             f"Planned: `{temporal.get('planned_count', 0)}`, sample ids: `{', '.join(str(item) for item in temporal.get('sample_ids', [])) or '-'}`",
+            "",
+            "```bash",
+            str(temporal.get("export_command") or ""),
+            str(temporal.get("dry_run_decisions_command") or ""),
+            str(temporal.get("apply_decisions_command") or ""),
+            "```",
             "",
             "## Backup Restore Verify",
             "",

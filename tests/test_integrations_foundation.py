@@ -10248,12 +10248,16 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert report["poller_coverage"]["last_chats"] == 20
     assert report["poller_coverage"]["expected_chats"] == 150
     assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
+    assert "--decisions data/expert_rag_temporal_cleanup.md" in report["temporal_rag_cleanup"]["dry_run_decisions_command"]
     assert report["backup_restore_verify"]["ok"] is True
     assert report["logrotate"]["ok"] is True
     assert "Status: `BLOCKED`" in markdown
     assert "Review open Olga handoffs" in markdown
     assert "Fix Avito missed-poller coverage: latest summary scanned 20/150 chats" in "\n".join(report["manual_actions"])
+    assert "mark per-item decisions" in "\n".join(report["manual_actions"])
     assert "Latest chats: `20/150`" in markdown
+    assert "temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md" in markdown
+    assert "temporal-cleanup --apply" not in markdown
     assert "Review 1 Telegram handoff closures marked closed_manual_no_client_reply" in "\n".join(report["manual_actions"])
     assert "Manual closures without client reply: `handoff=1`, `avito_promises=0`" in markdown
 
