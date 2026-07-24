@@ -194,6 +194,8 @@ class TelegramHandoffNotifier:
             result = {"ok": False, "error": repr(exc)}
             notify_error = repr(exc)
         telegram_message_id = _telegram_message_id(result) if isinstance(result, dict) else ""
+        if not telegram_message_id and not notify_error:
+            notify_error = _telegram_send_error(result, "telegram_message_not_delivered")
         ref = {}
         if telegram_message_id:
             task_fields = _booking_task_fields(handoff) if urgent else _handoff_task_fields(handoff)
@@ -230,7 +232,7 @@ class TelegramHandoffNotifier:
             await asyncio.to_thread(_store_ref_media_statuses, self.chat_id, telegram_message_id, attachment_statuses, self.ref_path)
         failure_notify = await self._notify_media_failures(handoff, photo_errors + media_errors)
         return {
-            "sent": not notify_error,
+            "sent": bool(telegram_message_id) and not notify_error,
             "error": notify_error,
             "telegram": result,
             "telegram_handoff_ref": ref,
@@ -333,6 +335,8 @@ class TelegramHandoffNotifier:
             edit_result = await _to_thread_retry(self.bot.edit_message_text, self.chat_id, parsed_message_id, escaped_text)
         except Exception as exc:
             return {"merged": False, "reason": "edit_failed", "error": repr(exc)}
+        if not _telegram_delivery_ok(edit_result):
+            return {"merged": False, "reason": "edit_not_delivered", "error": _telegram_send_error(edit_result, "telegram_edit_not_delivered")}
         is_critical = _handoff_is_critical(handoff)
         task_fields = _handoff_task_fields(handoff)
         ref = await asyncio.to_thread(
@@ -403,7 +407,15 @@ class TelegramHandoffNotifier:
                 )
             else:
                 result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, escape(text), **(topic_params or {})))
-            return {"sent": True, "telegram": result, "text": text, "reply_markup": reply_markup or {}, "topic_params": topic_params or {}}
+            sent = _telegram_delivery_ok(result)
+            return {
+                "sent": sent,
+                "error": "" if sent else _telegram_send_error(result, "telegram_message_not_delivered"),
+                "telegram": result,
+                "text": text,
+                "reply_markup": reply_markup or {},
+                "topic_params": topic_params or {},
+            }
         except Exception as exc:
             return {"sent": False, "error": repr(exc), "text": text, "reply_markup": reply_markup or {}, "topic_params": topic_params or {}}
 
@@ -418,15 +430,25 @@ class TelegramHandoffNotifier:
             result = await _to_thread_retry(
                 lambda: self.bot.send_photo_url(self.chat_id, photo_url, escape(caption) if caption else None, **(topic_params or {}))
             )
-            return {"sent": True, "telegram": result, "photo_url": photo_url, "caption": caption, "topic_params": topic_params or {}}
+            sent = _telegram_delivery_ok(result)
+            return {
+                "sent": sent,
+                "error": "" if sent else _telegram_send_error(result, "telegram_photo_not_delivered"),
+                "telegram": result,
+                "photo_url": photo_url,
+                "caption": caption,
+                "topic_params": topic_params or {},
+            }
         except Exception as url_exc:
             try:
                 path = await asyncio.to_thread(_download_photo_url, photo_url, self.media_dir)
                 result = await _to_thread_retry(
                     lambda: self.bot.send_photo(self.chat_id, path, escape(caption) if caption else None, **(topic_params or {}))
                 )
+                sent = _telegram_delivery_ok(result)
                 return {
-                    "sent": True,
+                    "sent": sent,
+                    "error": "" if sent else _telegram_send_error(result, "telegram_photo_not_delivered"),
                     "telegram": result,
                     "photo_url": photo_url,
                     "caption": caption,
@@ -585,7 +607,7 @@ def _notification_delivered(result: Any) -> bool:
         return False
     if result.get("sent") is True:
         return True
-    if result.get("ok") is True and not result.get("error"):
+    if _telegram_delivery_ok(result.get("telegram") or result):
         return True
     return result.get("reason") == "preview_only" and bool(result.get("outbox") or result.get("outbox_path"))
 
@@ -878,6 +900,16 @@ def _message_data(handoff: Handoff) -> dict[str, Any]:
 def _telegram_message_id(send_response: dict[str, Any]) -> str:
     result = send_response.get("result") if isinstance(send_response.get("result"), dict) else {}
     return str(result.get("message_id") or send_response.get("message_id") or "").strip()
+
+
+def _telegram_delivery_ok(send_response: Any) -> bool:
+    return isinstance(send_response, dict) and send_response.get("ok") is not False and bool(_telegram_message_id(send_response))
+
+
+def _telegram_send_error(send_response: Any, fallback: str) -> str:
+    if not isinstance(send_response, dict):
+        return fallback
+    return str(send_response.get("error") or send_response.get("description") or fallback)
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:

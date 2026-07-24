@@ -9146,6 +9146,29 @@ async def test_telegram_handoff_notifier_downloads_and_sends_avito_photo_urls(tm
 
 
 @pytest.mark.anyio
+async def test_telegram_handoff_notifier_requires_message_id_for_sent_status(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+
+    class FakeTelegramBot:
+        def send_message(self, chat_id, text):
+            return {"ok": True}
+
+    handoff = Handoff(
+        reason=HandoffReason.MISSING_DATA,
+        message=avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-no-message-id", "text": "Вопрос"}),
+        summary="Нужно уточнить у Ольги.",
+    )
+    ref_path = tmp_path / "handoff_refs.json"
+    notifier = TelegramHandoffNotifier(FakeTelegramBot(), "admin-chat", ref_path=ref_path, topics_enabled=False)
+
+    result = await notifier.notify(handoff)
+
+    assert result["sent"] is False
+    assert result["error"] == "telegram_message_not_delivered"
+    assert load_telegram_handoff_refs(ref_path) == {}
+
+
+@pytest.mark.anyio
 async def test_telegram_handoff_notifier_merges_repeated_avito_chat_card(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
@@ -9400,6 +9423,42 @@ async def test_handoff_sla_does_not_mark_failed_notifications_as_sent(tmp_path) 
 
     result = await process_handoff_sla(
         EmptyNotifier(),
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=60 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+    )
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
+
+    assert result["reminders"] == 0
+    assert result["escalations"] == 0
+    assert updated.get("reminder_sent_at", 0) == 0
+    assert updated.get("escalation_sent_at", 0) == 0
+
+
+@pytest.mark.anyio
+async def test_handoff_sla_does_not_mark_pseudo_ok_notifications_as_sent(tmp_path) -> None:
+    class PseudoOkNotifier:
+        async def notify_text(self, text):
+            return {"ok": True, "text": text}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-critical",
+        handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
+        urgency="critical",
+        reason="booking_critical",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 5 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+
+    result = await process_handoff_sla(
+        PseudoOkNotifier(),
         ref_path=ref_path,
         now=now,
         reminder_after_seconds=60 * 60,
@@ -11218,6 +11277,44 @@ async def test_process_avito_message_handoff_failure_is_retryable_when_no_client
     assert result["ok"] is False
     assert result["processing_status"] == "retryable_error"
     assert result["error"] == "telegram_handoff_failed:telegram down"
+    assert result["mark_read"]["reason"] == "not_marked_read_delivery_failed"
+
+
+@pytest.mark.anyio
+async def test_process_avito_message_pseudo_ok_handoff_is_retryable_when_no_delivery_evidence(tmp_path) -> None:
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(
+                action="handoff",
+                reply="",
+                handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=context.message, summary="Нужно уточнить у Ольги."),
+                metadata={"planner": "test"},
+            )
+
+    class Sender:
+        async def send_message(self, account_id, chat_id, text):
+            raise AssertionError("empty reply must not be sent")
+
+    class PseudoOkNotifier:
+        async def notify(self, handoff):
+            return {"ok": True}
+
+    message = avito_inbound_message({"type": "message", "id": "m1", "chat_id": "chat-handoff-pseudo-ok", "content": {"text": "Нестандартный вопрос"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=Sender(),
+        handoff_notifier=PseudoOkNotifier(),
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is False
+    assert result["processing_status"] == "retryable_error"
+    assert result["error"] == "telegram_handoff_failed:unknown"
     assert result["mark_read"]["reason"] == "not_marked_read_delivery_failed"
 
 

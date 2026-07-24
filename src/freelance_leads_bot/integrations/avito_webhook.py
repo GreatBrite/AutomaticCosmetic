@@ -841,7 +841,19 @@ def _delivery_ok(result: Any) -> bool:
         return True
     if result.get("reason") == "preview_only" and (result.get("outbox_path") or result.get("outbox")):
         return True
-    return bool(result.get("ok") and not result.get("error"))
+    if result.get("sent") is True:
+        return True
+    telegram_result = result.get("telegram") if isinstance(result.get("telegram"), dict) else result
+    return _telegram_delivery_ok(telegram_result)
+
+
+def _telegram_delivery_ok(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False:
+        return False
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    return bool(payload.get("message_id") or result.get("message_id"))
 
 
 def _delivery_error(result: Any, fallback: str) -> str:
