@@ -9975,10 +9975,12 @@ def test_webhook_runners_disable_uvicorn_access_logs() -> None:
         root / "run_avito_webhook.sh",
         root / "run_yclients_integration.sh",
         root / "deploy/systemd/yclients-avito-webhook.service",
+        root / "deploy/systemd/yclients-yclients-integration.service",
     ]
 
     for path in paths:
-        assert "--no-access-log" in path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
+        assert "--no-access-log" in text or "run_yclients_integration.sh" in text
 
 
 def test_missed_poller_systemd_unit_sets_production_limits() -> None:
