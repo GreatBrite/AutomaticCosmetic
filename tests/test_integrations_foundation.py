@@ -176,6 +176,7 @@ from scripts.avito_missed_message_poller import _should_process as should_proces
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.export_open_handoffs import build_open_handoffs_export, format_open_handoffs_markdown
 from scripts.verify_runtime_backup import verify_runtime_backup
+from scripts.verify_logrotate_config import verify_logrotate_config
 from scripts.avito_live_telegram_relay import (
     compact_handoff_event,
     compact_relay_event,
@@ -9685,6 +9686,43 @@ def test_verify_runtime_backup_restores_to_isolated_dir_and_checks_integrity(tmp
     restored_state = Path(result["restore_dir"]) / "runtime" / "data" / "state.json"
     assert restored_db.exists()
     assert restored_state.read_text(encoding="utf-8") == '{"ok": true}'
+
+
+def test_logrotate_config_covers_debug_logs_without_runtime_state() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = verify_logrotate_config(root / "deploy" / "logrotate" / "automaticcosmetic")
+
+    assert result["ok"] is True
+    assert "/root/AutomaticCosmetic/data/codex_chat/*.debug.log" in result["patterns"]
+    assert "/root/AutomaticCosmetic/data/*.jsonl" in result["patterns"]
+    assert "copytruncate" in result["directives"]
+    assert result["forbidden_matches"] == []
+
+
+def test_logrotate_config_rejects_sqlite_and_state_json(tmp_path) -> None:
+    path = tmp_path / "automaticcosmetic"
+    path.write_text(
+        """
+/root/AutomaticCosmetic/data/*.log
+/root/AutomaticCosmetic/data/leads.sqlite3
+/root/AutomaticCosmetic/data/telegram_handoff_refs.json {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = verify_logrotate_config(path)
+
+    assert result["ok"] is False
+    assert "/root/AutomaticCosmetic/data/leads.sqlite3" in result["forbidden_matches"]
+    assert "/root/AutomaticCosmetic/data/telegram_handoff_refs.json" in result["forbidden_matches"]
 
 
 def test_ops_status_warns_when_expert_rag_has_items_needing_review(tmp_path) -> None:

@@ -382,6 +382,7 @@ systemctl start yclients-visit-confirmations.timer
 
 ```bash
 sudo cp deploy/logrotate/automaticcosmetic /etc/logrotate.d/automaticcosmetic
+PYTHONPATH="$PWD" .venv/bin/python scripts/verify_logrotate_config.py deploy/logrotate/automaticcosmetic
 sudo logrotate -d /etc/logrotate.d/automaticcosmetic
 ```
 
