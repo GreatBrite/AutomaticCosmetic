@@ -308,6 +308,8 @@ curl -s http://127.0.0.1:8020/health
 
 Секрет не писать в логи, PR и скриншоты.
 
+Webhook/YCLIENTS uvicorn-сервисы должны запускаться с `--no-access-log`, потому что Avito token и YCLIENTS secret приходят в query params и иначе могут попасть в journal. `/health` отдаёт только redacted integration URLs, а `ops_status --json` дополнительно маскирует поля `secret`, `token`, `key`, `access_token`.
+
 ## Backup и restore
 
 Ежедневный backup:

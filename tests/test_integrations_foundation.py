@@ -9246,6 +9246,18 @@ def test_ops_status_json_redacts_secrets_and_keeps_secret_required_flag(tmp_path
     assert payload["flags"]["yclients_integration_secret_required"] is True
 
 
+def test_webhook_runners_disable_uvicorn_access_logs() -> None:
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "run_avito_webhook.sh",
+        root / "run_yclients_integration.sh",
+        root / "deploy/systemd/yclients-avito-webhook.service",
+    ]
+
+    for path in paths:
+        assert "--no-access-log" in path.read_text(encoding="utf-8")
+
+
 def test_ops_status_reports_temporal_rag_cleanup_separately(tmp_path) -> None:
     report_path = tmp_path / "unanswered_report.json"
     state_path = tmp_path / "unanswered_state.json"

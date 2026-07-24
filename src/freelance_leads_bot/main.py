@@ -2012,6 +2012,7 @@ def start_avito_webhook_if_needed() -> None:
         host,
         "--port",
         port,
+        "--no-access-log",
     ]
     AVITO_WEBHOOK_SUPERVISOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_handle = AVITO_WEBHOOK_SUPERVISOR_LOG_PATH.open("ab")
