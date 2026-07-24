@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .expert_rag import DEFAULT_EXPERT_RAG_DB_PATH, NEEDS_REVIEW, ExpertAnswer, ExpertRagStore
+from .expert_rag import APPROVED, DEFAULT_EXPERT_RAG_DB_PATH, NEEDS_REVIEW, ExpertAnswer, ExpertRagStore
 
 
 DEFAULT_AUDIT_LOG_PATH = Path("data/expert_rag_review_audit.jsonl")
@@ -22,6 +22,15 @@ _MONEY_RE = re.compile(r"(?iu)(?:\b\d[\d\s]{2,}\b\s*(?:₽|руб|р\b)?|сто�
 _VOLUME_RE = re.compile(r"(?iu)\b\d+(?:[.,-]\d+)?\s*мл\b")
 _CASE_SPECIFIC_RE = re.compile(r"(?iu)(клиент прислал несколько сообщений|после родов|подвисает|жду|буду ждать|еду в питер|мурманск|фото-пример)")
 _EFFECT_RE = re.compile(r"(?iu)(эффект|держится|сохраняется)")
+_TEMPORAL_RE = re.compile(
+    r"(?iu)\b("
+    r"сегодня|завтра|послезавтра|вчера|"
+    r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|"
+    r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|"
+    r"\d{1,2}:\d{2}|"
+    r"окн[оа]|слот|запис[ьи]|адрес|акци[яи]|скидк|договор[её]н"
+    r")\b"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
     decisions_parser.add_argument("path", type=Path, help="Markdown file produced by the export command and marked with [x].")
     decisions_parser.add_argument("--apply", action="store_true", help="Apply safe approve/deprecate decisions. Default is dry-run.")
     decisions_parser.add_argument("--by", default="olga", help="Approver name for applied approve decisions.")
+
+    temporal_parser = subparsers.add_parser(
+        "temporal-cleanup",
+        help="Disable autoanswer for approved temporal facts without expiry.",
+    )
+    temporal_parser.add_argument("--limit", type=int, default=200, help="Maximum approved items to scan.")
+    temporal_parser.add_argument("--apply", action="store_true", help="Apply metadata changes. Default is dry-run.")
 
     return parser
 
@@ -142,6 +158,15 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
             path=args.path,
             apply=args.apply,
             approved_by=args.by,
+            as_json=args.json,
+        )
+
+    if args.command == "temporal-cleanup":
+        return _run_temporal_cleanup_command(
+            store,
+            audit_log_path=audit_log_path,
+            limit=args.limit,
+            apply=args.apply,
             as_json=args.json,
         )
 
@@ -322,6 +347,65 @@ def _run_decisions_command(
     return code, _json_or_text(as_json, payload, _format_decision_plan(payload))
 
 
+def _run_temporal_cleanup_command(
+    store: ExpertRagStore,
+    *,
+    audit_log_path: Path,
+    limit: int,
+    apply: bool,
+    as_json: bool,
+) -> tuple[int, str]:
+    planned = _temporal_cleanup_plan(store, limit=limit)
+    applied: list[dict[str, Any]] = []
+    if apply:
+        for entry in planned:
+            item = store.get(int(entry["id"]))
+            if not item:
+                continue
+            updated = store.update_metadata(
+                item.id,
+                {
+                    "autoanswer_allowed": False,
+                    "temporal_fact": True,
+                    "autoanswer_block_reason": "temporal_without_expiry",
+                    "temporal_cleanup_applied_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            _append_audit_log(audit_log_path, action="temporal_cleanup", previous=item, current=updated)
+            applied.append({**entry, "applied": True})
+    payload = {
+        "ok": True,
+        "dry_run": not apply,
+        "planned_count": len(planned),
+        "applied_count": len(applied),
+        "planned": applied if apply else planned,
+    }
+    return 0, _json_or_text(as_json, payload, _format_temporal_cleanup(payload))
+
+
+def _temporal_cleanup_plan(store: ExpertRagStore, *, limit: int) -> list[dict[str, Any]]:
+    planned: list[dict[str, Any]] = []
+    for item in store.list_answers(status=APPROVED, limit=max(1, int(limit or 1))):
+        metadata = item.metadata or {}
+        if item.expires_at or metadata.get("valid_until") or metadata.get("expires_at"):
+            continue
+        if metadata.get("autoanswer_allowed") is False:
+            continue
+        text = "\n".join([item.question_canonical, item.answer_client, item.answer_internal, item.topic, item.service, item.city])
+        if not _TEMPORAL_RE.search(text):
+            continue
+        planned.append(
+            {
+                "id": item.id,
+                "status": item.status,
+                "question": item.question_canonical,
+                "answer_client": item.answer_client,
+                "reason": "temporal_without_expiry",
+            }
+        )
+    return planned
+
+
 def _parse_markdown_decisions(markdown: str) -> dict[int, list[str]]:
     decisions: dict[int, list[str]] = {}
     for line in markdown.splitlines():
@@ -430,6 +514,25 @@ def _format_decision_plan(payload: dict[str, Any]) -> str:
         lines.append("No changes were applied because the decision file needs attention.")
     elif payload.get("dry_run"):
         lines.append("No changes were applied. Re-run with --apply to mutate approve/deprecate decisions.")
+    return "\n".join(lines)
+
+
+def _format_temporal_cleanup(payload: dict[str, Any]) -> str:
+    planned = payload.get("planned") if isinstance(payload.get("planned"), list) else []
+    mode = "DRY RUN" if payload.get("dry_run") else "APPLY"
+    lines = [f"{mode}: expert RAG temporal cleanup"]
+    lines.append(f"Temporal autoanswer blocks planned: {payload.get('planned_count', 0)}")
+    if not planned:
+        lines.append("No approved temporal autoanswer items need cleanup.")
+    for entry in planned[:50]:
+        applied = " applied" if entry.get("applied") else ""
+        lines.append(f"- #{entry.get('id')} {entry.get('reason')}{applied}")
+        if entry.get("question"):
+            lines.append(f"  Q: {_short(str(entry['question']), 90)}")
+        if entry.get("answer_client"):
+            lines.append(f"  A: {_short(str(entry['answer_client']), 120)}")
+    if payload.get("dry_run") and planned:
+        lines.append("No changes were applied. Re-run with --apply to set autoanswer_allowed=false.")
     return "\n".join(lines)
 
 

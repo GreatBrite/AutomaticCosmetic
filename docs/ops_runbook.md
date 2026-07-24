@@ -43,6 +43,13 @@ JSON для автоматизации:
 
 Поля `temporal_without_expiry` и `temporal_needs_cleanup` нужны для старых дат/окон/адресов: такие знания должны быть либо `autoanswer_allowed=false`, либо иметь `expires_at`/`valid_until`. Новые временные ответы Ольги сохраняются как память, но автоматически блокируются от autoanswer без expiry.
 
+Почистить старые временные approved-знания безопасно через dry-run:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --apply
+```
+
 ## Текущий нормальный WARN
 
 Если видишь:

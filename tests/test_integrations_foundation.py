@@ -6671,6 +6671,45 @@ def test_expert_rag_review_cli_rejects_conflicting_markdown_decisions(tmp_path) 
     assert not audit_path.exists()
 
 
+def test_expert_rag_review_temporal_cleanup_dry_run_and_apply(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    store = ExpertRagStore(db_path)
+    stale = store.upsert_from_handoff(
+        question="Можно завтра записаться?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    blocked = store.upsert_from_handoff(
+        question="Адрес завтра?",
+        answer_client="Завтра адрес уточняем отдельно.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": False},
+    )
+
+    dry_code, dry_output = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "temporal-cleanup"])
+    apply_code, apply_output = run_review_command(["--db", str(db_path), "--audit-log", str(audit_path), "temporal-cleanup", "--apply"])
+    updated_stale = store.get(stale.id)
+    updated_blocked = store.get(blocked.id)
+
+    assert dry_code == 0
+    assert "DRY RUN" in dry_output
+    assert f"#{stale.id}" in dry_output
+    assert apply_code == 0
+    assert "APPLY" in apply_output
+    assert updated_stale is not None
+    assert updated_stale.metadata["autoanswer_allowed"] is False
+    assert updated_stale.metadata["temporal_fact"] is True
+    assert updated_stale.metadata["autoanswer_block_reason"] == "temporal_without_expiry"
+    assert updated_blocked is not None
+    assert updated_blocked.metadata["autoanswer_allowed"] is False
+    assert audit_path.exists()
+    assert "temporal_cleanup" in audit_path.read_text(encoding="utf-8")
+
+
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     expert = ExpertRagStore(tmp_path / "expert.sqlite3")
