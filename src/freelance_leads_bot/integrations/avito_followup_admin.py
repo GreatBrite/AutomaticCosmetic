@@ -81,6 +81,8 @@ def apply_pending_followup_action(
     now: int | None = None,
     audit_path: Path | str = DEFAULT_FOLLOWUP_AUDIT_LOG_PATH,
     snooze_seconds: int = DEFAULT_FOLLOWUP_SNOOZE_SECONDS,
+    client_answer_confirmed: bool = False,
+    resolution_note: str = "",
 ) -> dict[str, Any]:
     parsed = parse_pending_followup_callback(f"avfu:{token}:{action}")
     if parsed is None:
@@ -93,6 +95,10 @@ def apply_pending_followup_action(
     if not key:
         return {"ok": False, "reason": "followup_not_found", "token": token, "action": action}
     row = pending.get(key) if isinstance(pending.get(key), dict) else {}
+    if client_answer_confirmed:
+        row["client_answer_confirmed"] = True
+        if resolution_note:
+            row["final_answer"] = str(resolution_note).strip()[:1000]
     if action == "done":
         close_status = "closed_manual_no_client_reply" if _critical_without_client_reply(row) else "manual_closed"
         row.update(
@@ -107,6 +113,8 @@ def apply_pending_followup_action(
                 "overdue": False,
             }
         )
+        if resolution_note:
+            row["resolution_note"] = str(resolution_note).strip()[:1000]
     elif action == "stale":
         row.update(
             {
@@ -119,6 +127,8 @@ def apply_pending_followup_action(
                 "overdue": False,
             }
         )
+        if resolution_note:
+            row["resolution_note"] = str(resolution_note).strip()[:1000]
     elif action == "urgent":
         row.update(
             {
@@ -153,7 +163,10 @@ def apply_pending_followup_action(
         "chat_id": row.get("chat_id"),
         "message_id": row.get("message_id"),
         "business_status": row.get("business_status"),
+        "client_answer_confirmed": bool(row.get("client_answer_confirmed")),
     }
+    if resolution_note:
+        audit["resolution_note"] = str(resolution_note).strip()[:1000]
     _append_jsonl(Path(audit_path), audit)
     return {"ok": True, "action": action, "key": key, "token": token, "row": row, "audit": audit}
 

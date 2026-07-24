@@ -181,6 +181,12 @@ from scripts.export_open_handoffs import (
     format_open_handoffs_markdown,
     parse_open_handoff_decisions,
 )
+from scripts.export_avito_followups import (
+    build_avito_followup_decision_review,
+    build_avito_followups_export,
+    format_avito_followups_markdown,
+    parse_avito_followup_decisions,
+)
 from scripts.production_readiness_report import build_production_readiness_report, format_production_readiness_markdown
 from scripts.verify_runtime_backup import verify_runtime_backup
 from scripts.verify_logrotate_config import verify_logrotate_config
@@ -7519,6 +7525,152 @@ def test_pending_followup_admin_action_closes_state_and_writes_audit(tmp_path) -
     assert "Срочно" not in button_texts
 
 
+def test_export_avito_followups_markdown_is_read_only_and_includes_decisions(tmp_path) -> None:
+    report_path = tmp_path / "report.json"
+    state_path = tmp_path / "state.json"
+    key = "1:chat-followup:m-bot-1"
+    report_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": [
+                    {
+                        "key": key,
+                        "account_id": 1,
+                        "chat_id": "chat-followup",
+                        "message_id": "m-bot-1",
+                        "client_name": "Анна",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                        "overdue": True,
+                        "severity": "critical",
+                        "age_seconds": 7200,
+                        "listing_city": "Геленджик",
+                        "listing_title": "Увеличение губ",
+                        "bot_promise": "Уточню адрес и напишу.",
+                        "last_client_message": "Жду адрес",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    state_path.write_text(json.dumps({"pending_followups": {key: {"chat_id": "chat-followup"}}}, ensure_ascii=False), encoding="utf-8")
+    before = state_path.read_text(encoding="utf-8")
+
+    report = build_avito_followups_export(report_path=report_path, state_path=state_path, now=1780000000)
+    markdown = format_avito_followups_markdown(report)
+
+    assert state_path.read_text(encoding="utf-8") == before
+    assert report["pending_count"] == 1
+    assert report["critical_count"] == 1
+    assert report["overdue_count"] == 1
+    assert "Жду адрес" in markdown
+    assert f"resolved #{pending_followup_token(key)}" in markdown
+    assert f"not_relevant #{pending_followup_token(key)}" in markdown
+    assert parse_avito_followup_decisions(markdown) == []
+
+
+def test_avito_followup_decisions_dry_run_and_apply_resolved_with_reason(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    decisions_path = tmp_path / "avito_followups.md"
+    audit_path = tmp_path / "audit.jsonl"
+    key = "1:chat-followup:m-bot-1"
+    token = pending_followup_token(key)
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    key: {
+                        "account_id": 1,
+                        "chat_id": "chat-followup",
+                        "message_id": "m-bot-1",
+                        "client_name": "Анна",
+                        "business_status": "overdue",
+                        "business_resolved": False,
+                        "overdue": True,
+                        "severity": "critical",
+                        "bot_promise": "Уточню адрес и подтвержу запись.",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    decisions_path.write_text(f"- [x] resolved #{token}: ответили в Avito в 12:10\n", encoding="utf-8")
+    before = state_path.read_text(encoding="utf-8")
+
+    dry_run = build_avito_followup_decision_review(
+        decisions_path=decisions_path,
+        state_path=state_path,
+        audit_path=audit_path,
+        apply=False,
+        now=1780000000,
+    )
+    after_dry_run = state_path.read_text(encoding="utf-8")
+    applied = build_avito_followup_decision_review(
+        decisions_path=decisions_path,
+        state_path=state_path,
+        audit_path=audit_path,
+        apply=True,
+        actor="olga",
+        now=1780000100,
+    )
+    row = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+
+    assert dry_run["ok"] is True
+    assert dry_run["items"][0]["would_apply"] is True
+    assert before == after_dry_run
+    assert applied["ok"] is True
+    assert applied["applied_count"] == 1
+    assert row["business_resolved"] is True
+    assert row["business_status"] == "manual_closed"
+    assert row["client_answer_confirmed"] is True
+    assert row["resolution_note"] == "ответили в Avito в 12:10"
+    assert audit_path.exists()
+    assert "ответили в Avito в 12:10" in audit_path.read_text(encoding="utf-8")
+
+
+def test_avito_followup_decisions_reject_invalid_without_partial_apply(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    decisions_path = tmp_path / "avito_followups.md"
+    first_key = "1:chat-followup:m-bot-1"
+    second_key = "1:chat-other:m-bot-2"
+    first_token = pending_followup_token(first_key)
+    second_token = pending_followup_token(second_key)
+    state = {
+        "pending_followups": {
+            first_key: {"chat_id": "chat-followup", "business_status": "overdue", "business_resolved": False},
+            second_key: {"chat_id": "chat-other", "business_status": "overdue", "business_resolved": False},
+        }
+    }
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    decisions_path.write_text(
+        "\n".join(
+            [
+                f"- [x] not_relevant #{first_token}: клиент отказался",
+                f"- [x] resolved #{second_token}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    review = build_avito_followup_decision_review(
+        decisions_path=decisions_path,
+        state_path=state_path,
+        audit_path=tmp_path / "audit.jsonl",
+        apply=True,
+        now=1780000000,
+    )
+    unchanged = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert review["ok"] is False
+    assert review["applied_count"] == 0
+    assert any("requires a reason" in error for error in review["errors"])
+    assert unchanged == state
+
+
 def test_pending_followup_admin_keeps_old_urgent_callback_compatible_and_snoozes(tmp_path) -> None:
     state_path = tmp_path / "state.json"
     key = "1:chat-followup:m-bot-1"
@@ -10415,6 +10567,8 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert report["avito_promises"]["pending"] == 1
     assert report["avito_promises"]["critical"] == 1
     assert report["avito_promises"]["overdue"] == 1
+    assert report["avito_promises"]["export_command"] == "python scripts/export_avito_followups.py --output data/avito_followups_review.md"
+    assert "--decisions data/avito_followups_review.md" in report["avito_promises"]["dry_run_decisions_command"]
     assert report["open_handoffs"]["export_command"] == "python scripts/export_open_handoffs.py --output data/open_handoffs_review.md"
     assert "--decisions data/open_handoffs_review.md" in report["open_handoffs"]["dry_run_decisions_command"]
     assert report["manual_closure_audit"]["handoff_manual_closed_without_client_reply"] == 1
@@ -10425,6 +10579,8 @@ def test_production_readiness_report_aggregates_manual_blockers(tmp_path) -> Non
     assert "Review open Olga handoffs" in markdown
     assert "Review /avito_followups: pending=1, critical=1, overdue=1" in "\n".join(report["manual_actions"])
     assert "Pending: `1`, critical: `1`, overdue: `1`" in markdown
+    assert "python scripts/export_avito_followups.py --output data/avito_followups_review.md" in markdown
+    assert "python scripts/export_avito_followups.py --decisions data/avito_followups_review.md --apply-decisions" in markdown
     assert "python scripts/export_open_handoffs.py --output data/open_handoffs_review.md" in markdown
     assert "python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md --apply-decisions" in markdown
     assert "Fix Avito missed-poller coverage: latest summary scanned 20/150 chats" in "\n".join(report["manual_actions"])
