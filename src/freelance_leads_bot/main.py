@@ -69,6 +69,7 @@ from .integrations.handoff_refs import (
     find_telegram_handoff_ref_by_text,
     find_telegram_handoff_ref_in_logs,
     find_telegram_handoff_ref_near_message_id,
+    handoff_ref_is_critical,
     load_telegram_handoff_refs,
     open_handoff_refs,
     remember_telegram_handoff_ref,
@@ -456,6 +457,7 @@ def format_open_cards(
                     "",
                     f"<b>{index}. {escape(str(entry.get('time') or '-'))}</b>",
                     _history_client_line(str(entry.get("chat_id") or ""), str(entry.get("client_name") or "")),
+                    "SLA: <b>critical</b>" if handoff_ref_is_critical(entry) else "SLA: ordinary",
                     f"Причина: <code>{escape(str(entry.get('reason') or '-'))}</code>",
                     f"Telegram: <code>{escape(str(telegram_id))}</code>",
                 ]
@@ -548,7 +550,9 @@ def send_open_handoff_cards(
             "draft_pending": "Статус: черновик ждёт подтверждения",
             "rejected": "Статус: предыдущий черновик отклонён, карточка остаётся открытой",
         }.get(status, "Статус: ждёт ответа")
+        sla_line = "SLA: critical" if handoff_ref_is_critical(ref) else "SLA: ordinary"
         text = f"{escape(str(ref.get('handoff_text') or '').strip())}\n\n<b>{escape(status_line)}</b>"
+        text += f"\n<b>{escape(sla_line)}</b>"
         response = bot.send_message(telegram_chat_id, text, **(topic_params or {}))
         message_id = str((response.get("result") or {}).get("message_id") or "")
         if message_id:

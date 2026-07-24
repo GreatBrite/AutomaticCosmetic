@@ -383,6 +383,33 @@ def test_send_open_handoff_cards_reissues_each_handoff_in_current_topic(tmp_path
     assert all(call[0] == "target-chat" for call in bot.calls)
     assert all(call[2]["message_thread_id"] == "77" for call in bot.calls)
     assert "Нужна ручная консультация" in bot.calls[1][1]
+    assert "SLA: ordinary" in bot.calls[1][1]
+
+
+def test_send_open_handoff_cards_marks_critical_sla(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    remember_telegram_handoff_ref(
+        telegram_chat_id="olga",
+        telegram_message_id="10",
+        avito_chat_id="avito-chat",
+        source_message_id="client-message",
+        handoff_text="Клиент спрашивает: запись на 28 июля у нас в силе? Адрес напишите.",
+    )
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.calls.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": 100 + len(self.calls)}}
+
+    bot = FakeBot()
+
+    count = send_open_handoff_cards(bot, "target-chat")
+
+    assert count == 1
+    assert "SLA: critical" in bot.calls[1][1]
 
 
 @pytest.fixture(autouse=True)
@@ -1318,6 +1345,7 @@ def test_format_open_cards_keeps_handoff_open_after_initial_hold_reply(tmp_path)
     assert "Открытые карточки" in text
     assert "missing_data" in text
     assert "42" in text
+    assert "SLA: ordinary" in text
 
 
 def test_format_open_cards_closes_handoff_after_later_client_reply(tmp_path) -> None:
