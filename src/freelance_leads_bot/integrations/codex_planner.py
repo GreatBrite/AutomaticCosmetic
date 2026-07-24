@@ -52,7 +52,7 @@ def build_codex_planner_prompt(payload: dict[str, Any], trace: list[dict[str, An
         "Если yclients.slots.list вернул schedule_status='unknown', график на дату неизвестен: не говори 'мест нет', скажи что проверишь эту дату.\n"
         "Если schedule_status='known' и slots пустые, можно сказать, что на этот день мест нет, и предложить другой день в том же городе.\n\n"
         "Слово handoff — только внутреннее поле JSON. Никогда не пиши клиенту слова 'handoff', 'эскалация' и не объясняй внутренний маршрут как шаблон; клиентский текст должен звучать как обычная переписка сервиса.\n"
-        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, booking_critical, complaint_or_risk, missing_data.\n"
+        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, booking_critical, complaint_or_risk, expert_expectation, voice_transcription_failed, missing_data.\n"
         "Верни строго один JSON-объект без markdown.\n"
         "Чтобы вызвать инструменты:\n"
         '{"tool_calls":[{"name":"knowledge.list","arguments":{"query":"ботокс"}}]}\n'

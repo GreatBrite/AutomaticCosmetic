@@ -166,6 +166,7 @@ def build_codex_review_prompt(
         "Верни строго JSON без markdown:\n"
         '{"action":"approve","notes":"коротко"}\n'
         '{"action":"revise","reply":"исправленный текст","notes":"что исправлено"}\n'
+        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, booking_critical, complaint_or_risk, expert_expectation, voice_transcription_failed, missing_data.\n"
         '{"action":"handoff","handoff_reason":"missing_data","handoff_summary":"что уточнить внутри команды","reply":"текст клиенту"}\n\n'
         "PAYLOAD:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n"

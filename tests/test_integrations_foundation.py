@@ -9461,6 +9461,8 @@ def test_codex_planner_prompt_and_json_parser() -> None:
     assert "живой ассистент записи" in prompt
     assert "Router уже обработал простые safety/RAG/media/city/procedure случаи" in prompt
     assert "Слово handoff — только внутреннее поле JSON" in prompt
+    assert "expert_expectation" in prompt
+    assert "voice_transcription_failed" in prompt
     assert "reply=''" in prompt
     assert "фото до/после" in prompt
     assert "тихую задачу" in prompt
@@ -9476,6 +9478,7 @@ def test_codex_planner_prompt_and_json_parser() -> None:
 def test_codex_review_can_revise_or_handoff_bad_draft() -> None:
     message = avito_inbound_message({"type": "message", "chat_id": "chat-review", "text": "Где вы?"})
     decision = AvitoConsultantReply(action="codex_reply", reply="Мы у метро Тверская, приходите завтра.")
+    prompt = build_codex_review_prompt(message=message, decision=decision, conversation_history=[])
 
     revised = apply_review_outcome(
         message,
@@ -9493,6 +9496,8 @@ def test_codex_review_can_revise_or_handoff_bad_draft() -> None:
     assert handoff.action == "handoff"
     assert handoff.handoff is not None
     assert handoff.handoff.reason == "missing_data"
+    assert "expert_expectation" in prompt
+    assert "voice_transcription_failed" in prompt
 
 
 def test_codex_review_guard_handoffs_aesthetic_volume_promise() -> None:
