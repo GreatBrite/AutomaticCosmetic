@@ -20,6 +20,7 @@ class HandoffReason(str, Enum):
     BOOKING_CRITICAL = "booking_critical"
     COMPLAINT_OR_RISK = "complaint_or_risk"
     EXPERT_EXPECTATION = "expert_expectation"
+    VOICE_TRANSCRIPTION_FAILED = "voice_transcription_failed"
     MISSING_DATA = "missing_data"
 
 

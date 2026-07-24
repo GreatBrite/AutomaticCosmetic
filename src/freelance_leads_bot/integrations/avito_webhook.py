@@ -784,7 +784,7 @@ def _ignore_reason(event: dict[str, Any], message: Any, settings: IntegrationSet
 
 async def _notify_voice_transcription_error(message: Any, handoff_notifier: HandoffNotifier) -> dict[str, Any]:
     handoff = Handoff(
-        reason=HandoffReason.MISSING_DATA,
+        reason=HandoffReason.VOICE_TRANSCRIPTION_FAILED,
         message=message,
         summary=(
             "Клиент прислал голосовое в Avito, но бот не смог его расшифровать. "

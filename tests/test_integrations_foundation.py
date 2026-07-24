@@ -8431,6 +8431,52 @@ def test_avito_webhook_transcribes_voice_before_processing() -> None:
         processed_events.seen.clear()
 
 
+def test_avito_webhook_voice_transcription_failure_creates_critical_handoff() -> None:
+    class FailingVoiceResolver:
+        async def transcribe(self, message):
+            raise RuntimeError("speech api down")
+
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.handoffs = []
+
+        async def notify(self, handoff):
+            self.handoffs.append(handoff)
+            return {"sent": True, "telegram": {"ok": True, "result": {"message_id": 1}}}
+
+    notifier = FakeNotifier()
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
+    avito_app.dependency_overrides[get_voice_resolver] = lambda: FailingVoiceResolver()
+    avito_app.dependency_overrides[get_handoff_notifier] = lambda: notifier
+    event = {
+        "payload": {
+            "type": "message_created",
+            "value": {
+                "id": "voice-message-fail-1",
+                "chat_id": "chat-voice-fail",
+                "direction": "in",
+                "type": "voice",
+                "content": {"voice": {"voice_id": "voice-fail-1"}},
+            },
+        }
+    }
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json=event)
+
+        assert response.status_code == 200
+        assert response.json()["action"] == "voice_transcription_error_handoff"
+        assert response.json()["processing_status"] == "processed"
+        assert response.json()["handoff"] == HandoffReason.VOICE_TRANSCRIPTION_FAILED.value
+        assert notifier.handoffs[0].reason == HandoffReason.VOICE_TRANSCRIPTION_FAILED
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
 def test_avito_webhook_reviewer_revises_before_send() -> None:
     class FakePlanner:
         async def respond(self, context, toolbox):
