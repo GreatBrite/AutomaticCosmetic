@@ -17,6 +17,15 @@ DEFAULT_RAG_ADMIN_PLANS_PATH = Path("data/expert_rag_admin_plans.json")
 DEFAULT_RAG_ADMIN_AUDIT_PATH = Path("data/expert_rag_admin_audit.jsonl")
 PRICE_RE = re.compile(r"(?<!\d)(\d[\d\s]{2,})(?!\d)")
 PERCENT_RE = re.compile(r"(?iu)(?:подним\w*|увелич\w*|индексир\w*)[^\d]{0,40}(\d+(?:[.,]\d+)?)\s*%")
+TEMPORAL_RAG_ADMIN_RE = re.compile(
+    r"(?iu)\b("
+    r"сегодня|завтра|послезавтра|вчера|"
+    r"понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|"
+    r"\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|"
+    r"\d{1,2}:\d{2}|"
+    r"окн[оа]|слот|запис[ьи]|адрес|акци[яи]|скидк|договор[её]н"
+    r")\b"
+)
 
 
 @dataclass(frozen=True)
@@ -340,6 +349,7 @@ class ExpertRagAdminService:
                     "admin_plan_id": plan.id,
                     "autoanswer_allowed": True,
                 }
+                metadata.update(_autoanswer_metadata_for_rag_admin(previous.question_canonical, change.new_answer, metadata=metadata))
                 created = self.store.upsert_from_handoff(
                     question=previous.question_canonical,
                     answer_client=change.new_answer,
@@ -363,6 +373,7 @@ class ExpertRagAdminService:
                     "kind": "policy" if not autoanswer_allowed else "expert_answer",
                 }
                 inferred = infer_metadata(change.new_answer)
+                metadata.update(_autoanswer_metadata_for_rag_admin(plan.command, change.new_answer, metadata=metadata))
                 created = self.store.upsert_from_handoff(
                     question=plan.command,
                     answer_client=change.new_answer,
@@ -730,6 +741,18 @@ def _price_scope_is_ambiguous(command: str, items: list[ExpertAnswer]) -> bool:
     services = {item.service for item in items if item.service}
     cities = {item.city for item in items if item.city}
     return len(services) > 1 or len(cities) > 1 or len(items) > 3
+
+
+def _autoanswer_metadata_for_rag_admin(question: str, answer: str, *, metadata: dict[str, Any]) -> dict[str, Any]:
+    if metadata.get("autoanswer_allowed") is False:
+        return {}
+    if TEMPORAL_RAG_ADMIN_RE.search(f"{question}\n{answer}"):
+        return {
+            "autoanswer_allowed": False,
+            "temporal_fact": True,
+            "autoanswer_block_reason": "temporal_without_expiry",
+        }
+    return {}
 
 
 def _effect_value_from_command(command: str) -> str:

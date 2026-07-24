@@ -37,6 +37,12 @@ from .integrations.avito_identity import CLIENT_NAME_CACHE_PATH, clean_client_na
 from .integrations.avito_read import avito_read_client_from_settings
 from .integrations.avito_sender import avito_image_sender_from_settings, avito_sender_from_settings
 from .integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
+from .integrations.avito_followup_admin import (
+    apply_pending_followup_action,
+    parse_pending_followup_callback,
+    pending_followup_card_text,
+    pending_followup_keyboard,
+)
 from .integrations.care_crm import (
     CareLearningService,
     CareCrmStore,
@@ -63,12 +69,14 @@ from .integrations.handoff_refs import (
     find_telegram_handoff_ref_by_text,
     find_telegram_handoff_ref_in_logs,
     find_telegram_handoff_ref_near_message_id,
+    handoff_ref_is_critical,
     load_telegram_handoff_refs,
     open_handoff_refs,
     remember_telegram_handoff_ref,
     update_handoff_status,
 )
-from .integrations.handoff_notify import handoff_notifier_from_settings
+from .integrations.handoff_notify import _download_photo_url, handoff_notifier_from_settings
+from .integrations.telegram_client_topics import get_or_create_client_topic, topic_request_from_avito_followup
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
 from .integrations.runtime import booking_from_settings, rag_admin_intent_parser_from_settings
@@ -113,6 +121,7 @@ HELP = """Команды:
 /open_cards - незакрытые handoff-карточки Ольги/админа
 /visit_confirmations - карточки проверки сегодняшних визитов для допродаж
 /care_followups - карточки due-задач отдела заботы
+/avito_followups - зависшие обещания Avito-бота
 /client <телефон|имя> - карточка клиента локальной CRM
 /learning - последние уроки отдела заботы
 /bot_restart - применить env-флаги рестартом Telegram-бота
@@ -139,6 +148,8 @@ AVITO_WEBHOOK_LOG_PATH = Path("data/avito_webhook.log")
 HANDOFF_OUTBOX_PATH = Path("data/handoff_outbox.jsonl")
 AVITO_POLLER_LOG_PATH = Path("data/avito_poller.log")
 AVITO_DRAFTS_PATH = Path("data/avito_client_drafts.json")
+AVITO_UNANSWERED_STATE_PATH = Path(os.getenv("AVITO_UNANSWERED_STATE_PATH", "data/avito_unanswered_monitor_state.json"))
+AVITO_UNANSWERED_REPORT_PATH = Path(os.getenv("AVITO_UNANSWERED_REPORT_PATH", "data/avito_unanswered_report.json"))
 TELEGRAM_HANDOFF_REFS_PATH = DEFAULT_HANDOFF_REFS_PATH
 CODEX_TIMEOUT_ANSWER = "Codex не успел ответить за отведенное время."
 CODEX_TIMEOUT_RESTART_MESSAGE = (
@@ -276,6 +287,9 @@ def feature_flags_keyboard() -> dict:
         [
             {"text": "История Ольги", "callback_data": "olga_history"},
             {"text": "Открытые карточки", "callback_data": "open_cards"},
+        ],
+        [
+            {"text": "Avito обещания", "callback_data": "avito_followups"},
         ],
         [
             {"text": "Обновить /flags", "callback_data": "flags"},
@@ -443,6 +457,7 @@ def format_open_cards(
                     "",
                     f"<b>{index}. {escape(str(entry.get('time') or '-'))}</b>",
                     _history_client_line(str(entry.get("chat_id") or ""), str(entry.get("client_name") or "")),
+                    "SLA: <b>critical</b>" if handoff_ref_is_critical(entry) else "SLA: ordinary",
                     f"Причина: <code>{escape(str(entry.get('reason') or '-'))}</code>",
                     f"Telegram: <code>{escape(str(telegram_id))}</code>",
                 ]
@@ -535,7 +550,9 @@ def send_open_handoff_cards(
             "draft_pending": "Статус: черновик ждёт подтверждения",
             "rejected": "Статус: предыдущий черновик отклонён, карточка остаётся открытой",
         }.get(status, "Статус: ждёт ответа")
+        sla_line = "SLA: critical" if handoff_ref_is_critical(ref) else "SLA: ordinary"
         text = f"{escape(str(ref.get('handoff_text') or '').strip())}\n\n<b>{escape(status_line)}</b>"
+        text += f"\n<b>{escape(sla_line)}</b>"
         response = bot.send_message(telegram_chat_id, text, **(topic_params or {}))
         message_id = str((response.get("result") or {}).get("message_id") or "")
         if message_id:
@@ -1235,12 +1252,19 @@ def send_visit_confirmation_cards(
     except Exception as exc:
         bot.send_message(chat_id, "Не смогла получить записи YCLIENTS: " + escape(str(exc)), **(topic_params or {}))
         return
+    summary = store.visit_confirmation_summary(day)
     if not rows:
-        bot.send_message(chat_id, f"На {escape(day)} не нашла записей для проверки визитов.", **(topic_params or {}))
+        bot.send_message(
+            chat_id,
+            f"На {escape(day)} не нашла записей для проверки визитов.\n"
+            f"Статусы CRM: confirmed={summary['confirmed']}, no_show={summary['no_show']}, needs_details={summary['needs_details']}.",
+            **(topic_params or {}),
+        )
         return
     bot.send_message(
         chat_id,
-        f"<b>Проверка визитов за {escape(day)}</b>\nКарточек: {len(rows)}.",
+        f"<b>Проверка визитов за {escape(day)}</b>\n"
+        f"Карточек: {len(rows)}. Уже confirmed={summary['confirmed']}, no_show={summary['no_show']}, needs_details={summary['needs_details']}.",
         **(topic_params or {}),
     )
     for row in rows:
@@ -1465,6 +1489,9 @@ def format_care_followup_card(task: dict) -> str:
     city = escape(str(task.get("city") or ""))
     draft = escape(str(task.get("message_draft") or ""))
     reason = escape(str(task.get("reason") or "Причина не записана."))
+    gate = task.get("send_gate") if isinstance(task.get("send_gate"), dict) else {}
+    gate_status = escape(str(gate.get("status") or "unknown"))
+    gate_reason = escape(str(gate.get("reason") or task.get("blocked_reason") or ""))
     confidence = escape(str(round(float(task.get("confidence") or 0), 2)))
     risk_level = escape(str(task.get("risk_level") or "unknown"))
     links = CareCrmStore().list_client_links(int(task.get("client_id") or 0), channel="telegram_client") if task.get("client_id") else []
@@ -1476,11 +1503,12 @@ def format_care_followup_card(task: dict) -> str:
         status_bits.append("риск/жалоба")
     status_line = "\nСтоп-флаги: <b>" + escape(", ".join(status_bits)) + "</b>" if status_bits else ""
     city_line = f"\nГород визита: <b>{city}</b>" if city else ""
+    gate_line = f"\nGate: <b>{gate_status}</b>" + (f" — {gate_reason}" if gate_reason else "")
     return (
         "<b>Задача отдела заботы</b>\n"
         f"Клиент: <b>{client}</b>\n"
         f"После визита: <b>{service}</b>{city_line}\n"
-        f"Срок: <b>{due_at}</b>{status_line}\n"
+        f"Срок: <b>{due_at}</b>{status_line}{gate_line}\n"
         f"Риск: <b>{risk_level}</b>, уверенность: <b>{confidence}</b>, Telegram: <b>{telegram_link}</b>\n"
         f"Причина: {reason}\n\n"
         f"Черновик клиенту:\n<blockquote>{draft}</blockquote>"
@@ -1494,7 +1522,19 @@ def send_care_followup_cards(
     topic_params: dict[str, str] | None = None,
 ) -> None:
     store = CareCrmStore()
-    tasks = store.list_followup_tasks(status="planned", due_before=datetime.now().isoformat(), limit=20)
+    tasks = [
+        task
+        for task in store.list_followup_tasks(status="", due_before=datetime.now().isoformat(), limit=50)
+        if str(task.get("status") or "") in {"planned", "needs_olga"}
+    ]
+    tasks.sort(
+        key=lambda task: (
+            0 if task.get("complaint_risk") or str(task.get("risk_level") or "").casefold() in {"blocked", "high"} else 1,
+            str(task.get("due_at") or ""),
+            int(task.get("id") or 0),
+        )
+    )
+    tasks = tasks[:20]
     if not tasks:
         bot.send_message(chat_id, "Due-задач отдела заботы сейчас нет.", **(topic_params or {}))
         return
@@ -1502,6 +1542,20 @@ def send_care_followup_cards(
     for task in tasks:
         task_id = int(task["id"])
         enriched = FollowupBrainService(store).enrich_task(task_id) or task
+        gate = store.followup_send_gate(task_id)
+        if gate["status"] == "needs_channel":
+            enriched = store.update_followup_task(
+                task_id,
+                requires_channel_resolution=True,
+                outcome="needs_channel_resolution",
+            ) or enriched
+        elif gate["status"] == "blocked":
+            enriched = store.update_followup_task(
+                task_id,
+                blocked_reason=str(gate.get("reason") or "blocked"),
+                risk_level="blocked" if "risk" in str(gate.get("reason") or "") or "complaint" in str(gate.get("reason") or "") else None,
+            ) or enriched
+        enriched = {**enriched, "send_gate": gate}
         response = bot.send_message(
             chat_id,
             format_care_followup_card(enriched),
@@ -1526,7 +1580,6 @@ def handle_care_followup_callback(
     if parsed is None:
         return False
     task_id, action = parsed
-    delivery = CareFollowupDeliveryService(CareCrmStore(), TelegramBot(settings.telegram_client_bot_token)) if settings.telegram_client_bot_token else None
     store = CareCrmStore()
     if action == "skip":
         result = CareFollowupDeliveryService(store, bot).skip_task(task_id)
@@ -1543,7 +1596,7 @@ def handle_care_followup_callback(
         )
         return True
     if action == "ask":
-        store.update_followup_task(task_id, outcome="ask_olga")
+        store.update_followup_task(task_id, status="needs_olga", outcome="ask_olga")
         bot.answer_callback_query(callback_id, "Оставила как вопрос")
         bot.send_message(telegram_chat_id, "Ок, эту задачу оставила как требующую решения Ольги.", **(topic_params or {}))
         return True
@@ -1551,14 +1604,39 @@ def handle_care_followup_callback(
         task = store.get_followup_task(task_id)
         if task:
             store.update_client_flags(int(task["client_id"]), do_not_contact=True, consent_status="denied")
-            store.update_followup_task(task_id, status="blocked", outcome="do_not_contact_by_olga")
+            store.update_followup_task(task_id, status="blocked", blocked_reason="do_not_contact_by_olga", outcome="do_not_contact_by_olga")
         bot.answer_callback_query(callback_id, "Не писать")
         bot.send_message(telegram_chat_id, "Отметила клиента как «не писать» и заблокировала задачу.", **(topic_params or {}))
         return True
-    if delivery is None:
+    gate = store.followup_send_gate(task_id)
+    if gate["status"] == "needs_channel":
+        store.update_followup_task(task_id, requires_channel_resolution=True, outcome="needs_channel_resolution")
+        bot.answer_callback_query(callback_id, "Нет канала")
+        bot.send_message(
+            telegram_chat_id,
+            "У клиента нет подтверждённой Telegram-связки. Создала задачу: найти канал связи или не писать.",
+            **(topic_params or {}),
+        )
+        return True
+    if not gate.get("allowed"):
+        store.update_followup_task(task_id, status="blocked", blocked_reason=str(gate.get("reason") or "blocked"))
+        bot.answer_callback_query(callback_id, "Заблокировано")
+        bot.send_message(telegram_chat_id, f"Не отправляю клиенту: {escape(str(gate.get('reason') or 'задача заблокирована'))}.", **(topic_params or {}))
+        return True
+    if not settings.telegram_client_followup_send_enabled:
+        store.update_followup_task(task_id, outcome="send_blocked_by_feature_flag")
+        bot.answer_callback_query(callback_id, "Отправка выключена")
+        bot.send_message(
+            telegram_chat_id,
+            "Отправку клиентам держу выключенной: включите TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED только после проверки черновиков.",
+            **(topic_params or {}),
+        )
+        return True
+    if not settings.telegram_client_bot_token:
         bot.answer_callback_query(callback_id, "Нет client bot token")
         bot.send_message(telegram_chat_id, "Не настроен TELEGRAM_CLIENT_BOT_TOKEN, отправить клиенту не могу.", **(topic_params or {}))
         return True
+    delivery = CareFollowupDeliveryService(store, TelegramBot(settings.telegram_client_bot_token))
     result = asyncio.run(delivery.send_task(task_id))
     if result.get("ok"):
         bot.answer_callback_query(callback_id, "Отправлено")
@@ -1567,6 +1645,183 @@ def handle_care_followup_callback(
     bot.answer_callback_query(callback_id, str(result.get("status") or "Не отправлено"))
     bot.send_message(telegram_chat_id, "Не отправила follow-up: " + escape(str(result)), **(topic_params or {}))
     return True
+
+
+def send_avito_followup_cards(
+    bot: TelegramBot,
+    chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    *,
+    report_path: Path | str = AVITO_UNANSWERED_REPORT_PATH,
+    topics_enabled: bool = True,
+    topics_path: Path | str | None = None,
+    limit: int = 10,
+) -> None:
+    report = _read_json_file(Path(report_path))
+    rows = report.get("pending_followups") if isinstance(report.get("pending_followups"), list) else []
+    active = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and not row.get("business_resolved")
+        and str(row.get("business_status") or "") not in {"manual_closed", "not_relevant", "business_resolved", "superseded_by_new_promise"}
+    ]
+    active.sort(
+        key=lambda row: (
+            0 if str(row.get("severity") or "") == "critical" else 1,
+            0 if row.get("business_status") == "overdue" else 1,
+            -int(row.get("age_seconds") or 0),
+        )
+    )
+    if not active:
+        bot.send_message(chat_id, "Зависших Avito-обещаний сейчас нет.", **(topic_params or {}))
+        return
+    bot.send_message(chat_id, f"<b>Зависшие Avito-обещания</b>\nКарточек: {min(len(active), limit)} из {len(active)}.", **(topic_params or {}))
+    for row in active[:limit]:
+        key = str(row.get("key") or "")
+        card_topic_params = avito_followup_topic_params(
+            bot,
+            chat_id,
+            row,
+            topics_enabled=topics_enabled,
+            topics_path=topics_path,
+        ) or (topic_params or {})
+        bot.send_message(
+            chat_id,
+            escape(pending_followup_card_text(row)),
+            reply_markup=pending_followup_keyboard(key) if key else None,
+            **card_topic_params,
+        )
+        send_avito_followup_media(bot, chat_id, row, topic_params=card_topic_params)
+
+
+def avito_followup_topic_params(
+    bot: TelegramBot,
+    chat_id: str,
+    row: dict,
+    *,
+    topics_enabled: bool = True,
+    topics_path: Path | str | None = None,
+) -> dict[str, str]:
+    try:
+        request = topic_request_from_avito_followup(row)
+        kwargs = {"path": topics_path} if topics_path else {}
+        result = get_or_create_client_topic(bot, chat_id, enabled=topics_enabled, **request, **kwargs)
+        return dict(result.get("topic_params") or {})
+    except Exception:
+        return {}
+
+
+def send_avito_followup_media(
+    bot: TelegramBot,
+    chat_id: str,
+    row: dict,
+    *,
+    topic_params: dict[str, str] | None = None,
+    limit: int = 5,
+) -> int:
+    urls = _avito_followup_media_urls(row)[: max(0, int(limit or 0))]
+    sent = 0
+    for index, url in enumerate(urls, start=1):
+        caption = f"Фото клиента из Avito ({index}/{len(urls)})"
+        try:
+            bot.send_photo_url(
+                chat_id,
+                url,
+                caption=caption,
+                **(topic_params or {}),
+            )
+            sent += 1
+        except Exception:
+            try:
+                path = _download_photo_url(url, ROOT / "data" / "avito_followup_photos")
+                bot.send_photo(chat_id, path, caption=caption, **(topic_params or {}))
+                sent += 1
+            except Exception:
+                continue
+    return sent
+
+
+def _avito_followup_media_urls(row: dict) -> list[str]:
+    urls: list[str] = []
+    for key in ("last_client_photo_urls", "last_client_media_urls", "photo_urls", "media_urls"):
+        value = row.get(key) if isinstance(row, dict) else None
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            text = str(item or "").strip()
+            if text.startswith(("http://", "https://")) and text not in urls:
+                urls.append(text)
+    return urls
+
+
+def handle_avito_followup_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    state_path: Path | str = AVITO_UNANSWERED_STATE_PATH,
+    report_path: Path | str = AVITO_UNANSWERED_REPORT_PATH,
+) -> bool:
+    parsed = parse_pending_followup_callback(data)
+    if parsed is None:
+        return False
+    token, action = parsed
+    result = apply_pending_followup_action(state_path=state_path, token=token, action=action, actor="telegram_admin")
+    if not result.get("ok"):
+        bot.answer_callback_query(callback_id, "Карточка не найдена")
+        bot.send_message(
+            telegram_chat_id,
+            "Не нашла это Avito-обещание в текущем state. Возможно, оно уже закрыто или state обновился.",
+            **(topic_params or {}),
+        )
+        return True
+    labels = {
+        "done": "Закрыто",
+        "stale": "Не актуально",
+        "urgent": "Помечено срочным",
+        "later": "Напомню позже",
+    }
+    row = result.get("row") if isinstance(result.get("row"), dict) else {}
+    _sync_avito_followup_report_after_action(report_path=Path(report_path), key=str(result.get("key") or ""), row=row)
+    bot.answer_callback_query(callback_id, labels.get(action, "Готово"))
+    bot.send_message(
+        telegram_chat_id,
+        escape(f"{labels.get(action, 'Готово')}: {row.get('client_name') or row.get('chat_id') or 'Avito-обещание'}"),
+        **(topic_params or {}),
+    )
+    return True
+
+
+def _sync_avito_followup_report_after_action(*, report_path: Path, key: str, row: dict) -> None:
+    if not key or not row:
+        return
+    report = _read_json_file(report_path)
+    rows = report.get("pending_followups") if isinstance(report.get("pending_followups"), list) else []
+    changed = False
+    for index, existing in enumerate(rows):
+        if isinstance(existing, dict) and str(existing.get("key") or "") == key:
+            rows[index] = {**existing, **row, "key": key}
+            changed = True
+            break
+    if not changed:
+        return
+    report["pending_followups"] = rows
+    active = [item for item in rows if isinstance(item, dict) and not item.get("business_resolved")]
+    report["pending_followup_count"] = len(active)
+    report["overdue_followup_count"] = sum(1 for item in active if item.get("overdue") or item.get("business_status") == "overdue")
+    report["critical_followup_count"] = sum(1 for item in active if item.get("severity") == "critical")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def parse_feature_flag_command(raw_text: str) -> tuple[FeatureFlag | None, str]:
@@ -1730,6 +1985,8 @@ def start_avito_unanswered_monitor_if_needed() -> None:
     command = [sys.executable, script_arg]
     if os.getenv("AVITO_UNANSWERED_AUTOREPLY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
         command.append("--autoreply")
+    if os.getenv("AVITO_UNANSWERED_NOTIFY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+        command.append("--notify")
     AVITO_UNANSWERED_SUPERVISOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_handle = AVITO_UNANSWERED_SUPERVISOR_LOG_PATH.open("ab")
     process = subprocess.Popen(
@@ -1739,7 +1996,7 @@ def start_avito_unanswered_monitor_if_needed() -> None:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    runtime_log(f"avito_unanswered started pid={process.pid} autoreply={'--autoreply' in command}")
+    runtime_log(f"avito_unanswered started pid={process.pid} autoreply={'--autoreply' in command} notify={'--notify' in command}")
 
 
 def start_avito_webhook_if_needed() -> None:
@@ -1759,6 +2016,7 @@ def start_avito_webhook_if_needed() -> None:
         host,
         "--port",
         port,
+        "--no-access-log",
     ]
     AVITO_WEBHOOK_SUPERVISOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_handle = AVITO_WEBHOOK_SUPERVISOR_LOG_PATH.open("ab")
@@ -2203,6 +2461,7 @@ def menu_text(store: LeadStore) -> str:
         "Auth: /codex_auth, /codex_login, /codex_logout\n"
         "MFA: /mfa, /mfa_status, /mfa_set, /mfa_delete\n"
         "История Ольги: /olga_history\n"
+        "Avito обещания: /avito_followups\n"
         "Флаги: /flags, /full_live_on, /full_live_off или команды ниже\n\n"
         + "\n".join(
             f"<code>{flag.command}</code> - вкл/выкл - сейчас <b>{feature_flag_state(flag)}</b> - {escape(flag.description)}"
@@ -2821,6 +3080,20 @@ def serve(settings: Settings) -> None:
                         topic_params=callback_topic_params,
                     ):
                         continue
+                if data.startswith("avfu:"):
+                    callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
+                        callback,
+                        settings.telegram_chat_id,
+                        str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
+                    )
+                    if handle_avito_followup_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
                 if data == "olga_history":
                     bot.answer_callback_query(callback_id, "История Ольги")
                     bot.send_message(callback_chat_id, format_olga_history(), reply_markup=olga_history_keyboard(), **callback_topic_params)
@@ -2828,6 +3101,16 @@ def serve(settings: Settings) -> None:
                 if data == "open_cards":
                     bot.answer_callback_query(callback_id, "Открытые карточки")
                     send_open_handoff_cards(bot, callback_chat_id, callback_topic_params)
+                    continue
+                if data == "avito_followups":
+                    bot.answer_callback_query(callback_id, "Avito обещания")
+                    send_avito_followup_cards(
+                        bot,
+                        callback_chat_id,
+                        callback_topic_params,
+                        topics_enabled=integration_settings.telegram_client_topics_enabled,
+                        topics_path=integration_settings.telegram_client_topics_path,
+                    )
                     continue
                 if data == "preset:live:ask":
                     bot.answer_callback_query(callback_id, "Подтверждение")
@@ -3081,6 +3364,14 @@ def serve(settings: Settings) -> None:
                 send_open_handoff_cards(bot, reply_chat_id, topic_params)
             elif text.startswith("/visit_confirmations") or text.startswith("/visits_today") or text.startswith("/visits"):
                 send_visit_confirmation_cards(bot, reply_chat_id, integration_settings, raw_text, topic_params)
+            elif text.startswith("/avito_followups") or text.startswith("/avito_promises"):
+                send_avito_followup_cards(
+                    bot,
+                    reply_chat_id,
+                    topic_params,
+                    topics_enabled=integration_settings.telegram_client_topics_enabled,
+                    topics_path=integration_settings.telegram_client_topics_path,
+                )
             elif text.startswith("/care_followups") or text.startswith("/followups"):
                 send_care_followup_cards(bot, reply_chat_id, integration_settings, topic_params)
             elif text.startswith("/client"):

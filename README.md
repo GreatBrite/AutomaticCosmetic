@@ -112,7 +112,17 @@ scripts/live_smoke_check.sh
 - `ok`: общий эксплуатационный статус;
 - `summary.avito_actionable`: сколько Avito-диалогов реально ждут действия;
 - `summary.avito_autoreply_failed`: сколько delayed auto-reply попыток упали;
+- `summary.avito_manual_closed_without_client_reply`: критичные Avito-задачи, закрытые вручную без подтверждённого ответа клиенту;
 - `summary.rag_needs_review`: сколько RAG-знаний ждёт подтверждения;
+- `flags.yclients_integration_secret_required`: production webhook/callback YCLIENTS защищён shared secret;
+
+Production defaults:
+
+- `AVITO_CODEX_MAX_STEPS=4`;
+- `YCLIENTS_INTEGRATION_SECRET` непустой, POST без секрета даёт `403`;
+- `TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED=false` до ручной проверки care-followups;
+- backup timer: `deploy/systemd/automaticcosmetic-backup.timer`;
+- logrotate: `deploy/logrotate/automaticcosmetic`.
 - `summary.data_total_bytes` и `summary.disk_free_bytes`: рост `data/` и запас диска;
 - `checks.systemd_services`: живы ли runtime-сервисы;
 - `checks.expert_rag`: есть ли approved RAG-знания.

@@ -108,6 +108,23 @@ class TelegramBot:
         self._add_delivery_params(payload, message_thread_id, direct_messages_topic_id, business_connection_id)
         return self.api("sendMessage", payload)
 
+    def create_forum_topic(
+        self,
+        chat_id: str,
+        name: str,
+        icon_color: int | None = None,
+        icon_custom_emoji_id: str | None = None,
+    ) -> dict:
+        payload: dict[str, str | int] = {
+            "chat_id": chat_id,
+            "name": name[:128],
+        }
+        if icon_color is not None:
+            payload["icon_color"] = icon_color
+        if icon_custom_emoji_id:
+            payload["icon_custom_emoji_id"] = icon_custom_emoji_id
+        return self.api("createForumTopic", payload)
+
     def send_web_app_button(
         self,
         chat_id: str,

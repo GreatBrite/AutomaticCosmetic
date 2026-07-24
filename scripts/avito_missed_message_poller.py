@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 from pyavitoapi.transport.errors import AvitoApiError
@@ -25,7 +25,7 @@ from src.freelance_leads_bot.integrations.avito_media import AvitoApiPhotoResolv
 from src.freelance_leads_bot.integrations.avito_sender import avito_sender_from_settings
 from src.freelance_leads_bot.integrations.avito_turn_buffer import enqueue_avito_turn_message
 from src.freelance_leads_bot.integrations.avito_voice import AvitoApiVoiceResolver
-from src.freelance_leads_bot.integrations.avito_webhook import _is_own_message, process_avito_message
+from src.freelance_leads_bot.integrations.avito_webhook import _is_own_message, process_avito_message, processing_outcome_from_result
 from src.freelance_leads_bot.integrations.codex_planner import CodexPlannerRunner
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import ExpertRagStore
@@ -39,6 +39,9 @@ from src.freelance_leads_bot.storage import LeadStore
 LOG_PATH = Path("data/avito_poller.log")
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 DEFAULT_ACCESS_ERROR_BACKOFF_SECONDS = 1800
+DEFAULT_POLLER_CHAT_LIMIT = 150
+DEFAULT_POLLER_MESSAGES_PER_CHAT = 50
+DEFAULT_POLLER_PAGE_SIZE = 100
 
 
 def _env_int(name: str, default: int) -> int:
@@ -239,8 +242,7 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
     expert_rag = ExpertRagStore(settings.rag_expert_db_path) if settings.rag_retrieval_enabled else None
 
     since_ts = int(time.time()) - lookback_seconds
-    chats_payload = await reader.list_chats(account_id, limit=chat_limit)
-    chats = _items(chats_payload, "chats", "items")
+    chats = await _list_recent_chats(reader, account_id, chat_limit=chat_limit)
     update_client_name_cache({str(chat.get("id") or ""): client_name_from_chat(chat, account_id=account_id) for chat in chats})
     processed = 0
     skipped = 0
@@ -264,90 +266,136 @@ async def run_once(settings: IntegrationSettings, *, lookback_seconds: int, chat
             candidates.append(raw_message)
         if not candidates:
             continue
-        for stale_message in candidates[:-1]:
-            dedup.mark_once(f"{chat_id}:{stale_message.get('id') or ''}")
-            skipped += 1
-            skip_reasons["stale_candidate"] += 1
-        raw_message = candidates[-1]
-        key = f"{chat_id}:{raw_message.get('id') or ''}"
-        if dedup.contains(key):
-            skipped += 1
-            skip_reasons["duplicate"] += 1
-            continue
-        message = _inbound_from_message(account_id=account_id, chat=chat, raw_message=raw_message)
-        if str(message.metadata.get("message_type") or "") == "voice" and voice_resolver:
-            try:
-                message = await voice_resolver.transcribe(message)
-            except Exception as exc:
+        for raw_message in candidates:
+            key = f"{chat_id}:{raw_message.get('id') or ''}"
+            if dedup.contains(key):
                 skipped += 1
-                skip_reasons["voice_transcription_error"] += 1
-                _log({"event": "ignored", "chat_id": chat_id, "message_id": message.message_id, "reason": "voice_transcription_error", "error": repr(exc)})
+                skip_reasons["duplicate"] += 1
                 continue
-        if settings.avito_turn_debounce_seconds > 0:
-            queued = enqueue_avito_turn_message(
-                message,
-                debounce_seconds=settings.avito_turn_debounce_seconds,
-                max_wait_seconds=settings.avito_turn_max_wait_seconds,
-                max_messages=settings.avito_turn_batch_max_messages,
-            )
-            skipped += 1
-            skip_reasons["turn_debounce_queued"] += 1
+            message = _inbound_from_message(account_id=account_id, chat=chat, raw_message=raw_message)
+            if str(message.metadata.get("message_type") or "") == "voice" and voice_resolver:
+                try:
+                    message = await voice_resolver.transcribe(message)
+                except Exception as exc:
+                    metadata = dict(message.metadata)
+                    metadata["voice_transcription_error"] = repr(exc)
+                    message = replace(message, metadata=metadata)
+                    _log(
+                        {
+                            "event": "voice_transcription_error",
+                            "chat_id": chat_id,
+                            "message_id": message.message_id,
+                            "error": repr(exc),
+                        }
+                    )
+            if settings.avito_turn_debounce_seconds > 0:
+                queued = enqueue_avito_turn_message(
+                    message,
+                    debounce_seconds=settings.avito_turn_debounce_seconds,
+                    max_wait_seconds=settings.avito_turn_max_wait_seconds,
+                    max_messages=settings.avito_turn_batch_max_messages,
+                )
+                queue_ok = bool(queued.get("queued"))
+                if queue_ok:
+                    dedup.mark_once(key)
+                    skipped += 1
+                    skip_reasons["turn_debounce_queued"] += 1
+                else:
+                    errors += 1
+                    skip_reasons[str(queued.get("reason") or "turn_debounce_queue_failed")] += 1
+                _log(
+                    {
+                        "event": "queued" if queue_ok else "retryable_error",
+                        "reason": "turn_debounce" if queue_ok else str(queued.get("reason") or "turn_debounce_queue_failed"),
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "message": asdict(message),
+                        "queue": queued,
+                    }
+                )
+                continue
+            try:
+                result = await process_avito_message(
+                    message=message,
+                    settings=settings,
+                    toolbox=toolbox,
+                    planner=planner,
+                    sender=sender,
+                    handoff_notifier=notifier,
+                    photo_resolver=photo_resolver,
+                    history_store=history_store,
+                    expert_rag=expert_rag,
+                )
+            except Exception as exc:
+                errors += 1
+                _log({"event": "process_error", "chat_id": chat_id, "message_id": raw_message.get("id"), "error": repr(exc)})
+                continue
+            if _dedup_allowed(result):
+                dedup.mark_once(key)
+            if result.get("ignored"):
+                skipped += 1
+                skip_reasons[str(result.get("reason") or "ignored")] += 1
+                _log(
+                    {
+                        "event": "ignored",
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "reason": result.get("reason"),
+                        "result": result,
+                    }
+                )
+                continue
+            if not result.get("ok"):
+                errors += 1
+                skip_reasons[str(result.get("reason") or "retryable_error")] += 1
+                _log(
+                    {
+                        "event": "retryable_error",
+                        "chat_id": chat_id,
+                        "message_id": message.message_id,
+                        "message": asdict(message),
+                        "result": result,
+                    }
+                )
+                continue
+            processed += 1
             _log(
                 {
-                    "event": "queued",
-                    "reason": "turn_debounce",
+                    "event": "processed",
                     "chat_id": chat_id,
                     "message_id": message.message_id,
                     "message": asdict(message),
-                    "queue": queued,
-                }
-            )
-            dedup.mark_once(key)
-            continue
-        try:
-            result = await process_avito_message(
-                message=message,
-                settings=settings,
-                toolbox=toolbox,
-                planner=planner,
-                sender=sender,
-                handoff_notifier=notifier,
-                photo_resolver=photo_resolver,
-                history_store=history_store,
-                expert_rag=expert_rag,
-            )
-        except Exception as exc:
-            errors += 1
-            _log({"event": "process_error", "chat_id": chat_id, "message_id": raw_message.get("id"), "error": repr(exc)})
-            continue
-        dedup.mark_once(key)
-        if result.get("ignored"):
-            skipped += 1
-            skip_reasons[str(result.get("reason") or "ignored")] += 1
-            _log(
-                {
-                    "event": "ignored",
-                    "chat_id": chat_id,
-                    "message_id": message.message_id,
-                    "reason": result.get("reason"),
                     "result": result,
                 }
             )
-            continue
-        processed += 1
-        _log(
-            {
-                "event": "processed",
-                "chat_id": chat_id,
-                "message_id": message.message_id,
-                "message": asdict(message),
-                "result": result,
-            }
-        )
 
     summary = {"processed": processed, "skipped": skipped, "errors": errors, "chats": len(chats), "skip_reasons": dict(skip_reasons)}
     _log({"event": "summary", **summary})
     return summary
+
+
+def _dedup_allowed(result: dict[str, Any]) -> bool:
+    return processing_outcome_from_result(result).safe_to_dedup
+
+
+async def _list_recent_chats(reader: AvitoReadClient, account_id: int, *, chat_limit: int) -> list[dict[str, Any]]:
+    target = max(0, int(chat_limit or 0))
+    if target <= 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    page_size = min(DEFAULT_POLLER_PAGE_SIZE, target)
+    while len(rows) < target:
+        limit = min(page_size, target - len(rows))
+        payload = await reader.list_chats(account_id, limit=limit, offset=offset)
+        page = _items(payload, "chats", "items")
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < limit:
+            break
+        offset += len(page)
+    return rows[:target]
 
 
 async def main() -> None:
@@ -355,8 +403,11 @@ async def main() -> None:
     interval = _env_int("AVITO_POLLER_INTERVAL_SECONDS", 60)
     access_error_backoff = _env_int("AVITO_POLLER_ACCESS_ERROR_BACKOFF_SECONDS", DEFAULT_ACCESS_ERROR_BACKOFF_SECONDS)
     lookback = _env_int("AVITO_POLLER_LOOKBACK_SECONDS", 3600)
-    chat_limit = _env_int("AVITO_POLLER_CHAT_LIMIT", 20)
-    messages_per_chat = _env_int("AVITO_POLLER_MESSAGES_PER_CHAT", 20)
+    chat_limit = _env_int("AVITO_POLLER_CHAT_LIMIT", _env_int("AVITO_UNANSWERED_CHAT_LIMIT", DEFAULT_POLLER_CHAT_LIMIT))
+    messages_per_chat = _env_int(
+        "AVITO_POLLER_MESSAGES_PER_CHAT",
+        _env_int("AVITO_UNANSWERED_MESSAGES_PER_CHAT", DEFAULT_POLLER_MESSAGES_PER_CHAT),
+    )
     once = os.getenv("AVITO_POLLER_ONCE", "").lower() in {"1", "true", "yes", "on"}
 
     while True:

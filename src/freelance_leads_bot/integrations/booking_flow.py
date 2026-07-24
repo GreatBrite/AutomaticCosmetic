@@ -39,6 +39,7 @@ class BookingRequest:
 class BookingDecision:
     action: str
     reply: str
+    state: str = ""
     handoff: Handoff | None = None
     slots: list[Slot] = field(default_factory=list)
     appointment_id: int | None = None
@@ -57,6 +58,7 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="handoff",
                 reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
+                state="awaiting_olga",
                 handoff=handoff,
             )
 
@@ -65,6 +67,7 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_city",
                 reply="Подскажите, пожалуйста, в каком городе вам удобно записаться?",
+                state="requested_slot",
             )
 
         services = await self.booking.get_services(city)
@@ -74,12 +77,14 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_service",
                 reply=f"Какая процедура вас интересует? Сейчас доступны: {available}.",
+                state="requested_slot",
             )
 
         if not request.preferred_date:
             return BookingDecision(
                 action="ask_date",
                 reply=f"На какую дату посмотреть свободное время в городе {city}?",
+                state="requested_slot",
                 service=service,
             )
 
@@ -89,12 +94,14 @@ class AvitoBookingFlow:
                 return BookingDecision(
                     action="no_slots",
                     reply=f"На {request.preferred_date} свободного времени по услуге {service.title} не нашла. Предложить другой день?",
+                    state="failed",
                     service=service,
                 )
             times = ", ".join(slot.starts_at.strftime("%H:%M") for slot in slots[:6])
             return BookingDecision(
                 action="offer_slots",
                 reply=f"В городе {city} на {request.preferred_date} есть время: {times}. Какое удобно?",
+                state="offered_slot",
                 slots=slots,
                 service=service,
             )
@@ -105,6 +112,7 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_time",
                 reply=f"Не вижу свободного времени {request.preferred_time}. Доступно: {times}.",
+                state="requested_slot",
                 slots=slots,
                 service=service,
             )
@@ -114,6 +122,7 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_contact",
                 reply="Пришлите, пожалуйста, имя для записи и номер телефона для связи.",
+                state="offered_slot",
                 slots=slots,
                 service=service,
             )
@@ -126,6 +135,7 @@ class AvitoBookingFlow:
                     f"{selected_slot.starts_at.strftime('%d.%m %H:%M')}. "
                     "Сейчас проверю оформление записи и вернусь с подтверждением."
                 ),
+                state="awaiting_olga",
                 handoff=Handoff(
                     reason=HandoffReason.BOOKING_AMBIGUOUS,
                     message=request.message,
@@ -155,6 +165,7 @@ class AvitoBookingFlow:
                 f"{selected_slot.starts_at.strftime('%d.%m %H:%M')}. "
                 "Если что-то изменится, напишем."
             ),
+            state="confirmed",
             appointment_id=appointment_id,
             service=service,
         )
@@ -215,15 +226,24 @@ def extract_date(text: str, today: date | None = None) -> str:
         return (current + timedelta(days=1)).isoformat()
     match = DATE_ISO_RE.search(text)
     if match:
-        return match.group(1)
+        try:
+            return date.fromisoformat(match.group(1)).isoformat()
+        except ValueError:
+            return ""
     match = DATE_DMY_RE.search(text)
     if match:
         day = int(match.group(1))
         month = int(match.group(2))
         year = int(match.group(3) or current.year)
-        candidate = date(year, month, day)
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return ""
         if not match.group(3) and candidate < current:
-            candidate = date(year + 1, month, day)
+            try:
+                candidate = date(year + 1, month, day)
+            except ValueError:
+                return ""
         return candidate.isoformat()
     return ""
 

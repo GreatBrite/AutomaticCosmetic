@@ -367,7 +367,19 @@ class TelegramAdminBotTransport:
     def _recent_history(self, history_key: str) -> list[dict[str, Any]]:
         if not self.history_store or not self.settings.telegram_admin_history_enabled:
             return []
-        return self.history_store.recent_codex_chat(self.settings.telegram_admin_history_limit, history_key)
+        configured_limit = int(self.settings.telegram_admin_history_limit or 0)
+        limit = min(max(configured_limit or 20, 8), 20)
+        rows = self.history_store.recent_codex_chat(limit + 1, history_key)
+        if len(rows) <= limit:
+            return rows
+        older_count = len(rows) - limit
+        recent = rows[-limit:]
+        summary = {
+            "role": "system",
+            "content": f"Краткое резюме памяти: скрыто {older_count}+ более ранних сообщений этой Telegram-задачи; используй последние сообщения и tool_trace, не проси заново уже известные факты.",
+            "created_at": recent[0].get("created_at") if recent else "",
+        }
+        return [summary, *recent]
 
     def _remember(self, history_key: str, role: str, content: str) -> None:
         if not self.history_store or not self.settings.telegram_admin_history_enabled:

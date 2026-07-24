@@ -10,7 +10,36 @@ from typing import Any
 
 DEFAULT_HANDOFF_REFS_PATH = Path("data/telegram_handoff_refs.json")
 MAX_HANDOFF_REFS = 1000
-UNRESOLVED_HANDOFF_STATUSES = {"open", "draft_pending", "rejected"}
+UNRESOLVED_HANDOFF_STATUSES = {"open", "in_progress", "draft_pending", "rejected", "expired_critical"}
+CLOSED_HANDOFF_STATUSES = {
+    "answered",
+    "resolved",
+    "closed",
+    "manual_closed",
+    "closed_manual",
+    "closed_manual_no_client_reply",
+    "not_relevant",
+    "expired",
+}
+CRITICAL_HANDOFF_REASONS = {
+    "booking_critical",
+    "booking_ambiguous",
+    "photo_consultation",
+    "complaint_or_risk",
+    "expert_expectation",
+    "medical_question",
+    "voice_transcription_failed",
+}
+CRITICAL_HANDOFF_TEXT_RE = re.compile(
+    r"("
+    r"booking[_\s-]*critical|booking[_\s-]*ambiguous|photo[_\s-]*consultation|complaint[_\s-]*or[_\s-]*risk|expert[_\s-]*expectation|"
+    r"запис[ьи]|перезапис|перенос|отмен[аи]|адрес|где\s+.*при(?:й|и)ти|"
+    r"в\s+силе|подтверд|подтвержд|дат[ауеы]|время|окн[оа]|"
+    r"фото|вложени|голосов|жалоб|отзыв|негатив|медицин|противопоказ|"
+    r"об[ъь]?[её]м|мл|результат|размер|заметн|выраженн|нельзя\s+автообещ"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def telegram_handoff_ref_key(telegram_chat_id: str, telegram_message_id: str | int) -> str:
@@ -52,11 +81,25 @@ def remember_telegram_handoff_ref(
     telegram_chat_id: str,
     telegram_message_id: str | int,
     avito_chat_id: str,
+    telegram_message_thread_id: str | int = "",
     client_name: str = "",
     handoff_text: str = "",
     handoff_id: str = "",
     source_message_id: str = "",
     status: str = "open",
+    reason: str = "",
+    urgency: str = "",
+    sla: str = "",
+    client_waits_for: str = "",
+    deadline_at: int = 0,
+    escalation_at: int = 0,
+    phone: str = "",
+    city: str = "",
+    service: str = "",
+    booking_date: str = "",
+    booking_time: str = "",
+    confirmation_needed: str = "",
+    assignee: str = "",
     path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
 ) -> dict:
     telegram_chat_id = str(telegram_chat_id).strip()
@@ -68,6 +111,8 @@ def remember_telegram_handoff_ref(
     key = telegram_handoff_ref_key(telegram_chat_id, telegram_message_id)
     refs = load_telegram_handoff_refs(path)
     existing = refs.get(key) if isinstance(refs.get(key), dict) else {}
+    reason_value = str(reason or existing.get("reason") or _reason_from_text(handoff_text) or "").strip()
+    waits_for = str(client_waits_for or existing.get("client_waits_for") or _client_waits_for_from_text(handoff_text) or "").strip()
     stable_handoff_id = str(handoff_id or existing.get("handoff_id") or "").strip()
     if not stable_handoff_id:
         stable_handoff_id = handoff_id_for(avito_chat_id, source_message_id, int(existing.get("created_at") or now))
@@ -75,11 +120,27 @@ def remember_telegram_handoff_ref(
         "handoff_id": stable_handoff_id,
         "telegram_chat_id": telegram_chat_id,
         "telegram_message_id": telegram_message_id,
+        "telegram_message_thread_id": str(telegram_message_thread_id or existing.get("telegram_message_thread_id") or "").strip(),
         "avito_chat_id": avito_chat_id,
         "source_message_id": str(source_message_id or existing.get("source_message_id") or "").strip(),
         "client_name": str(client_name or "").strip(),
         "handoff_text": str(handoff_text or "").strip()[-3000:],
         "status": str(status or existing.get("status") or "open"),
+        "reason": reason_value,
+        "urgency": str(urgency or existing.get("urgency") or "").strip(),
+        "sla": str(sla or existing.get("sla") or ("critical" if reason_value in CRITICAL_HANDOFF_REASONS else "")).strip(),
+        "client_waits_for": waits_for,
+        "deadline_at": int(deadline_at or existing.get("deadline_at") or 0),
+        "escalation_at": int(escalation_at or existing.get("escalation_at") or 0),
+        "phone": str(phone or existing.get("phone") or "").strip(),
+        "city": str(city or existing.get("city") or "").strip(),
+        "service": str(service or existing.get("service") or "").strip(),
+        "booking_date": str(booking_date or existing.get("booking_date") or "").strip(),
+        "booking_time": str(booking_time or existing.get("booking_time") or "").strip(),
+        "confirmation_needed": str(confirmation_needed or existing.get("confirmation_needed") or "").strip(),
+        "assignee": str(assignee or existing.get("assignee") or "").strip(),
+        "reminder_sent_at": int(existing.get("reminder_sent_at") or 0),
+        "escalation_sent_at": int(existing.get("escalation_sent_at") or 0),
         "draft_id": str(existing.get("draft_id") or ""),
         "closed_at": int(existing.get("closed_at") or 0),
         "created_at": int(existing.get("created_at") or now),
@@ -95,6 +156,9 @@ def update_handoff_status(
     status: str,
     *,
     draft_id: str = "",
+    resolution_note: str = "",
+    resolution_source: str = "",
+    resolution_action: str = "",
     path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
 ) -> bool:
     handoff_id = str(handoff_id or "").strip()
@@ -108,7 +172,13 @@ def update_handoff_status(
             continue
         ref["status"] = status
         ref["draft_id"] = str(draft_id or ref.get("draft_id") or "")
-        ref["closed_at"] = now if status == "closed" else 0
+        ref["closed_at"] = now if status in CLOSED_HANDOFF_STATUSES else 0
+        if resolution_note:
+            ref["resolution_note"] = str(resolution_note).strip()[:1000]
+        if resolution_source:
+            ref["resolution_source"] = str(resolution_source).strip()[:120]
+        if resolution_action:
+            ref["resolution_action"] = str(resolution_action).strip()[:120]
         ref["updated_at"] = now
         changed = True
     if changed:
@@ -177,6 +247,41 @@ def latest_unresolved_handoff_ref_for_chat(
 
 
 def open_handoff_refs(path: Path | str = DEFAULT_HANDOFF_REFS_PATH) -> list[dict]:
+    return _open_handoff_refs(path, repair_missing_ids=True)
+
+
+def read_open_handoff_refs(path: Path | str = DEFAULT_HANDOFF_REFS_PATH) -> list[dict]:
+    return _open_handoff_refs(path, repair_missing_ids=False)
+
+
+def handoff_ref_is_critical(ref: dict[str, Any]) -> bool:
+    if not isinstance(ref, dict):
+        return False
+    if str(ref.get("status") or "").strip() == "expired_critical":
+        return True
+    if str(ref.get("urgency") or "").strip().casefold() == "critical":
+        return True
+    reason = str(ref.get("reason") or "").strip().casefold()
+    if reason in CRITICAL_HANDOFF_REASONS:
+        return True
+    if str(ref.get("sla") or "").strip().casefold() == "critical":
+        return True
+    structured = " ".join(
+        str(ref.get(key) or "")
+        for key in (
+            "client_waits_for",
+            "confirmation_needed",
+            "booking_date",
+            "booking_time",
+            "service",
+            "city",
+            "handoff_text",
+        )
+    )
+    return bool(CRITICAL_HANDOFF_TEXT_RE.search(structured.casefold().replace("ё", "е")))
+
+
+def _open_handoff_refs(path: Path | str = DEFAULT_HANDOFF_REFS_PATH, *, repair_missing_ids: bool) -> list[dict]:
     refs = load_telegram_handoff_refs(path)
     canonical: dict[str, dict] = {}
     changed = False
@@ -192,12 +297,13 @@ def open_handoff_refs(path: Path | str = DEFAULT_HANDOFF_REFS_PATH) -> list[dict
             )
             ref["handoff_id"] = handoff_id
             ref.setdefault("status", "open")
-            refs[key] = ref
-            changed = True
+            if repair_missing_ids:
+                refs[key] = ref
+                changed = True
         current = canonical.get(handoff_id)
         if current is None or int(ref.get("updated_at") or 0) > int(current.get("updated_at") or 0):
             canonical[handoff_id] = ref
-    if changed:
+    if changed and repair_missing_ids:
         save_telegram_handoff_refs(refs, path)
     by_chat: dict[str, dict] = {}
     for ref in canonical.values():
@@ -208,6 +314,29 @@ def open_handoff_refs(path: Path | str = DEFAULT_HANDOFF_REFS_PATH) -> list[dict
     rows = [dict(ref) for ref in by_chat.values() if str(ref.get("status") or "open") in UNRESOLVED_HANDOFF_STATUSES]
     rows.sort(key=_handoff_ref_recency_key, reverse=True)
     return rows
+
+
+def _reason_from_text(text: str) -> str:
+    for line in str(text or "").splitlines():
+        label, _, value = line.partition(":")
+        if label.strip().casefold() == "причина":
+            return value.strip()
+    return ""
+
+
+def _client_waits_for_from_text(text: str) -> str:
+    lowered = str(text or "").casefold().replace("ё", "е")
+    if "адрес" in lowered:
+        return "адрес/подтверждение записи"
+    if "запис" in lowered or "в силе" in lowered or "подтверд" in lowered:
+        return "подтверждение записи"
+    if "фото" in lowered or "вложени" in lowered:
+        return "оценка фото/вложения"
+    if "голосов" in lowered:
+        return "разбор голосового сообщения"
+    if "жалоб" in lowered or "отзыв" in lowered or "негатив" in lowered:
+        return "разбор жалобы/риска"
+    return ""
 
 
 def find_telegram_handoff_ref(

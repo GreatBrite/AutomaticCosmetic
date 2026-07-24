@@ -35,10 +35,39 @@ JSON для автоматизации:
 - `avito_autoreply_failures`: failed delayed auto-reply попытки. Это error.
 - `expert_rag`: есть ли approved RAG-знания.
 - `expert_rag_needs_review`: есть знания, которые бот не должен использовать сам, пока их не подтвердили.
+- `expert_rag_temporal_cleanup`: approved-знания с датами, временем, окнами, адресами, акциями или конкретными договорённостями без expiry.
 - `data_footprint`: размер `data/` и крупнейшие файлы/директории.
 - `disk_free_space`: свободное место на диске.
 
 В строке `RAG` поле `high_risk_approved` показывает approved-знания с медицинским/рисковым контекстом. Поле `excluded_from_avito_autoanswer` должно совпадать с ним: такие знания не передаются в Avito autoanswer/planner context и остаются только для контролируемого review/аналитики.
+
+Поля `temporal_without_expiry` и `temporal_needs_cleanup` нужны для старых дат/окон/адресов: такие знания должны быть либо `autoanswer_allowed=false`, либо иметь `expires_at`/`valid_until`. Новые временные ответы Ольги сохраняются как память, но автоматически блокируются от autoanswer без expiry.
+
+Почистить старые временные approved-знания безопасно через поштучный review:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --output data/expert_rag_temporal_cleanup.md
+```
+
+Открой `data/expert_rag_temporal_cleanup.md`: там перечислены approved-знания с датами, окнами, адресами, акциями или разовыми договорённостями без expiry. У каждого пункта отметь ровно одно решение:
+
+- `block_autoanswer #id: причина` — знание остаётся как контекст/пример, но перестаёт быть прямым factual autoanswer;
+- `keep_for_autoanswer #id: причина` — только если отдельно добавили expiry/reusable wording;
+- `needs_edit #id: причина` — нужно переписать или добавить expiry перед изменением metadata.
+
+Сначала dry-run:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md
+```
+
+Если dry-run чистый, применить решения:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md --apply
+```
+
+Применяются только строки `block_autoanswer`: команда выставляет `autoanswer_allowed=false`, `temporal_fact=true` и `autoanswer_block_reason=temporal_without_expiry`. Если в файле есть конфликт, missing id или закрывающее решение без причины, ничего не применяется.
 
 ## Текущий нормальный WARN
 
@@ -162,6 +191,100 @@ LLM-понимание свободных команд Ольги использ
 
 Смотреть `checks[].name == "avito_unanswered_queue"` и `data.actionable_count`.
 
+В Telegram открыть рабочий список:
+
+```text
+/avito_followups
+```
+
+Если `TELEGRAM_CLIENT_TOPICS_ENABLED=true`, бот создаёт отдельную Telegram-тему под каждый Avito-диалог и сохраняет связь в `TELEGRAM_CLIENT_TOPICS_PATH` (`data/telegram_client_topics.json` по умолчанию). Карточка и фото клиента отправляются в эту тему; если Telegram не дал создать тему, бот молча откатывается к обычной отправке в основной чат.
+
+По каждой карточке нужно выбрать действие:
+
+- `Закрыто` — клиент уже получил финальный ответ.
+- `Не актуально` — обещание больше не требует ответа клиенту.
+- `Напомнить позже` — временно убрать из повторных уведомлений.
+
+Если клиент пишет про запись, адрес, оплату, перенос или “я записана, всё в силе?”, это считается критичным: задачу нельзя закрывать обещанием “уточню”, нужен финальный ответ клиенту или явное решение Ольги.
+
+### `telegram_open_handoffs`
+
+`ops_status` отдельно проверяет открытые Telegram-карточки Ольги из `data/telegram_handoff_refs.json`. Проверка read-only: запуск статуса не чинит и не перезаписывает этот файл.
+
+Нерешённые статусы: `open`, `in_progress`, `draft_pending`, `rejected`, `expired_critical`.
+
+Критичными считаются карточки про запись, перенос, отмену, адрес, подтверждение даты/времени, вопрос “в силе?”, фото/вложения, voice, жалобу, негативный отзыв или медицинский вопрос. Если critical handoff старше 1 часа, это warning; старше 3 часов — error. Обычный handoff старше 24 часов — warning, старше 48 часов — error. `expired_critical` всегда error.
+
+Если `ops_status` пишет `Immediate action required: review open Olga handoffs.`, нужно открыть `/open_cards` или тему клиента и дать клиенту финальный ответ/закрыть карточку с понятной причиной. Массово закрывать старые карточки без проверки последнего входящего и исходящего Avito нельзя.
+
+Для спокойного ручного разбора текущих хвостов можно сделать read-only экспорт. Команда не чинит и не переписывает `data/telegram_handoff_refs.json`, а собирает список открытых карточек с критичностью, возрастом, Avito chat_id и последними найденными входящими/исходящими из логов:
+
+```bash
+.venv/bin/python scripts/export_open_handoffs.py --output data/open_handoffs_review.md
+```
+
+Дальше по каждому пункту в `data/open_handoffs_review.md` нужно открыть Avito/тему клиента, проверить последний входящий и исходящий, затем закрыть карточку только с понятным результатом: клиент получил финальный ответ, Ольга обработала вручную, вопрос явно неактуален или задача всё ещё требует действия.
+
+В review-файле у каждой карточки есть блок `Decision, mark exactly one after manual review`. После проверки нужно отметить ровно одну строку `- [x]` и оставить причину после двоеточия. Закрывающие решения без причины не применяются.
+
+Сначала всегда dry-run:
+
+```bash
+.venv/bin/python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md
+```
+
+Если dry-run не показывает ошибок, можно применить решения:
+
+```bash
+.venv/bin/python scripts/export_open_handoffs.py --decisions data/open_handoffs_review.md --apply-decisions
+```
+
+Команда сохраняет в `data/telegram_handoff_refs.json` статус, `closed_at`, `resolution_note`, `resolution_source` и `resolution_action`. Решение `still_needs_action` state не закрывает: такая карточка остаётся видимой в `ops_status` и `/open_cards`.
+
+Решение `closed_manual_no_client_reply` не открывает карточку заново и не шлёт повторный пинг Ольге, но остаётся видимым отдельным warning `telegram_manual_closure_without_client_reply` в `ops_status`. Это нужно как audit-хвост: критичный вопрос был просмотрен и закрыт вручную без подтверждённого ответа клиенту.
+
+### `avito_pending_followups`
+
+Это зависшие обещания бота после фраз вроде “уточню”, “проверю”, “подтвержу”.
+
+Если есть critical followup, `ops_status` даёт минимум warning даже до просрочки. Если critical/overdue обещание старше `AVITO_OVERDUE_PROMISE_ERROR_AFTER_SECONDS`, `ops_status --strict` возвращает error. По умолчанию SLA — 3 часа.
+
+Проверить хвосты:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --json
+journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
+```
+
+Для ручного разбора через Markdown:
+
+```bash
+.venv/bin/python scripts/export_avito_followups.py --output data/avito_followups_review.md
+.venv/bin/python scripts/export_avito_followups.py --decisions data/avito_followups_review.md
+.venv/bin/python scripts/export_avito_followups.py --decisions data/avito_followups_review.md --apply-decisions
+```
+
+В `data/avito_followups_review.md` по каждой задаче отмечай ровно одно решение: `resolved`, `not_relevant`, `remind_later` или `still_needs_action`. Решения `resolved` и `not_relevant` требуют причину после `:`. Сначала всегда запускай dry-run без `--apply-decisions`; если есть ошибки, apply не делает частичных изменений.
+
+После ручного ответа в Avito монитор должен запомнить исходящее сообщение и закрыть открытую задачу, если ответ похож на финальный.
+
+Если нажали `Закрыто` по критичной карточке, а монитор не видит исходящего ответа клиенту после создания задачи, карточка получает статус `closed_manual_no_client_reply`. Это не дёргает Ольгу повторно, но остаётся warning в `ops_status`: такой случай нужно отдельно проверить в Avito.
+
+Фото и вложения из Avito бот пересылает в тему клиента. Статусы хранятся в `data/telegram_handoff_refs.json`: `received`, `downloaded`, `sent_to_olga`, `download_failed`, `manual_avito_check_required`. Если фото/файл не удалось переслать после retry, Ольга получает текстовую карточку “открыть Avito и проверить вложение вручную”.
+
+Голосовые сообщения расшифровываются webhook/missed-poller. Если расшифровка упала, сообщение не считается обработанным молча: создаётся handoff Ольге, а при падении handoff сообщение остаётся retryable.
+
+Missed-poller должен проверять минимум 150 последних чатов:
+
+```env
+AVITO_POLLER_CHAT_LIMIT=150
+AVITO_POLLER_MESSAGES_PER_CHAT=50
+```
+
+Если эти переменные не заданы, poller использует такие же production-defaults и проходит чаты страницами через `offset`.
+
+`ops_status` проверяет последний `summary` в `data/avito_poller.log`. В строке `Poller: chats=X/150 age=Ys` должно быть не меньше `150/150`, а summary должен быть свежим. Если видно `chats=20/150`, сервис, скорее всего, запущен со старым окружением или старым unit/env. В `deploy/systemd/yclients-avito-missed-poller.service` лимиты закреплены явно; после деплоя нужно скопировать unit, сделать `systemctl daemon-reload`, перезапустить `yclients-avito-missed-poller.service` и проверить новый summary в логах.
+
 ### `avito_unanswered_report_fresh`
 
 Monitor может зависнуть или перестать обновлять отчёт.
@@ -184,6 +307,145 @@ journalctl -u yclients-avito-unanswered-monitor.service -n 100 --no-pager
 journalctl -u yclients-avito-unanswered-monitor.service -n 200 --no-pager
 ```
 
+## Проверка визитов и допродажи
+
+Вечерние карточки визитов отправляет timer:
+
+```bash
+systemctl status yclients-visit-confirmations.timer --no-pager
+systemctl list-timers --all yclients-visit-confirmations.timer --no-pager
+```
+
+Ручной запуск:
+
+```bash
+.venv/bin/python scripts/send_visit_confirmations.py --date 2026-07-22 --force --no-quiet-empty
+```
+
+В Telegram можно запросить карточки командой:
+
+```text
+/visit_confirmations
+/care_followups
+```
+
+Follow-up клиентам отправляется только если включён `TELEGRAM_CLIENT_FOLLOWUP_SEND_ENABLED`. До проверки черновиков держать этот флаг выключенным.
+
+Правила отдела заботы:
+
+- После подтверждённого визита follow-up можно готовить даже при `consent_status=unknown`, если нет явного запрета.
+- `do_not_contact` или `consent_status=denied` полностью блокируют отправку клиенту.
+- `complaint_risk`, risk-level `high/blocked` или спорный риск — полный стоп: клиенту не пишем, оставляем задачу Ольге.
+- Если у клиента нет verified Telegram-связки, `/care_followups` показывает задачу найти канал связи или не писать, а не готовую отправку.
+- Ответ Ольги текстом на care-карточку заменяет черновик и сохраняется как урок тона для будущих follow-up.
+
+Полезные ops-сигналы:
+
+- `care_visit_details` — есть визиты в `needs_details` дольше 24 часов.
+- `care_followup_channels` — due-задачи есть, но нет verified Telegram-канала.
+- `care_followup_risk_gate` — live-отправка включена, а в очереди есть риск-блокированные задачи.
+
+## Role/tool matrix
+
+Матрица ролей проверяется тестом `test_role_safety_report_enforces_production_tool_matrix`.
+
+Нормальное состояние:
+
+- клиентские роли `avito_client`, `telegram_client`, `vk_client` имеют только read-only YCLIENTS/knowledge и безопасную CRM-memory; без Avito send, YCLIENTS mutations, workspace и RAG-admin tools;
+- Ольга может делать рабочие бизнес-мутации через allowlist, но не имеет `workspace.*`;
+- admin имеет workspace только read-only: `workspace.files.list`, `workspace.files.read`, `workspace.logs.tail`; без `workspace.command.run` и `workspace.python.run`;
+- upsell stub read-only: не отправляет клиентам, не мутирует YCLIENTS/Avito/RAG-admin и `live_actions_enabled=false`.
+
+## YCLIENTS webhook secret
+
+В production `YCLIENTS_INTEGRATION_SECRET` должен быть непустым. `/health` обязан показывать:
+
+```json
+{"secret_required": true}
+```
+
+POST на `/yclients/webhook` и `/yclients/callback` без `X-YCLIENTS-Signature`/`X-YClients-Webhook-Secret` должен возвращать `403`. GET/HEAD probe остаётся открытым для health-check.
+
+Если `ops_status` показывает `yclients_webhook_secret` как error:
+
+```bash
+grep -n '^YCLIENTS_INTEGRATION_SECRET=' .env
+systemctl restart yclients-yclients-integration.service
+curl -s http://127.0.0.1:8020/health
+```
+
+Секрет не писать в логи, PR и скриншоты.
+
+Webhook/YCLIENTS uvicorn-сервисы должны запускаться с `--no-access-log`, потому что Avito token и YCLIENTS secret приходят в query params и иначе могут попасть в journal. `/health` отдаёт только redacted integration URLs, а `ops_status --json` дополнительно маскирует поля `secret`, `token`, `key`, `access_token`.
+
+## Backup и restore
+
+Ежедневный backup:
+
+```bash
+sudo cp deploy/systemd/automaticcosmetic-backup.service /etc/systemd/system/
+sudo cp deploy/systemd/automaticcosmetic-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now automaticcosmetic-backup.timer
+```
+
+Ручной запуск:
+
+```bash
+.venv/bin/python scripts/backup_runtime_data.py --data-dir data --output-dir backups --env-path .env --retention-days 14
+```
+
+SQLite копируется через безопасный sqlite backup API в `backups/sqlite-*/`. JSON-state и `.env` архивируются отдельно в `backups/runtime-json-env-*.tar.gz` с правами `0600`.
+
+Проверка restore без записи в live `data/`:
+
+```bash
+.venv/bin/python scripts/verify_runtime_backup.py --backup-dir backups --restore-dir /tmp/automaticcosmetic-restore-check
+```
+
+Команда распаковывает `runtime-json-env-*.tar.gz` в отдельную папку, копирует SQLite из `sqlite-*` туда же и прогоняет `PRAGMA integrity_check`. Если нужно проверить конкретную дату, укажи stamp:
+
+```bash
+.venv/bin/python scripts/verify_runtime_backup.py --backup-dir backups --stamp YYYYMMDDTHHMMSSZ --restore-dir /tmp/automaticcosmetic-restore-check
+```
+
+Backup содержит `.env` и может содержать `data/mfa_totp.json`, то есть внутри есть реальные секреты. Такой архив нельзя отправлять подрядчикам, в GitHub issue или в чат без шифрования/очистки.
+
+Реальный restore в production делать только после успешной проверки выше:
+
+```bash
+systemctl stop freelance-leads-bot.service \
+  yclients-avito-webhook.service \
+  yclients-avito-missed-poller.service \
+  yclients-avito-unanswered-monitor.service \
+  yclients-yclients-integration.service \
+  yclients-visit-confirmations.timer \
+  yclients-visit-confirmations.service
+cp backups/sqlite-YYYYMMDDTHHMMSSZ/*.sqlite3 data/
+tar -xzf backups/runtime-json-env-YYYYMMDDTHHMMSSZ.tar.gz -C /root/AutomaticCosmetic
+systemctl start yclients-yclients-integration.service \
+  yclients-avito-webhook.service \
+  yclients-avito-missed-poller.service \
+  yclients-avito-unanswered-monitor.service \
+  freelance-leads-bot.service
+systemctl start yclients-visit-confirmations.timer
+.venv/bin/python -m src.freelance_leads_bot.integrations.ops_status
+```
+
+Перед restore проверить, что архив именно нужной даты, и сохранить копию текущего `data/`/`.env` отдельно, если есть риск отката не туда.
+
+## Log rotation
+
+Шаблон лежит в `deploy/logrotate/automaticcosmetic`.
+
+```bash
+sudo cp deploy/logrotate/automaticcosmetic /etc/logrotate.d/automaticcosmetic
+PYTHONPATH="$PWD" .venv/bin/python scripts/verify_logrotate_config.py deploy/logrotate/automaticcosmetic
+sudo logrotate -d /etc/logrotate.d/automaticcosmetic
+```
+
+Ротация касается только `*.log`, `*.jsonl`, trace/audit/outbox. Она не трогает SQLite, client topics, handoff refs и state JSON.
+
 ## Что делать при data/disk warning
 
 Проверить крупнейшие элементы:
@@ -199,6 +461,7 @@ df -h .
 - `data/leads.sqlite3`
 - `data/expert_rag.sqlite3`
 - `data/telegram_handoff_refs.json`
+- `data/telegram_client_topics.json`
 - `data/avito_processed_events.json`
 - `data/avito_unanswered_monitor_state.json`
 
@@ -208,6 +471,13 @@ df -h .
 
 ```bash
 cd /root/AutomaticCosmetic
-.venv/bin/python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m compileall -q src scripts
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m pytest -q -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python -m src.freelance_leads_bot.integrations.ops_status --strict
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" .venv/bin/python scripts/production_readiness_report.py --output data/production_readiness.md
 scripts/live_smoke_check.sh
 ```
+
+`production_readiness_report.py` read-only: он не закрывает карточки, не применяет RAG cleanup и не восстанавливает backup в live `data/`. Он собирает единый Markdown: `ops_status`, открытые handoff, temporal RAG candidates, backup restore verify и logrotate safety.
+
+Тестовый прогон не должен писать fake/test Avito события в live `data/avito_webhook.log`: pytest изолирует webhook log, processed-events и history DB через `tmp_path`. Если после тестов в production-логе появились `chat-codex`, `chat-voice`, `chat-review` или другие тестовые chat id, это регресс изоляции тестов.

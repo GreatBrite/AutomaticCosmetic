@@ -37,6 +37,11 @@ EXPERT_ESTIMATE_CUE_RE = re.compile(
     r"(?is)(?:фото\s+посмотр|по\s+фото|визуальн\w+\s+оценк|ориентир|ориентировочн|"
     r"\b\d{2,5}\s*(?:мл|₽|руб)|стоимост|как\s+модель|потребу\w+|можно\s+ориентироваться)"
 )
+AESTHETIC_PROMISE_VOLUME_RE = re.compile(r"(?iu)(?:\b\d{2,5}\s*(?:мл|милли?литр\w*)\b|(?:^|[^\d])(?:300|400|1200)(?:[^\d]|$)|объ[её]м)")
+AESTHETIC_PROMISE_RESULT_RE = re.compile(
+    r"(?iu)(размер|\+\s*1|плюс\s+один|заметн\w+|ярк\w+|выраженн\w+|результат|"
+    r"увелич\w+|хватит|достаточн\w+|как\s+будет|до\s*/?\s*после)"
+)
 
 
 class AvitoDraftReviewer(Protocol):
@@ -92,12 +97,32 @@ def apply_review_outcome(
         reply, changed = sanitize_consultation_language(decision.reply)
         if changed:
             metadata["consultation_guard"] = {"changed": True, "reason": "approved_draft"}
+        guard = aesthetic_expectation_guard(reply, message=message, decision=decision)
+        if guard:
+            metadata["aesthetic_expectation_guard"] = guard
+            return replace(
+                decision,
+                action="handoff",
+                reply=guard["safe_reply"],
+                handoff=Handoff(reason=HandoffReason.EXPERT_EXPECTATION, message=message, summary=guard["handoff_summary"]),
+                metadata=metadata,
+            )
         return replace(decision, reply=reply, metadata=metadata)
 
     reply = str(outcome.get("reply") or decision.reply or "").strip()
     reply, changed = sanitize_consultation_language(reply)
     if changed:
         metadata["consultation_guard"] = {"changed": True, "reason": action}
+    guard = aesthetic_expectation_guard(reply, message=message, decision=decision)
+    if guard:
+        metadata["aesthetic_expectation_guard"] = guard
+        return replace(
+            decision,
+            action="handoff",
+            reply=guard["safe_reply"],
+            handoff=Handoff(reason=HandoffReason.EXPERT_EXPECTATION, message=message, summary=guard["handoff_summary"]),
+            metadata=metadata,
+        )
     if action == "handoff":
         handoff = _handoff_from_review(message, outcome) or decision.handoff
         return replace(
@@ -141,6 +166,7 @@ def build_codex_review_prompt(
         "Верни строго JSON без markdown:\n"
         '{"action":"approve","notes":"коротко"}\n'
         '{"action":"revise","reply":"исправленный текст","notes":"что исправлено"}\n'
+        "Допустимые handoff_reason: photo_consultation, human_requested, booking_ambiguous, booking_critical, complaint_or_risk, expert_expectation, voice_transcription_failed, missing_data.\n"
         '{"action":"handoff","handoff_reason":"missing_data","handoff_summary":"что уточнить внутри команды","reply":"текст клиенту"}\n\n'
         "PAYLOAD:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n"
@@ -158,6 +184,23 @@ def sanitize_consultation_language(reply: str) -> tuple[str, bool]:
     if original.strip() and not sanitized:
         sanitized = "Сейчас уточню этот момент и вернусь с ответом."
     return sanitized, sanitized != original.strip()
+
+
+def aesthetic_expectation_guard(reply: str, *, message: InboundMessage | None = None, decision: AvitoConsultantReply | None = None) -> dict[str, str]:
+    text = str(reply or "").casefold().replace("ё", "е")
+    if not text:
+        return {}
+    if not (AESTHETIC_PROMISE_VOLUME_RE.search(text) and AESTHETIC_PROMISE_RESULT_RE.search(text)):
+        return {}
+    allowed = (decision.metadata or {}).get("olga_approved_aesthetic_formula") if decision and isinstance(decision.metadata, dict) else False
+    if allowed:
+        return {}
+    return {
+        "reason": "aesthetic_expectation_guard",
+        "safe_reply": "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее.",
+        "handoff_summary": "Нельзя автообещать результат по мл. Проверьте вопрос клиента и ответьте формулировкой Ольги.",
+        "message_text": str(message.text or "")[:500] if message else "",
+    }
 
 
 def _remove_redundant_expert_tail(text: str) -> str:

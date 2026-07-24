@@ -95,6 +95,8 @@ class IntegrationSettings:
     vk_send_enabled: bool
     vk_codex_enabled: bool
     telegram_admin_response_wait_seconds: int = 60
+    telegram_client_topics_enabled: bool = True
+    telegram_client_topics_path: Path = ROOT / "data" / "telegram_client_topics.json"
     rag_dynamic_intent_enabled: bool = True
     rag_service_catalog_enabled: bool = True
     rag_shared_retrieval_enabled: bool = True
@@ -123,11 +125,13 @@ class IntegrationSettings:
             telegram_admin_history_enabled=_env_bool("TELEGRAM_ADMIN_HISTORY_ENABLED", True),
             telegram_admin_history_limit=_env_int("TELEGRAM_ADMIN_HISTORY_LIMIT", 0),
             telegram_admin_history_db_path=Path(_env("TELEGRAM_ADMIN_HISTORY_DB_PATH", str(ROOT / "data" / "leads.sqlite3"))),
+            telegram_client_topics_enabled=_env_bool("TELEGRAM_CLIENT_TOPICS_ENABLED", True),
+            telegram_client_topics_path=Path(_env("TELEGRAM_CLIENT_TOPICS_PATH", str(ROOT / "data" / "telegram_client_topics.json"))),
             openrouter_api_key=_env("OPENROUTER_API_KEY"),
             default_model=_env("DEFAULT_MODEL", "anthropic/claude-sonnet-4.5"),
             avito_codex_enabled=True if avito_test_mode else _env_bool("AVITO_CODEX_ENABLED"),
             avito_codex_timeout_seconds=_env_int("AVITO_CODEX_TIMEOUT_SECONDS", 180),
-            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 0),
+            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 4),
             avito_turn_debounce_seconds=_env_int("AVITO_TURN_DEBOUNCE_SECONDS", 60),
             avito_turn_max_wait_seconds=_env_int("AVITO_TURN_MAX_WAIT_SECONDS", 120),
             avito_turn_batch_max_messages=_env_int("AVITO_TURN_BATCH_MAX_MESSAGES", 10),

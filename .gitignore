@@ -4,6 +4,7 @@
 mcp/email.mcp.json
 data/*
 !data/.gitkeep
+backups/
 legacy_integrations/**/.env
 legacy_integrations/**/.venv/
 legacy_integrations/**/data/
