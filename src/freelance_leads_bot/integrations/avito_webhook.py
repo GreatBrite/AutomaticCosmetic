@@ -275,9 +275,10 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
             result = {"ok": False, "error": repr(exc), "chat_id": message.chat_id, "message_id": message.message_id}
             _log_webhook({"event": "debounce_batch_error", **result})
         else:
+            outcome = processing_outcome_from_result(result)
             _log_webhook(
                 {
-                    "event": "debounce_batch_processed" if not result.get("ignored") else "debounce_batch_ignored",
+                    "event": _webhook_log_event(outcome, prefix="debounce_batch"),
                     "reason": result.get("reason"),
                     "chat_id": message.chat_id,
                     "message_id": message.message_id,
@@ -416,9 +417,10 @@ async def avito_webhook(
         mentor_memory=mentor_memory,
         expert_rag=expert_rag,
     )
+    outcome = processing_outcome_from_result(result)
     _log_webhook(
         {
-            "event": "processed" if not result.get("ignored") else "ignored",
+            "event": _webhook_log_event(outcome),
             "reason": result.get("reason"),
             "chat_id": message.chat_id,
             "message_id": message.message_id,
@@ -431,6 +433,21 @@ async def avito_webhook(
     if _dedup_allowed(result):
         processed_events.mark_once(dedup_key)
     return result
+
+
+def _webhook_log_event(outcome: ProcessingOutcome, *, prefix: str = "") -> str:
+    status = outcome.status
+    if prefix:
+        if status == "processed":
+            return f"{prefix}_processed"
+        if status == "ignored":
+            return f"{prefix}_ignored"
+        if status == "queued":
+            return f"{prefix}_queued"
+        return f"{prefix}_retryable_error"
+    if status in {"processed", "ignored", "queued"}:
+        return status
+    return "retryable_error"
 
 
 def _mark_batch_messages_processed(message: Any) -> None:

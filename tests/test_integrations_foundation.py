@@ -8448,6 +8448,85 @@ def test_avito_webhook_does_not_dedup_failed_turn_debounce_queue(monkeypatch) ->
         processed_events.seen.clear()
 
 
+def test_avito_webhook_logs_retryable_error_for_failed_processing() -> None:
+    class FakePlanner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(action="codex_reply", reply="Ответ клиенту.", metadata={"planner": "test"})
+
+    class FailingSender:
+        async def send_message(self, account_id, chat_id, text):
+            return {"sent": False, "error": "avito down"}
+
+    processed_events.seen.clear()
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
+    avito_app.dependency_overrides[get_planner] = lambda: FakePlanner()
+    avito_app.dependency_overrides[get_sender] = lambda: FailingSender()
+    event = {
+        "type": "message",
+        "message_id": "send-fail-log-1",
+        "chat_id": "chat-send-fail-log",
+        "content": {"text": "Здравствуйте"},
+    }
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json=event)
+        rows = [json.loads(line) for line in avito_webhook_module.WEBHOOK_LOG_PATH.read_text(encoding="utf-8").splitlines()]
+
+        assert response.status_code == 200
+        assert response.json()["processing_status"] == "retryable_error"
+        assert rows[-1]["event"] == "retryable_error"
+        assert rows[-1]["message_id"] == "send-fail-log-1"
+    finally:
+        avito_app.dependency_overrides.clear()
+        processed_events.seen.clear()
+
+
+@pytest.mark.anyio
+async def test_avito_debounce_batch_logs_retryable_error(monkeypatch) -> None:
+    batch = {
+        "chat_key": "chat-batch-fail-log",
+        "chat_id": "chat-batch-fail-log",
+        "client_id": "client-1",
+        "account_id": 1,
+        "messages": [
+            {
+                "channel": "avito",
+                "client_id": "client-1",
+                "chat_id": "chat-batch-fail-log",
+                "message_id": "batch-fail-log-1",
+                "text": "Здравствуйте",
+                "created_at": 1780000000,
+                "has_photo": False,
+                "metadata": {"account_id": 1},
+            }
+        ],
+    }
+    failed_batches: list[tuple[dict, str]] = []
+
+    async def fake_process_avito_message(**kwargs):
+        return {
+            "ok": False,
+            "processing_status": "retryable_error",
+            "reason": "telegram_down",
+            "error": "telegram down",
+            "chat_id": "chat-batch-fail-log",
+            "message_id": "batch-fail-log-1",
+        }
+
+    monkeypatch.setattr(avito_webhook_module, "pop_due_avito_turn_batches", lambda: [batch])
+    monkeypatch.setattr(avito_webhook_module, "process_avito_message", fake_process_avito_message)
+    monkeypatch.setattr(avito_webhook_module, "mark_avito_turn_batch_failed", lambda item, error: failed_batches.append((item, error)))
+
+    result = await avito_webhook_module.process_due_avito_turn_batches(_settings())
+    rows = [json.loads(line) for line in avito_webhook_module.WEBHOOK_LOG_PATH.read_text(encoding="utf-8").splitlines()]
+
+    assert result[0]["processing_status"] == "retryable_error"
+    assert rows[-1]["event"] == "debounce_batch_retryable_error"
+    assert rows[-1]["message_id"] == "batch-fail-log-1"
+    assert failed_batches[0][1] == "telegram down"
+
+
 def test_extract_date_ignores_invalid_dates() -> None:
     assert extract_date("Запишите на 15.99", today=date(2026, 7, 1)) == ""
     assert extract_date("Запишите на 2026-99-15", today=date(2026, 7, 1)) == ""
