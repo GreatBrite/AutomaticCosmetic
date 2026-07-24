@@ -7031,6 +7031,92 @@ def test_expert_rag_review_temporal_cleanup_exports_markdown_without_mutation(tm
     assert unchanged.metadata["autoanswer_allowed"] is True
 
 
+def test_expert_rag_review_temporal_cleanup_markdown_decisions_dry_run_and_apply(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    decisions_path = tmp_path / "temporal_cleanup.md"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Когда есть окно на губы?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    decisions_path.write_text(
+        f"- [x] block_autoanswer #{item.id}: разовая запись на завтра\n",
+        encoding="utf-8",
+    )
+
+    dry_code, dry_output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "temporal-cleanup", "--decisions", str(decisions_path)]
+    )
+    unchanged = store.get(item.id)
+    apply_code, apply_output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "temporal-cleanup", "--decisions", str(decisions_path), "--apply"]
+    )
+    updated = store.get(item.id)
+
+    assert dry_code == 0
+    assert "DRY RUN" in dry_output
+    assert "sets autoanswer_allowed=false" in dry_output
+    assert unchanged is not None
+    assert unchanged.metadata["autoanswer_allowed"] is True
+    assert apply_code == 0
+    assert "APPLY" in apply_output
+    assert updated is not None
+    assert updated.metadata["autoanswer_allowed"] is False
+    assert updated.metadata["temporal_cleanup_decision"] == "block_autoanswer"
+    assert updated.metadata["temporal_cleanup_decision_note"] == "разовая запись на завтра"
+    assert "temporal_cleanup_decision" in audit_path.read_text(encoding="utf-8")
+
+
+def test_expert_rag_review_temporal_cleanup_decisions_reject_invalid_without_partial_apply(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    audit_path = tmp_path / "audit.jsonl"
+    decisions_path = tmp_path / "temporal_cleanup.md"
+    store = ExpertRagStore(db_path)
+    first = store.upsert_from_handoff(
+        question="Когда есть окно?",
+        answer_client="Завтра есть окно на 15:00.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    second = store.upsert_from_handoff(
+        question="Адрес завтра?",
+        answer_client="Адрес завтра уточняем отдельно.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    decisions_path.write_text(
+        "\n".join(
+            [
+                f"- [x] block_autoanswer #{first.id}: разовая запись",
+                f"- [x] block_autoanswer #{second.id}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    code, output = run_review_command(
+        ["--db", str(db_path), "--audit-log", str(audit_path), "temporal-cleanup", "--decisions", str(decisions_path), "--apply"]
+    )
+    first_after = store.get(first.id)
+    second_after = store.get(second.id)
+
+    assert code == 1
+    assert "Missing reasons: 1" in output
+    assert "No changes were applied" in output
+    assert first_after is not None
+    assert second_after is not None
+    assert first_after.metadata["autoanswer_allowed"] is True
+    assert second_after.metadata["autoanswer_allowed"] is True
+    assert not audit_path.exists()
+
+
 def test_mentor_memory_stores_olga_handoff_answer_in_expert_rag(tmp_path) -> None:
     knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
     expert = ExpertRagStore(tmp_path / "expert.sqlite3")

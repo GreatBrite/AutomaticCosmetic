@@ -14,8 +14,18 @@ DEFAULT_AUDIT_LOG_PATH = Path("data/expert_rag_review_audit.jsonl")
 DECISION_ACTION_APPROVE = "approve"
 DECISION_ACTION_DEPRECATE = "deprecate"
 DECISION_ACTION_NEEDS_EDIT = "needs_edit"
+TEMPORAL_DECISION_BLOCK_AUTOANSWER = "block_autoanswer"
+TEMPORAL_DECISION_KEEP_AUTOANSWER = "keep_for_autoanswer"
+TEMPORAL_DECISION_NEEDS_EDIT = "needs_edit"
 _DECISION_CHECKBOX_RE = re.compile(
     r"^\s*-\s*\[[xX]\]\s*(approve|deprecate|needs\s+edited\s+answer)(?:\s+for)?\s+#(\d+)\b",
+    re.IGNORECASE,
+)
+_TEMPORAL_DECISION_RE = re.compile(
+    r"^\s*-\s*\[[xX]\]\s*"
+    r"(block_autoanswer|keep_for_autoanswer|needs_edit)"
+    r"\s+#(?P<id>\d+)"
+    r"(?:\s*:\s*(?P<note>.*))?\s*$",
     re.IGNORECASE,
 )
 _MONEY_RE = re.compile(r"(?iu)(?:\b\d[\d\s]{2,}\b\s*(?:₽|руб|р\b)?|стоимост|цена|прайс|как\s+модель|как\s+пациент)")
@@ -80,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     temporal_parser.add_argument("--limit", type=int, default=200, help="Maximum approved items to scan.")
     temporal_parser.add_argument("--apply", action="store_true", help="Apply metadata changes. Default is dry-run.")
     temporal_parser.add_argument("--output", type=Path, help="Write dry-run/apply review report to this file.")
+    temporal_parser.add_argument(
+        "--decisions",
+        type=Path,
+        help="Read checked temporal cleanup decisions from a Markdown report. Default is dry-run unless --apply is also set.",
+    )
 
     return parser
 
@@ -163,6 +178,16 @@ def run_review_command(argv: list[str] | None = None) -> tuple[int, str]:
         )
 
     if args.command == "temporal-cleanup":
+        if args.decisions:
+            return _run_temporal_cleanup_decisions_command(
+                store,
+                audit_log_path=audit_log_path,
+                decisions_path=args.decisions,
+                limit=args.limit,
+                apply=args.apply,
+                as_json=args.json,
+                output_path=args.output,
+            )
         return _run_temporal_cleanup_command(
             store,
             audit_log_path=audit_log_path,
@@ -395,6 +420,85 @@ def _run_temporal_cleanup_command(
     return 0, _json_or_text(as_json, payload, _format_temporal_cleanup(payload))
 
 
+def _run_temporal_cleanup_decisions_command(
+    store: ExpertRagStore,
+    *,
+    audit_log_path: Path,
+    decisions_path: Path,
+    limit: int,
+    apply: bool,
+    as_json: bool,
+    output_path: Path | None = None,
+) -> tuple[int, str]:
+    if not decisions_path.exists():
+        payload = {
+            "ok": False,
+            "dry_run": not apply,
+            "error": "file_not_found",
+            "path": str(decisions_path),
+            "planned": [],
+            "conflicts": [],
+            "missing": [],
+            "not_candidates": [],
+            "missing_reason": [],
+        }
+        return 1, _json_or_text(as_json, payload, _format_temporal_decision_plan(payload))
+    parsed = _parse_temporal_cleanup_decisions(decisions_path.read_text(encoding="utf-8"))
+    plan = _build_temporal_cleanup_decision_plan(store, parsed, limit=limit)
+    ok = not plan["conflicts"] and not plan["missing"] and not plan["not_candidates"] and not plan["missing_reason"]
+    if ok and apply:
+        for entry in plan["planned"]:
+            if entry["action"] != TEMPORAL_DECISION_BLOCK_AUTOANSWER:
+                continue
+            item = store.get(int(entry["id"]))
+            if not item:
+                entry["error"] = "not_found"
+                ok = False
+                break
+            updated = store.update_metadata(
+                item.id,
+                {
+                    "autoanswer_allowed": False,
+                    "temporal_fact": True,
+                    "autoanswer_block_reason": "temporal_without_expiry",
+                    "temporal_cleanup_decision": TEMPORAL_DECISION_BLOCK_AUTOANSWER,
+                    "temporal_cleanup_decision_note": str(entry.get("note") or "")[:500],
+                    "temporal_cleanup_applied_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            _append_audit_log(
+                audit_log_path,
+                action="temporal_cleanup_decision",
+                previous=item,
+                current=updated,
+            )
+            entry["applied"] = True
+    payload = {
+        "ok": ok,
+        "dry_run": not apply,
+        "decision_count": sum(len(actions) for actions in parsed.values()),
+        "planned_count": len(plan["planned"]),
+        "applied_count": sum(1 for entry in plan["planned"] if entry.get("applied")),
+        **plan,
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2) if as_json else _format_temporal_decision_plan(payload)
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content + "\n", encoding="utf-8")
+        return (0 if ok else 1), _json_or_text(
+            as_json,
+            {
+                "ok": ok,
+                "path": str(output_path),
+                "decision_count": payload["decision_count"],
+                "applied_count": payload["applied_count"],
+                "dry_run": not apply,
+            },
+            f"Reviewed temporal RAG cleanup decisions from {decisions_path}. Applied={payload['applied_count']}.",
+        )
+    return (0 if ok else 1), content
+
+
 def _temporal_cleanup_plan(store: ExpertRagStore, *, limit: int) -> list[dict[str, Any]]:
     planned: list[dict[str, Any]] = []
     for item in store.list_answers(status=APPROVED, limit=max(1, int(limit or 1))):
@@ -421,6 +525,71 @@ def _temporal_cleanup_plan(store: ExpertRagStore, *, limit: int) -> list[dict[st
             }
         )
     return planned
+
+
+def _parse_temporal_cleanup_decisions(markdown: str) -> dict[int, list[dict[str, str]]]:
+    decisions: dict[int, list[dict[str, str]]] = {}
+    for line_no, line in enumerate(str(markdown or "").splitlines(), start=1):
+        match = _TEMPORAL_DECISION_RE.match(line)
+        if not match:
+            continue
+        item_id = int(match.group("id"))
+        decisions.setdefault(item_id, []).append(
+            {
+                "line": str(line_no),
+                "action": match.group(1).casefold(),
+                "note": str(match.group("note") or "").strip(),
+            }
+        )
+    return decisions
+
+
+def _build_temporal_cleanup_decision_plan(
+    store: ExpertRagStore,
+    parsed: dict[int, list[dict[str, str]]],
+    *,
+    limit: int,
+) -> dict[str, list[dict[str, Any]]]:
+    candidate_ids = {int(entry["id"]) for entry in _temporal_cleanup_plan(store, limit=limit)}
+    planned: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    not_candidates: list[dict[str, Any]] = []
+    missing_reason: list[dict[str, Any]] = []
+    for item_id, decisions in sorted(parsed.items()):
+        actions = sorted({decision["action"] for decision in decisions})
+        if len(actions) > 1:
+            conflicts.append({"id": item_id, "actions": actions, "lines": [int(decision["line"]) for decision in decisions]})
+            continue
+        decision = decisions[0]
+        item = store.get(item_id)
+        if not item:
+            missing.append({"id": item_id, "action": decision["action"], "line": int(decision["line"])})
+            continue
+        if item_id not in candidate_ids:
+            not_candidates.append({"id": item_id, "action": decision["action"], "status": item.status})
+            continue
+        if not decision["note"]:
+            missing_reason.append({"id": item_id, "action": decision["action"], "line": int(decision["line"])})
+            continue
+        planned.append(
+            {
+                "id": item.id,
+                "action": decision["action"],
+                "note": decision["note"],
+                "status": item.status,
+                "question": item.question_canonical,
+                "answer_client": item.answer_client,
+                "applied": False,
+            }
+        )
+    return {
+        "planned": planned,
+        "conflicts": conflicts,
+        "missing": missing,
+        "not_candidates": not_candidates,
+        "missing_reason": missing_reason,
+    }
 
 
 def _parse_markdown_decisions(markdown: str) -> dict[int, list[str]]:
@@ -553,6 +722,48 @@ def _format_temporal_cleanup(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_temporal_decision_plan(payload: dict[str, Any]) -> str:
+    planned = payload.get("planned") if isinstance(payload.get("planned"), list) else []
+    conflicts = payload.get("conflicts") if isinstance(payload.get("conflicts"), list) else []
+    missing = payload.get("missing") if isinstance(payload.get("missing"), list) else []
+    not_candidates = payload.get("not_candidates") if isinstance(payload.get("not_candidates"), list) else []
+    missing_reason = payload.get("missing_reason") if isinstance(payload.get("missing_reason"), list) else []
+    mode = "DRY RUN" if payload.get("dry_run") else "APPLY"
+    lines = [f"{mode}: expert RAG temporal cleanup decisions"]
+    if payload.get("error"):
+        lines.append(f"Error: {payload.get('error')}")
+        return "\n".join(lines)
+    lines.append(f"Checked decisions: {payload.get('decision_count', 0)}")
+    lines.append(f"Planned decisions: {len(planned)}, applied: {payload.get('applied_count', 0)}")
+    for entry in planned:
+        applied = " applied" if entry.get("applied") else ""
+        mutation = "sets autoanswer_allowed=false" if entry.get("action") == TEMPORAL_DECISION_BLOCK_AUTOANSWER else "no mutation"
+        lines.append(f"- #{entry.get('id')} {entry.get('action')}: {mutation}{applied}")
+        if entry.get("question"):
+            lines.append(f"  Q: {_short(str(entry['question']), 90)}")
+    if conflicts:
+        lines.append(f"Conflicts: {len(conflicts)}")
+        for entry in conflicts:
+            lines.append(f"- #{entry.get('id')} has multiple checked actions: {', '.join(entry.get('actions') or [])}")
+    if missing:
+        lines.append(f"Missing items: {len(missing)}")
+        for entry in missing:
+            lines.append(f"- #{entry.get('id')} not found")
+    if not_candidates:
+        lines.append(f"Not temporal cleanup candidates: {len(not_candidates)}")
+        for entry in not_candidates:
+            lines.append(f"- #{entry.get('id')} status={entry.get('status')}")
+    if missing_reason:
+        lines.append(f"Missing reasons: {len(missing_reason)}")
+        for entry in missing_reason:
+            lines.append(f"- #{entry.get('id')} {entry.get('action')} needs a reason after ':'")
+    if not payload.get("ok"):
+        lines.append("No changes were applied because the decision file needs attention.")
+    elif payload.get("dry_run"):
+        lines.append("No changes were applied. Re-run with --apply to apply block_autoanswer decisions.")
+    return "\n".join(lines)
+
+
 def _format_temporal_cleanup_markdown(payload: dict[str, Any]) -> str:
     planned = payload.get("planned") if isinstance(payload.get("planned"), list) else []
     mode = "DRY RUN" if payload.get("dry_run") else "APPLY"
@@ -569,6 +780,8 @@ def _format_temporal_cleanup_markdown(payload: dict[str, Any]) -> str:
         "- [ ] Checked that items below are time-specific or one-off",
         "- [ ] Confirmed they should remain available as context/style, not direct autoanswer",
         "- [ ] If an item is actually a stable rule, edit it separately with an expiry or reusable wording before cleanup",
+        "",
+        "For each item, mark at most one decision after manual review. Closing decisions require a reason after `:`.",
     ]
     if not planned:
         lines.extend(["", "No approved temporal autoanswer items need cleanup."])
@@ -604,6 +817,16 @@ def _format_temporal_cleanup_markdown(payload: dict[str, Any]) -> str:
         )
         if entry.get("answer_internal"):
             lines.extend(["", "Internal note:", "", f"> {_quote_markdown(str(entry.get('answer_internal') or '-'))}"])
+        lines.extend(
+            [
+                "",
+                "Decision:",
+                "",
+                f"- [ ] block_autoanswer #{entry.get('id')}: temporal/one-off fact; keep only as context/style",
+                f"- [ ] keep_for_autoanswer #{entry.get('id')}: stable reusable rule with expiry/rewrite handled separately",
+                f"- [ ] needs_edit #{entry.get('id')}: rewrite or add expiry before changing metadata",
+            ]
+        )
     return "\n".join(lines)
 
 

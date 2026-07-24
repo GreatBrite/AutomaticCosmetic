@@ -43,14 +43,31 @@ JSON для автоматизации:
 
 Поля `temporal_without_expiry` и `temporal_needs_cleanup` нужны для старых дат/окон/адресов: такие знания должны быть либо `autoanswer_allowed=false`, либо иметь `expires_at`/`valid_until`. Новые временные ответы Ольги сохраняются как память, но автоматически блокируются от autoanswer без expiry.
 
-Почистить старые временные approved-знания безопасно через dry-run:
+Почистить старые временные approved-знания безопасно через поштучный review:
 
 ```bash
 .venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --output data/expert_rag_temporal_cleanup.md
-.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --apply
 ```
 
-Сначала открой `data/expert_rag_temporal_cleanup.md`: там перечислены approved-знания с датами, окнами, адресами, акциями или разовыми договорённостями без expiry. Dry-run export ничего не меняет в базе. `--apply` только выставляет `autoanswer_allowed=false`, `temporal_fact=true` и `autoanswer_block_reason=temporal_without_expiry`, то есть знание остаётся в памяти как контекст/пример, но перестаёт быть прямым factual autoanswer.
+Открой `data/expert_rag_temporal_cleanup.md`: там перечислены approved-знания с датами, окнами, адресами, акциями или разовыми договорённостями без expiry. У каждого пункта отметь ровно одно решение:
+
+- `block_autoanswer #id: причина` — знание остаётся как контекст/пример, но перестаёт быть прямым factual autoanswer;
+- `keep_for_autoanswer #id: причина` — только если отдельно добавили expiry/reusable wording;
+- `needs_edit #id: причина` — нужно переписать или добавить expiry перед изменением metadata.
+
+Сначала dry-run:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md
+```
+
+Если dry-run чистый, применить решения:
+
+```bash
+.venv/bin/python -m src.freelance_leads_bot.integrations.expert_rag_review temporal-cleanup --decisions data/expert_rag_temporal_cleanup.md --apply
+```
+
+Применяются только строки `block_autoanswer`: команда выставляет `autoanswer_allowed=false`, `temporal_fact=true` и `autoanswer_block_reason=temporal_without_expiry`. Если в файле есть конфликт, missing id или закрывающее решение без причины, ничего не применяется.
 
 ## Текущий нормальный WARN
 
