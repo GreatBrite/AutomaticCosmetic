@@ -73,6 +73,7 @@ from src.freelance_leads_bot.integrations.avito_webhook import (
     get_reviewer,
     get_sender,
     get_settings,
+    get_toolbox,
     get_voice_resolver,
     process_avito_message,
     processing_outcome_from_result,
@@ -718,6 +719,27 @@ def test_avito_webhook_log_is_isolated_from_production_data(tmp_path) -> None:
         assert rows[-1]["event"] == "ignored"
         assert rows[-1]["reason"] == "not_message_event"
         assert not str(avito_webhook_module.WEBHOOK_LOG_PATH).startswith("data/")
+    finally:
+        avito_app.dependency_overrides.clear()
+
+
+def test_avito_webhook_ignores_non_message_without_heavy_dependencies(tmp_path) -> None:
+    assert avito_webhook_module.WEBHOOK_LOG_PATH.parent == tmp_path
+
+    def fail_dependency() -> None:
+        raise AssertionError("non-message webhook must not resolve heavy dependencies")
+
+    avito_app.dependency_overrides[get_settings] = lambda: _settings()
+    avito_app.dependency_overrides[get_booking] = fail_dependency
+    avito_app.dependency_overrides[get_sender] = fail_dependency
+    avito_app.dependency_overrides[get_handoff_notifier] = fail_dependency
+    avito_app.dependency_overrides[get_toolbox] = fail_dependency
+    try:
+        client = TestClient(avito_app)
+        response = client.post("/avito/webhook?token=webhook", json={"type": "ping"})
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "ignored": True, "reason": "not_message_event"}
     finally:
         avito_app.dependency_overrides.clear()
 
@@ -4196,7 +4218,7 @@ async def test_avito_consultant_filters_unverified_imported_price_tables(tmp_pat
 
 
 @pytest.mark.anyio
-async def test_avito_consultant_routes_photo_handoff_before_codex() -> None:
+async def test_avito_consultant_asks_photo_goal_before_codex_handoff() -> None:
     async def fake_codex_loop(payload, trace):
         assert payload["message"]["has_photo"] is True
         assert trace == []
@@ -4218,10 +4240,10 @@ async def test_avito_consultant_routes_photo_handoff_before_codex() -> None:
     reply = await consultant.respond(message)
 
     assert reply.metadata["planner"] == "client_router"
-    assert reply.action == "handoff"
-    assert reply.handoff is not None
-    assert reply.handoff.reason == HandoffReason.PHOTO_CONSULTATION
-    assert "Клиенту уже ответили" in reply.handoff.summary
+    assert reply.action == "ask_consultation_details"
+    assert reply.handoff is None
+    assert "фото" in reply.reply.casefold()
+    assert "что хотите" in reply.reply.casefold()
 
 
 @pytest.mark.anyio
@@ -4250,13 +4272,10 @@ async def test_codex_tool_loop_allows_silent_handoff_for_before_after_assets() -
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "handoff"
-    assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
-    assert reply.handoff is not None
-    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
-    assert "Клиенту уже ответили" in reply.handoff.summary
-    assert "Нужно у Ольги" not in reply.handoff.summary
-    assert "нельзя автообещать результат по мл" in reply.handoff.summary
+    assert reply.action == "ask_consultation_details"
+    assert reply.handoff is None
+    assert "какая зона" in reply.reply.casefold()
+    assert "что хотите" in reply.reply.casefold()
 
 
 @pytest.mark.anyio
@@ -8463,7 +8482,7 @@ def test_avito_live_telegram_relay_reads_handoff_outbox_as_live_question(tmp_pat
     assert "Нужен точный адрес" in card
 
 
-def test_avito_webhook_photo_returns_handoff(tmp_path) -> None:
+def test_avito_webhook_photo_asks_client_goal_before_handoff(tmp_path) -> None:
     processed_events.seen.clear()
     avito_app.dependency_overrides[get_settings] = lambda: _settings()
     avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
@@ -8482,10 +8501,10 @@ def test_avito_webhook_photo_returns_handoff(tmp_path) -> None:
         response = client.post("/avito/webhook?token=webhook", json=event)
 
         assert response.status_code == 200
-        assert response.json()["action"] == "handoff"
-        assert response.json()["handoff"] == "photo_consultation"
-        assert response.json()["handoff_notify"]["reason"] == "preview_only"
-        assert "photo_consultation" in outbox.read_text(encoding="utf-8")
+        assert response.json()["action"] == "ask_consultation_details"
+        assert response.json()["send"]["reason"] == "preview_only"
+        assert "что хотите" in response.json()["reply"].casefold()
+        assert not outbox.exists()
     finally:
         avito_app.dependency_overrides.clear()
         processed_events.seen.clear()
@@ -11333,11 +11352,11 @@ async def test_vk_bot_uses_preview_sender_and_shared_handoff(tmp_path) -> None:
     result = await bot.handle_update(update)
     duplicate = await bot.handle_update(update)
 
-    assert result["action"] == "handoff"
+    assert result["action"] == "ask_consultation_details"
     assert result["send"]["reason"] == "preview_only"
-    assert result["handoff"] == "photo_consultation"
+    assert result["handoff"] is None
     outbox_text = outbox.read_text(encoding="utf-8")
-    assert "фото передадим на оценку" in outbox_text
+    assert "что хотите получить" in outbox_text
     assert "консультац" not in outbox_text.casefold()
     assert duplicate["reason"] == "duplicate"
 

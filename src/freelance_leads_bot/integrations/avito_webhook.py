@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -175,6 +176,14 @@ def get_mentor_memory(
     return MentorMemoryService(toolbox.knowledge, expert_rag=expert_rag)
 
 
+async def _resolve_request_dependency(request: Request, dependency: Any, factory: Any) -> Any:
+    override = request.app.dependency_overrides.get(dependency)
+    value = override() if override is not None else factory()
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 @app.get("/health")
 async def health(settings: IntegrationSettings = Depends(get_settings)) -> dict[str, Any]:
     return {
@@ -302,17 +311,6 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
 async def avito_webhook(
     request: Request,
     settings: IntegrationSettings = Depends(get_settings),
-    toolbox: AutomationToolbox = Depends(get_toolbox),
-    planner: AvitoAgentPlanner | None = Depends(get_planner),
-    sender: AvitoSender = Depends(get_sender),
-    avito_reader: AvitoReadGateway | None = Depends(get_avito_reader),
-    handoff_notifier: HandoffNotifier = Depends(get_handoff_notifier),
-    photo_resolver: AvitoPhotoResolver | None = Depends(get_photo_resolver),
-    voice_resolver: AvitoVoiceResolver | None = Depends(get_voice_resolver),
-    history_store: LeadStore = Depends(get_history_store),
-    reviewer: AvitoDraftReviewer | None = Depends(get_reviewer),
-    mentor_memory: MentorMemoryService | None = Depends(get_mentor_memory),
-    expert_rag: ExpertRagStore | None = Depends(get_expert_rag),
 ) -> dict[str, Any]:
     if request.query_params.get("token") != settings.avito_webhook_secret:
         raise HTTPException(status_code=403, detail="forbidden")
@@ -321,6 +319,31 @@ async def avito_webhook(
     if not isinstance(event, dict) or not is_avito_message_event(event):
         _log_webhook({"event": "ignored", "reason": "not_message_event"})
         return {"ok": True, "ignored": True, "reason": "not_message_event"}
+
+    booking = await _resolve_request_dependency(request, get_booking, lambda: get_booking(settings))
+    handoff_notifier = await _resolve_request_dependency(request, get_handoff_notifier, lambda: get_handoff_notifier(settings))
+    toolbox = await _resolve_request_dependency(
+        request,
+        get_toolbox,
+        lambda: AutomationToolbox(
+            booking,
+            role_profile=role_profile(CodexRole.AVITO_CLIENT),
+            operations_notifier=handoff_notifier,
+        ),
+    )
+    planner = await _resolve_request_dependency(request, get_planner, lambda: get_planner(settings))
+    sender = await _resolve_request_dependency(request, get_sender, lambda: get_sender(settings))
+    avito_reader = await _resolve_request_dependency(request, get_avito_reader, lambda: get_avito_reader(settings))
+    photo_resolver = await _resolve_request_dependency(request, get_photo_resolver, lambda: get_photo_resolver(settings))
+    voice_resolver = await _resolve_request_dependency(request, get_voice_resolver, lambda: get_voice_resolver(settings))
+    history_store = await _resolve_request_dependency(request, get_history_store, lambda: get_history_store(settings))
+    reviewer = await _resolve_request_dependency(request, get_reviewer, lambda: get_reviewer(settings))
+    expert_rag = await _resolve_request_dependency(request, get_expert_rag, lambda: get_expert_rag(settings))
+    mentor_memory = await _resolve_request_dependency(
+        request,
+        get_mentor_memory,
+        lambda: MentorMemoryService(toolbox.knowledge, expert_rag=expert_rag),
+    )
 
     message = annotate_avito_message_actor(avito_inbound_message(event), settings)
     message = await transcribe_avito_voice_message(message, voice_resolver=voice_resolver)
