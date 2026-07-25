@@ -102,10 +102,11 @@ class TelegramClientCareBot:
 
         history_key = telegram_client_history_key(message)
         if message.text.strip().casefold().startswith("/start"):
+            cities = ", ".join(city for city in self.settings.cities if str(city).strip())
             text = (
                 "Здравствуйте! Я отдел заботы Ольги: помогу с консультацией, записью и уходом после процедур.\n\n"
                 "Вы уже были у Ольги на процедуре? Если да, пришлите, пожалуйста, телефон, по которому записывались. "
-                "Если нет — напишите, какая процедура интересует и в каком городе удобно."
+                f"Если нет — напишите, какая процедура интересует и какой город приёма удобен: {cities}."
             )
             send_result = await asyncio.to_thread(self.bot.send_message, message.chat_id, text)
             self._remember(history_key, "user", _history_user_content(message))

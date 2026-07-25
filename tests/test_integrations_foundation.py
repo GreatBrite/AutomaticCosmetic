@@ -3261,6 +3261,9 @@ async def test_telegram_client_start_and_phone_binding_flow(tmp_path) -> None:
     interactions = crm.list_client_interactions(client_id, limit=10)
     assert start["action"] == "start"
     assert "Вы уже были у Ольги" in start["reply"]
+    assert "какой город приёма удобен" in start["reply"]
+    assert "Ростов-на-Дону" in start["reply"]
+    assert "Москва" in start["reply"]
     assert reply["reply"] == "Нашла ваш прошлый визит, помогу с уходом."
     assert linked is not None
     assert int(linked["id"]) == client_id
