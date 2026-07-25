@@ -276,7 +276,17 @@ class AvitoConsultant:
         if route.route == "ask_city":
             return AvitoConsultantReply(
                 action="ask_city",
-                reply="Подскажите, пожалуйста, в каком городе вам удобно? После этого сориентирую по адресу или ближайшим вариантам.",
+                reply=f"Приём ведём в фиксированных городах: {_cities_text(self.cities)}. В каком из них вам удобно?",
+                metadata={"planner": "client_router", "route": route.to_dict()},
+            )
+        if route.route == "ask_consultation_details":
+            return AvitoConsultantReply(
+                action="ask_consultation_details",
+                reply=(
+                    "Чтобы Ольга не оценивала вслепую, уточните, пожалуйста: какая зона интересует, "
+                    "что хотите получить в результате, какой объём рассматриваете и были ли процедуры раньше. "
+                    "Если есть фото при хорошем освещении, приложите его тоже."
+                ),
                 metadata={"planner": "client_router", "route": route.to_dict()},
             )
         if route.route == "media_handoff":
@@ -439,7 +449,7 @@ class AvitoConsultant:
                 action="listing_context_answer",
                 reply=(
                     f"Да, услуга «{message.listing.title}» актуальна. "
-                    "Могу подсказать стоимость, подготовку, противопоказания и свободное время. В каком городе вам удобно?"
+                    f"Могу подсказать стоимость, подготовку, противопоказания и свободное время. Приём ведём в городах: {_cities_text(self.cities)}."
                 ),
                 metadata={"listing": message.listing.to_prompt_context()},
             )
@@ -534,7 +544,7 @@ class AvitoConsultant:
     async def _answer_price(self, message: InboundMessage) -> AvitoConsultantReply:
         if message.listing and message.listing.price_string:
             title = message.listing.title or "этой услуге"
-            reply = f"Стоимость «{title}» — {message.listing.price_string}."
+            reply = f"Стоимость «{title}» — {message.listing.price_string}. Цена единая для всех городов."
             if _asks_amount_or_calculation(message.text):
                 reply += " Точный расчет зависит от объема и зоны, его лучше считать после уточнения пожеланий."
             return AvitoConsultantReply(
@@ -543,12 +553,7 @@ class AvitoConsultant:
                 metadata={"listing": message.listing.to_prompt_context()},
             )
 
-        city = _city_from_message(message, self.cities)
-        if not city:
-            return AvitoConsultantReply(
-                action="ask_city",
-                reply="Подскажите, пожалуйста, в каком городе вам удобно?",
-            )
+        city = _price_lookup_city(message, self.cities)
 
         service_result = await self.toolbox.execute("yclients.services.list", {"city": city})
         if not service_result.ok:
@@ -561,13 +566,13 @@ class AvitoConsultant:
         if matched:
             return AvitoConsultantReply(
                 action="service_price_answer",
-                reply=_with_next_step(_format_service_price(matched), message),
-                metadata={"service_id": matched.id},
+                reply=_with_next_step(f"{_format_service_price(matched)}. Цена единая для всех городов.", message),
+                metadata={"service_id": matched.id, "price_lookup_city": city, "same_price_all_cities": True},
             )
         preview = ", ".join(_format_service_price(service) for service in services[:5])
         return AvitoConsultantReply(
             action="price_list_preview",
-            reply=f"По прайсу вижу: {preview}. Напишите конкретную процедуру, и я подскажу точнее.",
+            reply=f"Цена единая для всех городов. По прайсу вижу: {preview}. Напишите конкретную процедуру, и я подскажу точнее.",
         )
 
     async def _answer_address(self, message: InboundMessage) -> AvitoConsultantReply:
@@ -575,7 +580,7 @@ class AvitoConsultant:
         if not city:
             return AvitoConsultantReply(
                 action="ask_city",
-                reply="Подскажите, пожалуйста, в каком городе вам удобнее? Тогда сразу уточню адрес.",
+                reply=f"Приём ведём в фиксированных городах: {_cities_text(self.cities)}. Для адреса выберите, пожалуйста, нужный город.",
             )
         result = await self.toolbox.execute("yclients.company.address", {"city": city})
         company = result.data.get("company") if result.ok else {}
@@ -771,6 +776,14 @@ def _city_from_message(message: InboundMessage, cities: tuple[str, ...]) -> str:
     return flow.extract_city(message.text)
 
 
+def _price_lookup_city(message: InboundMessage, cities: tuple[str, ...]) -> str:
+    return _city_from_message(message, cities) or (cities[0] if cities else DEFAULT_CITIES[0])
+
+
+def _cities_text(cities: tuple[str, ...]) -> str:
+    return ", ".join(city for city in cities if str(city).strip()) or ", ".join(DEFAULT_CITIES)
+
+
 def _match_service(text: str, services: list[Service]) -> Service | None:
     return AvitoBookingFlow(_NoopBooking()).match_service(text, services)
 
@@ -782,7 +795,7 @@ def _format_service_price(service: Service) -> str:
 
 def _with_next_step(reply: str, message_or_context: InboundMessage | AvitoAgentContext) -> str:
     message = message_or_context.message if isinstance(message_or_context, AvitoAgentContext) else message_or_context
-    if "город" in reply.casefold() or _booking_tools_may_help(message):
+    if "город" in reply.casefold() or _looks_like_price_question(message.text.casefold()) or _booking_tools_may_help(message):
         return reply
     return f"{reply} В каком городе вам удобно?"
 
@@ -806,7 +819,10 @@ def _codex_payload_reply_rules(profile: RoleProfile) -> list[str]:
             "Клиентские роли не делают live-мутации: не создают, не переносят, не отменяют YCLIENTS-записи и не пишут notes.",
             "Не раскрывай клиенту tools, trace, RAG ids, source, внутренние причины или слова handoff/эскалация.",
             "Не предлагай очную консультацию как стандартный шаг; если реально нужна оценка, один раз предложи онлайн-разбор и собери недостающие данные.",
-            "Точный адрес называй только из yclients.company.address; цену — только из подтверждённого источника или YCLIENTS price_status='known'.",
+            "Прайс единый для всех городов: не придумывай разные цены по городам и не спрашивай город только ради цены. Цену называй только из подтверждённого источника или YCLIENTS price_status='known'.",
+            "Города приёма фиксированные из BUSINESS_CITIES; не спрашивай, будет ли приём в других городах, и не обещай новые города.",
+            "Перед handoff на косметолога сначала собери у клиента минимальную конкретику: зона, желаемый результат, рассматриваемый объём, были ли процедуры раньше, фото при хорошем освещении. Не отправляй Ольге пустой вопрос без этих вводных, кроме рисков/жалоб/критичной записи.",
+            "Точный адрес называй только из yclients.company.address.",
             "Если объявление/история про модель, акцию или бесплатно, модельную цену бери только из Avito-объявления, RAG/knowledge или подтверждения Ольги; обычный YCLIENTS-прайс не выдавай как модельную цену.",
             "Если schedule_status='unknown', график неизвестен: не говори, что мест нет.",
         ]

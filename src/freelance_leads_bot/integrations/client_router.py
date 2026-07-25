@@ -47,6 +47,10 @@ AESTHETIC_RESULT_RE = re.compile(
     r"увелич\w+|хватит|достаточн\w+|как\s+будет|до\s*/?\s*после|сколько\s+надо|сколько\s+нужно)"
 )
 AESTHETIC_BODY_RE = re.compile(r"(?iu)(груд|ягод|поп|тесоро|tesoro)")
+CONSULTATION_DETAIL_RE = re.compile(
+    r"(?iu)(хочу|интересует|нужно|надо|цель|эффект|результат|исправ|убрать|увелич|"
+    r"зона|губ|груд|ягод|поп|ботокс|морщин|асимметр|объ[её]м|мл|делал[аи]?|было|раньше)"
+)
 
 
 def route_client_message(
@@ -63,6 +67,14 @@ def route_client_message(
     has_service_hint = bool(SERVICE_HINT_RE.search(lowered) or _history_service_hint(conversation_history))
 
     if _aesthetic_expectation_question(lowered, conversation_history):
+        if _needs_consultation_details(message, lowered, conversation_history):
+            return ClientRoute(
+                route="ask_consultation_details",
+                city=city,
+                service_key=service_key,
+                block_autoanswer_reason="consultation_details_required",
+                metadata={"reason": "сначала нужно понять, что клиент хочет оценить"},
+            )
         return ClientRoute(
             route="expert_expectation_handoff",
             city=city,
@@ -85,6 +97,14 @@ def route_client_message(
         )
 
     if _has_media(message):
+        if _needs_consultation_details(message, lowered, conversation_history):
+            return ClientRoute(
+                route="ask_consultation_details",
+                city=city,
+                service_key=service_key,
+                block_autoanswer_reason="consultation_details_required",
+                metadata={"reason": "клиент прислал вложение без понятного запроса"},
+            )
         return ClientRoute(
             route="media_handoff",
             city=city,
@@ -156,6 +176,31 @@ def _has_media(message: InboundMessage) -> bool:
         or has_unresolved_voice
         or metadata.get("voice_transcription_error")
     )
+
+
+def _needs_consultation_details(
+    message: InboundMessage,
+    lowered: str,
+    conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> bool:
+    if _history_consultation_details(conversation_history):
+        return False
+    if not str(message.text or "").strip() or str(message.text or "").strip().casefold() in {"[фото]", "фото"}:
+        return True
+    if _has_media(message) and not CONSULTATION_DETAIL_RE.search(lowered):
+        return True
+    if _aesthetic_expectation_question(lowered, conversation_history):
+        return not _has_media(message)
+    return False
+
+
+def _history_consultation_details(conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
+    recent_user_text = " ".join(
+        str(item.get("content") or "") for item in conversation_history[-8:] if str(item.get("role") or "") == "user"
+    ).casefold().replace("ё", "е")
+    if not recent_user_text:
+        return False
+    return bool(CONSULTATION_DETAIL_RE.search(recent_user_text) and re.search(r"(?iu)(фото|сним|объ[её]м|мл|хочу|цель|результат)", recent_user_text))
 
 
 def _aesthetic_expectation_question(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:

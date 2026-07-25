@@ -2694,13 +2694,29 @@ def test_client_message_router_routes_high_confidence_rag_answer() -> None:
     assert route.service_key == "yagodicy"
 
 
-def test_client_message_router_handoffs_aesthetic_volume_expectations() -> None:
+def test_client_message_router_asks_details_before_aesthetic_handoff() -> None:
     route = route_client_message(
         InboundMessage(
             channel=Channel.AVITO,
             client_id="client-expectation",
             chat_id="chat-expectation",
             text="300 мл хватит на грудь, будет плюс один размер?",
+        )
+    )
+
+    assert route.route == "ask_consultation_details"
+    assert route.handoff_reason == ""
+    assert route.block_autoanswer_reason == "consultation_details_required"
+
+
+def test_client_message_router_handoffs_aesthetic_expectation_after_client_details() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-expectation",
+            chat_id="chat-expectation",
+            text="Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила.",
+            has_photo=True,
         )
     )
 
@@ -2759,7 +2775,18 @@ def test_client_message_router_blocks_risk_address_and_media() -> None:
     assert risk.route == "risk_handoff"
     assert risk.handoff_reason == HandoffReason.COMPLAINT_OR_RISK.value
     assert address.route == "ask_city"
-    assert media.route == "media_handoff"
+    assert media.route == "ask_consultation_details"
+
+    media_with_details = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-media-route",
+            chat_id="chat-media-route",
+            text="Посмотрите фото, хочу понять по губам что можно исправить",
+            has_photo=True,
+        )
+    )
+    assert media_with_details.route == "media_handoff"
 
 
 def test_client_message_router_routes_booking_critical_context_to_urgent_handoff() -> None:
@@ -2818,13 +2845,32 @@ async def test_avito_consultant_creates_booking_critical_handoff(tmp_path) -> No
 
 
 @pytest.mark.anyio
-async def test_avito_consultant_handoffs_aesthetic_volume_expectation(tmp_path) -> None:
+async def test_avito_consultant_asks_details_before_aesthetic_volume_handoff(tmp_path) -> None:
     consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")))
     message = avito_inbound_message(
         {
             "type": "message",
             "chat_id": "chat-expectation",
             "content": {"text": "300 мл хватит на грудь? Будет заметный результат?"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_consultation_details"
+    assert reply.handoff is None
+    assert "какая зона" in reply.reply.casefold()
+    assert "фото" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_handoffs_aesthetic_volume_expectation_with_details(tmp_path) -> None:
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-expectation",
+            "content": {"text": "Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила.", "image": {"url": "https://img.example/photo.jpg"}},
         }
     )
 
@@ -3747,7 +3793,27 @@ async def test_avito_consultant_answers_listing_price_without_handoff(tmp_path) 
     assert reply.action == "listing_price_answer"
     assert reply.handoff is None
     assert "от 18 000 ₽" in reply.reply
+    assert "единая для всех городов" in reply.reply.lower()
     assert "передам" not in reply.reply.lower()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_service_price_without_asking_city(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(services=[Service(id=7, title="Ботокс", price=3000, duration_minutes=30)])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, cities=("Ростов-на-Дону", "Москва"))
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-service-price", "content": {"text": "Сколько стоит ботокс?"}})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "service_price_answer"
+    assert reply.handoff is None
+    assert "Ботокс" in reply.reply
+    assert "3000 ₽" in reply.reply
+    assert "единая для всех городов" in reply.reply.lower()
+    assert "в каком городе" not in reply.reply.lower()
+    assert reply.metadata["price_lookup_city"] == "Ростов-на-Дону"
+    assert reply.metadata["same_price_all_cities"] is True
 
 
 @pytest.mark.anyio
