@@ -6665,6 +6665,57 @@ def test_shared_rag_retrieval_allows_price_only_volume_answer(tmp_path) -> None:
     assert result.safe_for_autoanswer is True
 
 
+def test_shared_rag_retrieval_detects_cross_city_price_conflict(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="botoks", title="Ботокс", aliases=("ботокс",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="Сколько стоит ботокс в Москве?",
+        answer_client="Ботокс стоит 3 000 ₽.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "botoks", "autoanswer_allowed": True},
+    )
+    store.upsert_from_handoff(
+        question="Сколько стоит ботокс в Ростове?",
+        answer_client="Ботокс стоит 4 000 ₽.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "botoks", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="Сколько стоит ботокс в Москве?", city="Москва", min_score=0.0)
+    )
+
+    assert result.answers
+    assert result.safe_for_autoanswer is False
+    assert result.handoff_reason == "conflict"
+    assert "price_conflict" in result.conflicts
+
+
+def test_shared_rag_retrieval_allows_same_price_across_cities(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="botoks", title="Ботокс", aliases=("ботокс",), visibility=("avito",))
+    for city in ("Москва", "Ростов-на-Дону"):
+        store.upsert_from_handoff(
+            question=f"Сколько стоит ботокс {city}?",
+            answer_client="Ботокс стоит 3 000 ₽.",
+            status=APPROVED,
+            approved_by="olga",
+            metadata={"service_key": "botoks", "autoanswer_allowed": True},
+        )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="Сколько стоит ботокс в Москве?", city="Москва", min_score=0.0)
+    )
+
+    assert result.answers
+    assert result.safe_for_autoanswer is True
+    assert "price_conflict" not in result.conflicts
+
+
 @pytest.mark.anyio
 async def test_telegram_rag_plan_cancel_and_details_callbacks(tmp_path) -> None:
     class FakeBot:

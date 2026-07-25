@@ -69,7 +69,7 @@ class RagRetrievalService:
             status=APPROVED,
             limit=max(request.limit * 3, request.limit),
             min_score=request.min_score,
-            city=request.city,
+            city="" if _price_request(query) else request.city,
             service=service_filter,
             exclude_risk_levels=("high",),
         )
@@ -172,6 +172,10 @@ def _price_conflict(answers: list[dict[str, Any]]) -> bool:
         if found:
             prices.add("|".join(found))
     return len(prices) > 1
+
+
+def _price_request(text: str) -> bool:
+    return bool(re.search(r"(?iu)\b(цен|стоим|прайс|сколько|руб|₽)\b", str(text or "")))
 
 
 def _request_autoanswer_blocker(request: RagRetrievalRequest, service_filter: str) -> str:

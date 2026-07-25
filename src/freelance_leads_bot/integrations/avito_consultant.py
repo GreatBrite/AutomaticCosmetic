@@ -456,7 +456,7 @@ class AvitoConsultant:
 
         return AvitoConsultantReply(
             action="clarify",
-            reply="Подскажите, какая процедура интересует и в каком городе удобно? Сразу посмотрю цену и свободное время.",
+            reply=f"Подскажите, какая процедура интересует. Приём ведём в городах: {_cities_text(self.cities)}. После этого сориентирую по цене и свободному времени.",
         )
 
     async def _knowledge_items(self, message: InboundMessage) -> list[dict[str, Any]]:
