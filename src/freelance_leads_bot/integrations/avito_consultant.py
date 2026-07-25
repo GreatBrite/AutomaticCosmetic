@@ -777,7 +777,8 @@ def _city_from_message(message: InboundMessage, cities: tuple[str, ...]) -> str:
 
 
 def _price_lookup_city(message: InboundMessage, cities: tuple[str, ...]) -> str:
-    return _city_from_message(message, cities) or (cities[0] if cities else DEFAULT_CITIES[0])
+    del message
+    return cities[0] if cities else DEFAULT_CITIES[0]
 
 
 def _cities_text(cities: tuple[str, ...]) -> str:

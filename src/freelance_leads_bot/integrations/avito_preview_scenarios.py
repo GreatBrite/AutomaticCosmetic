@@ -100,10 +100,9 @@ def default_scenarios() -> list[PreviewScenario]:
             ),
         ),
         PreviewScenario(
-            name="photo_handoff",
+            name="photo_goal_clarification",
             event=_message(photo_id, "Посмотрите фото", photo=True, created=created + 8),
-            expected_action="handoff",
-            expected_handoff="photo_consultation",
+            expected_action="ask_consultation_details",
         ),
         PreviewScenario(
             name="complaint_or_risk",

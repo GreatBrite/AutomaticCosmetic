@@ -2039,7 +2039,7 @@ async def test_booking_flow_creates_dry_run_appointment() -> None:
 
 
 @pytest.mark.anyio
-async def test_booking_flow_routes_photo_to_handoff() -> None:
+async def test_booking_flow_asks_photo_goal_before_handoff() -> None:
     gateway = DryRunYClientsGateway()
     flow = AvitoBookingFlow(gateway)
     message = avito_inbound_message(
@@ -2048,8 +2048,10 @@ async def test_booking_flow_routes_photo_to_handoff() -> None:
 
     decision = await flow.process(BookingRequest(message=message))
 
-    assert decision.action == "handoff"
-    assert decision.handoff is not None
+    assert decision.action == "ask_consultation_details"
+    assert decision.handoff is None
+    assert "какая зона" in decision.reply.casefold()
+    assert "что хотите" in decision.reply.casefold()
 
 
 def test_telegram_admin_parser_understands_create_command() -> None:
@@ -3832,6 +3834,29 @@ async def test_avito_consultant_answers_service_price_without_asking_city(tmp_pa
     assert reply.handoff is None
     assert "Ботокс" in reply.reply
     assert "3000 ₽" in reply.reply
+    assert "единая для всех городов" in reply.reply.lower()
+    assert "в каком городе" not in reply.reply.lower()
+    assert reply.metadata["price_lookup_city"] == "Ростов-на-Дону"
+    assert reply.metadata["same_price_all_cities"] is True
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_uses_canonical_price_city_even_when_client_mentions_another_city(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(
+        services=[
+            Service(id=7, title="Ботокс", price=3000, duration_minutes=30, city="Ростов-на-Дону"),
+            Service(id=8, title="Ботокс", price=9999, duration_minutes=30, city="Санкт-Петербург"),
+        ]
+    )
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, cities=("Ростов-на-Дону", "Санкт-Петербург"))
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-service-price-spb", "content": {"text": "В СПб сколько стоит ботокс?"}})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "service_price_answer"
+    assert "3000 ₽" in reply.reply
+    assert "9999" not in reply.reply
     assert "единая для всех городов" in reply.reply.lower()
     assert "в каком городе" not in reply.reply.lower()
     assert reply.metadata["price_lookup_city"] == "Ростов-на-Дону"
@@ -9976,6 +10001,8 @@ def test_codex_planner_prompt_and_json_parser() -> None:
     assert "подтверждённое решение" in prompt
     assert "Не предлагай очную консультацию" in prompt
     assert "Если уже есть оценка Ольги/подтверждённое решение" in prompt
+    assert "Прайс единый для всех городов" in prompt
+    assert "Города приёма фиксированы" in prompt
     assert "Нужно у Ольги:" not in prompt
     assert "Нужно: фото до/после" in prompt
     assert parsed is not None

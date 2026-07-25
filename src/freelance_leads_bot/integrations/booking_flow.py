@@ -23,6 +23,10 @@ CITY_ALIASES = {
 }
 
 
+def _cities_text(cities: tuple[str, ...]) -> str:
+    return ", ".join(city for city in cities if str(city).strip()) or ", ".join(DEFAULT_CITIES)
+
+
 @dataclass(frozen=True)
 class BookingRequest:
     message: InboundMessage
@@ -56,17 +60,19 @@ class AvitoBookingFlow:
         handoff = avito_photo_handoff(request.message)
         if handoff:
             return BookingDecision(
-                action="handoff",
-                reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
-                state="awaiting_olga",
-                handoff=handoff,
+                action="ask_consultation_details",
+                reply=(
+                    "Уточните, пожалуйста, какая зона интересует, что хотите получить в результате, "
+                    "какой объём рассматриваете и были ли процедуры раньше. Так Ольга сможет оценить фото точнее."
+                ),
+                state="requested_details",
             )
 
         city = request.city or self.extract_city(request.message.text)
         if not city:
             return BookingDecision(
                 action="ask_city",
-                reply="Подскажите, пожалуйста, в каком городе вам удобно записаться?",
+                reply=f"Приём ведём в фиксированных городах: {_cities_text(self.cities)}. В каком из них вам удобно записаться?",
                 state="requested_slot",
             )
 
