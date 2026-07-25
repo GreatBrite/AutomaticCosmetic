@@ -38,6 +38,7 @@ def toolbox_from_settings(
         role_profile=parsed_profile,
         care_crm=care_crm,
         operations_notifier=operations_notifier,
+        service_price_city=settings.cities[0] if settings.cities else "",
     )
 
 

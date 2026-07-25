@@ -144,6 +144,7 @@ def get_toolbox(
         booking,
         role_profile=role_profile(CodexRole.AVITO_CLIENT),
         operations_notifier=notifier,
+        service_price_city=settings.cities[0] if settings.cities else "",
     )
 
 
@@ -254,6 +255,7 @@ async def process_due_avito_turn_batches(settings: IntegrationSettings | None = 
         booking_from_settings(settings),
         role_profile=role_profile(CodexRole.AVITO_CLIENT),
         operations_notifier=handoff_notifier,
+        service_price_city=settings.cities[0] if settings.cities else "",
     )
     planner = get_planner(settings)
     sender = avito_sender_from_settings(settings)
@@ -329,6 +331,7 @@ async def avito_webhook(
             booking,
             role_profile=role_profile(CodexRole.AVITO_CLIENT),
             operations_notifier=handoff_notifier,
+            service_price_city=settings.cities[0] if settings.cities else "",
         ),
     )
     planner = await _resolve_request_dependency(request, get_planner, lambda: get_planner(settings))

@@ -184,6 +184,7 @@ class AutomationToolbox:
         history_store: LeadStore | None = None,
         operations_notifier: HandoffNotifier | None = None,
         expert_rag_admin: ExpertRagAdminService | None = None,
+        service_price_city: str = "",
     ) -> None:
         self.booking = booking
         self.knowledge = knowledge or JsonKnowledgeStore()
@@ -197,6 +198,7 @@ class AutomationToolbox:
         self.history_store = history_store
         self.operations_notifier = operations_notifier
         self.expert_rag_admin = expert_rag_admin
+        self.service_price_city = str(service_price_city or "").strip()
         self._tool_specs = _tool_specs(enable_workspace_tools=enable_workspace_tools or bool(role_profile and role_profile.allow_workspace_tools))
         if role_profile:
             self._tool_specs = {name: spec for name, spec in self._tool_specs.items() if role_profile.allows_tool(name)}
@@ -220,8 +222,18 @@ class AutomationToolbox:
                 address = await self.booking.get_company_address(str(args.get("city") or ""))
                 return ToolResult(ok=True, data={"company": address})
             if name == "yclients.services.list":
-                services = await self.booking.get_services(str(args.get("city") or ""))
-                return ToolResult(ok=True, data={"services": [_service_data(item) for item in services]})
+                requested_city = str(args.get("city") or "")
+                city = self._services_lookup_city(requested_city)
+                services = await self.booking.get_services(city)
+                data = {
+                    "services": [_service_data(item) for item in services],
+                    "requested_city": requested_city,
+                    "lookup_city": city,
+                    "same_price_all_cities": self._uses_canonical_service_price_city(),
+                }
+                if data["same_price_all_cities"]:
+                    data["client_price_policy"] = "Цена единая для всех городов; city в services.list не меняет клиентский прайс."
+                return ToolResult(ok=True, data=data)
             if name == "yclients.slots.list":
                 date_value = str(args.get("date") or "")[:10]
                 schedule_city = self.city_schedule.get_city(date_value)
@@ -374,6 +386,18 @@ class AutomationToolbox:
             return ToolResult(ok=False, error=f"unknown tool: {name}")
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
+
+    def _uses_canonical_service_price_city(self) -> bool:
+        return bool(
+            self.service_price_city
+            and self.role_profile
+            and self.role_profile.role in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}
+        )
+
+    def _services_lookup_city(self, requested_city: str) -> str:
+        if self._uses_canonical_service_price_city():
+            return self.service_price_city
+        return requested_city
 
     def validate_call(self, name: str, arguments: dict[str, Any] | None = None) -> str:
         spec = self._tool_specs.get(name)
@@ -933,8 +957,11 @@ def _tool_specs(*, enable_workspace_tools: bool = False) -> dict[str, ToolSpec]:
         ),
         "yclients.services.list": ToolSpec(
             name="yclients.services.list",
-            description="List YCLIENTS services for a city. Prices marked placeholder must not be quoted as real client prices.",
-            properties={"city": "City name, optional but preferred."},
+            description=(
+                "List YCLIENTS services and prices. Client-facing roles use a canonical price city because prices are the same for all cities. "
+                "Prices marked placeholder must not be quoted as real client prices."
+            ),
+            properties={"city": "City name, optional; client-facing roles do not use it to vary prices."},
             external=True,
         ),
         "yclients.slots.list": ToolSpec(

@@ -2665,6 +2665,9 @@ def test_telegram_client_role_is_care_consultant() -> None:
     assert "новым, повторным" in rules
     assert "CRM-факты" in rules
     assert "внутренние данные CRM" in rules
+    assert "Прайс единый для всех городов" in rules
+    assert "Города приёма фиксированные" in rules
+    assert "сначала уточни цель/зону" in rules
 
 
 def test_avito_client_role_hides_live_yclients_mutations() -> None:
@@ -2678,6 +2681,18 @@ def test_avito_client_role_hides_live_yclients_mutations() -> None:
     assert not profile.allows_tool("yclients.appointments.cancel")
     assert not profile.allows_tool("yclients.clients.notes.update")
     assert "не превращай слова" in rules.casefold()
+    assert "Прайс единый для всех городов" in rules
+    assert "Города приёма фиксированные" in rules
+    assert "сначала уточни цель/зону" in rules
+
+
+def test_vk_client_role_keeps_fixed_city_pricing_rules() -> None:
+    profile = role_profile(CodexRole.VK_CLIENT)
+    rules = "\n".join(profile.reply_rules)
+
+    assert "Прайс единый для всех городов" in rules
+    assert "Города приёма фиксированные" in rules
+    assert "сначала уточни цель/зону" in rules
 
 
 def test_client_message_router_blocks_ambiguous_booking_before_llm() -> None:
@@ -4668,6 +4683,56 @@ async def test_yclients_service_placeholder_prices_are_marked_for_codex(tmp_path
     assert service["price"] == 1
     assert service["price_status"] == "placeholder"
     assert "не называй" in service["client_price_hint"]
+
+
+@pytest.mark.anyio
+async def test_client_toolbox_services_list_uses_canonical_price_city(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(
+        services=[
+            Service(id=7, title="Ботокс", price=3000, duration_minutes=30, city="Ростов-на-Дону"),
+            Service(id=8, title="Ботокс", price=9999, duration_minutes=30, city="Санкт-Петербург"),
+        ]
+    )
+    toolbox = AutomationToolbox(
+        gateway,
+        JsonKnowledgeStore(tmp_path / "knowledge.json"),
+        role_profile=role_profile(CodexRole.AVITO_CLIENT),
+        service_price_city="Ростов-на-Дону",
+    )
+
+    result = await toolbox.execute("yclients.services.list", {"city": "Санкт-Петербург"})
+
+    assert result.ok is True
+    assert result.data["requested_city"] == "Санкт-Петербург"
+    assert result.data["lookup_city"] == "Ростов-на-Дону"
+    assert result.data["same_price_all_cities"] is True
+    assert result.data["services"][0]["price"] == 3000
+    assert all(service["price"] != 9999 for service in result.data["services"])
+    assert "Цена единая для всех городов" in result.data["client_price_policy"]
+
+
+@pytest.mark.anyio
+async def test_admin_toolbox_services_list_keeps_requested_city(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(
+        services=[
+            Service(id=7, title="Ботокс", price=3000, duration_minutes=30, city="Ростов-на-Дону"),
+            Service(id=8, title="Ботокс", price=9999, duration_minutes=30, city="Санкт-Петербург"),
+        ]
+    )
+    toolbox = AutomationToolbox(
+        gateway,
+        JsonKnowledgeStore(tmp_path / "knowledge.json"),
+        role_profile=role_profile(CodexRole.ADMIN),
+        service_price_city="Ростов-на-Дону",
+    )
+
+    result = await toolbox.execute("yclients.services.list", {"city": "Санкт-Петербург"})
+
+    assert result.ok is True
+    assert result.data["requested_city"] == "Санкт-Петербург"
+    assert result.data["lookup_city"] == "Санкт-Петербург"
+    assert result.data["same_price_all_cities"] is False
+    assert result.data["services"][0]["price"] == 9999
 
 
 @pytest.mark.anyio
@@ -10137,6 +10202,8 @@ def test_codex_review_prompt_checks_internals_offtopic_and_unconfirmed_facts() -
     assert "оффтопик" in prompt
     assert "Не спамь онлайн-консультацией" in prompt
     assert "оценка Ольги" in prompt
+    assert "Прайс единый для всех городов" in prompt
+    assert "Города приёма фиксированы" in prompt
 
 
 def test_codex_chat_prompt_explains_olga_business_context() -> None:
