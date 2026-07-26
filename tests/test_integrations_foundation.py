@@ -2144,7 +2144,7 @@ async def test_booking_flow_asks_photo_goal_before_handoff() -> None:
 
     assert decision.action == "ask_consultation_details"
     assert decision.handoff is None
-    assert "какая зона" in decision.reply.casefold()
+    assert "зону" in decision.reply.casefold()
     assert "что хотите" in decision.reply.casefold()
 
 
@@ -2951,6 +2951,62 @@ def test_client_message_router_blocks_unsupported_city_booking(city: str) -> Non
     assert "телефон" not in route.metadata["reply"].casefold()
 
 
+def test_client_message_router_blocks_external_city_booking_by_rule() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-unsupported-city",
+            chat_id="chat-unsupported-city",
+            text="Будете ли принимать в Сочи?",
+        )
+    )
+
+    assert route.route == "unsupported_city"
+    assert route.city == "Сочи"
+
+
+def test_client_message_router_does_not_block_external_city_price_only() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-price-from-city",
+            chat_id="chat-price-from-city",
+            text="Я из Анапы, сколько стоит ботокс?",
+        )
+    )
+
+    assert route.route != "unsupported_city"
+
+
+def test_client_message_router_does_not_treat_street_or_metro_as_unsupported_city() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-address-street",
+            chat_id="chat-address-street",
+            text="Вы у метро Сокол? Какой адрес?",
+        )
+    )
+
+    assert route.route == "ask_city"
+
+
+def test_client_message_router_uses_dynamic_fixed_cities_reply() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-dynamic-cities",
+            chat_id="chat-dynamic-cities",
+            text="Хочу записаться в Анапе на чистку",
+        ),
+        cities=("Москва",),
+    )
+
+    assert route.route == "unsupported_city"
+    assert "Москва" in route.metadata["reply"]
+    assert "Ростов-на-Дону" not in route.metadata["reply"]
+
+
 def test_client_message_router_keeps_supported_city_booking_flow() -> None:
     route = route_client_message(
         InboundMessage(
@@ -2962,6 +3018,21 @@ def test_client_message_router_keeps_supported_city_booking_flow() -> None:
     )
 
     assert route.route != "unsupported_city"
+
+
+def test_client_message_router_uses_service_aliases_for_booking() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-service-alias",
+            chat_id="chat-service-alias",
+            text="Хочу записаться в Москве на биоревитализацию",
+        ),
+        service_aliases=("биоревитализация",),
+    )
+
+    assert route.route == "booking_read"
+    assert route.block_autoanswer_reason == ""
 
 
 def test_client_message_router_routes_booking_critical_context_to_urgent_handoff() -> None:
@@ -3988,7 +4059,7 @@ async def test_automation_toolbox_lists_appointments_and_plans_care_tasks(tmp_pa
 
 
 @pytest.mark.anyio
-async def test_avito_consultant_answers_listing_price_without_handoff(tmp_path) -> None:
+async def test_avito_consultant_does_not_trust_listing_price_without_canonical_match(tmp_path) -> None:
     toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
     consultant = AvitoConsultant(toolbox)
     message = avito_inbound_message(
@@ -4014,11 +4085,84 @@ async def test_avito_consultant_answers_listing_price_without_handoff(tmp_path) 
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "listing_price_answer"
+    assert reply.action == "price_unknown"
     assert reply.handoff is None
-    assert "от 18 000 ₽" in reply.reply
-    assert "единая для всех городов" in reply.reply.lower()
+    assert "сверить" in reply.reply.casefold()
     assert "передам" not in reply.reply.lower()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_listing_price_only_when_canonical_matches(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(services=[Service(id=77, title="Увеличение ягодиц", price=18000, duration_minutes=60)])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-price-match",
+            "content": {
+                "text": "Какая цена?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "price_string": "18 000 ₽", "city": "Ростов-на-Дону"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "service_price_answer"
+    assert "18000" in reply.reply
+    assert "единая для всех городов" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_blocks_conflicting_listing_price(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(services=[Service(id=77, title="Увеличение ягодиц", price=20000, duration_minutes=60)])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-price-conflict",
+            "content": {
+                "text": "Какая цена?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "price_string": "18 000 ₽", "city": "Ростов-на-Дону"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "price_conflict_needs_check"
+    assert "сверить" in reply.reply.casefold()
+    assert "18 000" not in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_does_not_say_placeholder_price(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(services=[Service(id=77, title="Биоревитализация", price=1, duration_minutes=60)])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-placeholder-price", "content": {"text": "Сколько стоит биоревитализация?"}})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "price_unknown"
+    assert "1 ₽" not in reply.reply
+    assert "сверить" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_rare_yclients_service_price(tmp_path) -> None:
+    gateway = DryRunYClientsGateway(services=[Service(id=88, title="Биоревитализация", price=6500, duration_minutes=60)])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-rare-service", "content": {"text": "Сколько стоит биоревитализация?"}})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "service_price_answer"
+    assert "Биоревитализация" in reply.reply
+    assert "6500" in reply.reply
 
 
 @pytest.mark.anyio

@@ -10,11 +10,13 @@ from .agent_tools import AutomationToolbox
 from .agent_trace import JsonlAgentTraceLogger
 from .avito import avito_photo_handoff
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
+from .city_utils import fixed_cities_reply
 from .client_handlers import HandoffComposer, RagAnswerService
-from .client_router import ClientRoute, FIXED_CITIES_REPLY, route_client_message
+from .client_router import ClientRoute, route_client_message
 from .config import DEFAULT_CITIES
 from .expert_rag import ExpertRagStore
 from .rag_retrieval import RagRetrievalService
+from .service_catalog import ACTIVE, ServiceCatalogStore
 from .models import Handoff, HandoffReason, InboundMessage, Service, Slot
 from .roles import CodexRole, RoleProfile, conversation_key, role_profile
 
@@ -271,6 +273,8 @@ class AvitoConsultant:
             retrieved_expert_answers=context.retrieved_expert_answers,
             conversation_history=context.conversation_history,
             autoanswer_threshold=self.rag_autoanswer_threshold,
+            cities=self.cities,
+            service_aliases=_client_service_aliases(),
         )
         if route.route == "rag_answer":
             draft = self.rag_answer_service.from_retrieved(context.retrieved_expert_answers)
@@ -297,16 +301,15 @@ class AvitoConsultant:
             return AvitoConsultantReply(
                 action="ask_consultation_details",
                 reply=(
-                    "Чтобы Ольга не оценивала вслепую, уточните, пожалуйста: какая зона интересует, "
-                    "что хотите получить в результате, какой объём рассматриваете и были ли процедуры раньше. "
-                    "Если есть фото при хорошем освещении, приложите его тоже."
+                    "Уточните, пожалуйста: какая зона интересует, опишите зону и что хотите получить в результате. "
+                    "Если вопрос визуальный, приложите фото при хорошем освещении."
                 ),
                 metadata={"planner": "client_router", "route": route.to_dict()},
             )
         if route.route == "unsupported_city":
             return AvitoConsultantReply(
                 action="unsupported_city",
-                reply=FIXED_CITIES_REPLY,
+                reply=fixed_cities_reply(self.cities),
                 metadata={"planner": "client_router", "route": route.to_dict()},
             )
         if route.route == "media_handoff":
@@ -562,17 +565,6 @@ class AvitoConsultant:
         return None
 
     async def _answer_price(self, message: InboundMessage) -> AvitoConsultantReply:
-        if message.listing and message.listing.price_string:
-            title = message.listing.title or "этой услуге"
-            reply = f"Стоимость «{title}» — {message.listing.price_string}. Цена единая для всех городов."
-            if _asks_amount_or_calculation(message.text):
-                reply += " Точный расчет зависит от объема и зоны, его лучше считать после уточнения пожеланий."
-            return AvitoConsultantReply(
-                action="listing_price_answer",
-                reply=_with_next_step(reply, message),
-                metadata={"listing": message.listing.to_prompt_context()},
-            )
-
         city = _price_lookup_city(message, self.cities)
 
         service_result = await self.toolbox.execute("yclients.services.list", {"city": city})
@@ -582,17 +574,41 @@ class AvitoConsultant:
                 reply="Сейчас не вижу цену в базе. Напишите, какая именно процедура интересует, и я сверю по услугам.",
             )
         services = [_service_from_data(row) for row in service_result.data.get("services") or []]
-        matched = _match_service(message.text, services)
+        matched = _match_service(_price_match_text(message), services)
         if matched:
+            if matched.price <= 1:
+                return AvitoConsultantReply(
+                    action="price_unknown",
+                    reply="По этой процедуре точную стоимость нужно сверить. Напишите, пожалуйста, детали запроса, и я уточню.",
+                    metadata={"service_id": matched.id, "price_lookup_city": city, "price_status": "placeholder_or_unknown"},
+                )
+            listing_price = _numeric_price(message.listing.price_string if message.listing else "")
+            if listing_price and listing_price != int(matched.price):
+                return AvitoConsultantReply(
+                    action="price_conflict_needs_check",
+                    reply="Стоимость по объявлению и текущему прайсу нужно сверить. Уточню точную стоимость и вернусь с ответом.",
+                    metadata={
+                        "service_id": matched.id,
+                        "price_lookup_city": city,
+                        "canonical_price": matched.price,
+                        "listing": message.listing.to_prompt_context() if message.listing else {},
+                    },
+                )
             return AvitoConsultantReply(
                 action="service_price_answer",
                 reply=_with_next_step(f"{_format_service_price(matched)}. Цена единая для всех городов.", message),
                 metadata={"service_id": matched.id, "price_lookup_city": city, "same_price_all_cities": True},
             )
-        preview = ", ".join(_format_service_price(service) for service in services[:5])
+        if message.listing and message.listing.price_string:
+            return AvitoConsultantReply(
+                action="price_unknown",
+                reply="Вижу цену в объявлении, но точную стоимость лучше сверить с текущим прайсом. Напишите, какая именно процедура интересует.",
+                metadata={"listing": message.listing.to_prompt_context(), "price_lookup_city": city},
+            )
+        preview = ", ".join(_format_service_price(service) for service in services[:5] if service.price > 1)
         return AvitoConsultantReply(
             action="price_list_preview",
-            reply=f"Цена единая для всех городов. По прайсу вижу: {preview}. Напишите конкретную процедуру, и я подскажу точнее.",
+            reply=f"Цена единая для всех городов. По прайсу вижу: {preview or 'стоимость нужно уточнить по процедуре'}. Напишите конкретную процедуру, и я подскажу точнее.",
         )
 
     async def _answer_address(self, message: InboundMessage) -> AvitoConsultantReply:
@@ -807,6 +823,38 @@ def _cities_text(cities: tuple[str, ...]) -> str:
 
 def _match_service(text: str, services: list[Service]) -> Service | None:
     return AvitoBookingFlow(_NoopBooking()).match_service(text, services)
+
+
+def _price_match_text(message: InboundMessage) -> str:
+    parts = [message.text]
+    if message.listing:
+        parts.append(message.listing.title)
+    return " ".join(part for part in parts if part)
+
+
+def _numeric_price(value: str) -> int:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    return int(digits) if digits else 0
+
+
+def _client_service_aliases() -> tuple[str, ...]:
+    aliases: list[str] = []
+    try:
+        for item in ServiceCatalogStore().list():
+            if item.status != ACTIVE:
+                continue
+            aliases.extend([item.title, *item.aliases, *item.products])
+    except (OSError, ValueError):
+        return ()
+    seen: set[str] = set()
+    result: list[str] = []
+    for alias in aliases:
+        normalized = str(alias or "").strip().casefold()
+        if len(normalized) < 4 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(str(alias))
+    return tuple(result)
 
 
 def _format_service_price(service: Service) -> str:

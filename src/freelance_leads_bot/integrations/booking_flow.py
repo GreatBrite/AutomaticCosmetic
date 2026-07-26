@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from .models import Appointment, ClientProfile, Handoff, HandoffReason, InboundMessage, Service, Slot
 from .avito import avito_photo_handoff
+from .city_utils import cities_text, explicit_supported_city
 from .config import DEFAULT_CITIES
 from .yclients import YClientsGateway
 
@@ -15,17 +16,8 @@ PHONE_RE = re.compile(r"(?:\+7|8)?[\s(.-]*(\d{3})[\s).-]*(\d{3})[\s.-]*(\d{2})[\
 DATE_ISO_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 DATE_DMY_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.](\d{2})\b|\b(?:в\s*)?([01]?\d|2[0-3])\s*(?:час(?:а|ов)?|ч)\b")
-CITY_ALIASES = {
-    "Москва": ("москва", "москве", "москву", "москвы", "мск"),
-    "Ростов-на-Дону": ("ростов", "ростове", "ростова", "ростову"),
-    "Санкт-Петербург": ("санкт-петербург", "петербург", "петербурге", "питер", "питере", "спб"),
-    "Краснодар": ("краснодар", "краснодаре", "краснодара", "краснодару"),
-    "Геленджик": ("геленджик", "геленджике", "гелик"),
-}
-
-
 def _cities_text(cities: tuple[str, ...]) -> str:
-    return ", ".join(city for city in cities if str(city).strip()) or ", ".join(DEFAULT_CITIES)
+    return cities_text(cities)
 
 
 @dataclass(frozen=True)
@@ -71,8 +63,8 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_consultation_details",
                 reply=(
-                    "Уточните, пожалуйста, какая зона интересует, что хотите получить в результате, "
-                    "какой объём рассматриваете и были ли процедуры раньше. Так Ольга сможет оценить фото точнее."
+                    "Уточните, пожалуйста: какая зона интересует, опишите зону и что хотите получить в результате. "
+                    "Так Ольга сможет оценить фото точнее."
                 ),
                 state="requested_details",
             )
@@ -225,15 +217,7 @@ class AvitoBookingFlow:
         )
 
     def extract_city(self, text: str) -> str:
-        lowered = text.casefold()
-        for city in self.cities:
-            if city.casefold() in lowered:
-                return city
-        configured = set(self.cities)
-        for city, aliases in CITY_ALIASES.items():
-            if city in configured and any(alias in lowered for alias in aliases):
-                return city
-        return ""
+        return explicit_supported_city(text, cities=self.cities)
 
     def match_service(self, text: str, services: list[Service]) -> Service | None:
         lowered = text.casefold()
@@ -241,9 +225,10 @@ class AvitoBookingFlow:
             if service.title.casefold() in lowered:
                 return service
         for service in services:
-            if any(part and part in lowered for part in service.title.casefold().split()):
+            parts = [part for part in re.findall(r"[а-яёa-z0-9]{4,}", service.title.casefold()) if part not in {"лица", "услуга", "процедура"}]
+            if parts and any(part in lowered for part in parts):
                 return service
-        return services[0] if len(services) == 1 else None
+        return None
 
     def match_slot(self, preferred_time: str, slots: list[Slot]) -> Slot | None:
         target = preferred_time.strip()
