@@ -188,6 +188,8 @@ def _autoanswer_metadata_for_memory(question: str, answer: str) -> dict[str, Any
     text = f"{question}\n{answer}"
     if TEMPORAL_MEMORY_RE.search(text):
         return {"autoanswer_allowed": False, "temporal_fact": True, "autoanswer_block_reason": "temporal_without_expiry"}
+    if re.search(r"(?iu)(?:\d[\d\s]{2,}\s*(?:₽|руб|р\b)?|стоимост|стоит|стоить|цена|прайс|как\s+модель|как\s+пациент)", text):
+        return {"autoanswer_allowed": False, "price_fact": True, "autoanswer_block_reason": "price_requires_current_global_price_metadata"}
     return {"autoanswer_allowed": True}
 
 

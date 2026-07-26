@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Any, Awaitable, Callable
 
 from .models import Appointment, ClientProfile, Handoff, HandoffReason, InboundMessage, Service, Slot
 from .avito import avito_photo_handoff
@@ -51,10 +52,18 @@ class BookingDecision:
 
 
 class AvitoBookingFlow:
-    def __init__(self, booking: YClientsGateway, cities: tuple[str, ...] = DEFAULT_CITIES, *, allow_create: bool = True) -> None:
+    def __init__(
+        self,
+        booking: YClientsGateway,
+        cities: tuple[str, ...] = DEFAULT_CITIES,
+        *,
+        allow_create: bool = True,
+        slot_lookup: Callable[[str, int, str], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
         self.booking = booking
         self.cities = cities
         self.allow_create = allow_create
+        self.slot_lookup = slot_lookup
 
     async def process(self, request: BookingRequest) -> BookingDecision:
         handoff = avito_photo_handoff(request.message)
@@ -94,7 +103,46 @@ class AvitoBookingFlow:
                 service=service,
             )
 
-        slots = await self.booking.get_free_slots(city, service.id, request.preferred_date)
+        slot_result = await self._lookup_slots(city, service.id, request.preferred_date)
+        schedule_status = str(slot_result.get("schedule_status") or "known")
+        slots = _slots_from_lookup(slot_result)
+        if schedule_status == "unknown":
+            return BookingDecision(
+                action="booking_schedule_unknown",
+                reply="Проверю эту дату и вернусь с подтверждением.",
+                state="awaiting_olga",
+                handoff=Handoff(
+                    reason=HandoffReason.BOOKING_AMBIGUOUS,
+                    message=request.message,
+                    summary=(
+                        f"Клиент хочет записаться: {service.title}, {city}, {request.preferred_date}. "
+                        "График Ольги на дату не задан; нельзя говорить, что мест нет. Нужно проверить дату и дать клиенту финальный ответ."
+                    ),
+                ),
+                service=service,
+            )
+        if schedule_status != "known":
+            schedule_city = str(slot_result.get("schedule_city") or "").strip()
+            requested_city = str(slot_result.get("requested_city") or city).strip()
+            if schedule_status == "known_wrong_city" and schedule_city:
+                reply = f"На эту дату Ольга принимает в городе {schedule_city}, а не {requested_city}. Проверю варианты и вернусь с подтверждением."
+                summary = (
+                    f"Клиент хочет записаться: {service.title}, {requested_city}, {request.preferred_date}. "
+                    f"График на дату задан для другого города: {schedule_city}. Нужно предложить корректный следующий шаг."
+                )
+            else:
+                reply = "Проверю эту дату и вернусь с подтверждением."
+                summary = (
+                    f"Клиент хочет записаться: {service.title}, {city}, {request.preferred_date}. "
+                    f"Статус графика: {schedule_status}; нельзя говорить, что мест нет без проверки."
+                )
+            return BookingDecision(
+                action="booking_schedule_check_required",
+                reply=reply,
+                state="awaiting_olga",
+                handoff=Handoff(reason=HandoffReason.BOOKING_AMBIGUOUS, message=request.message, summary=summary),
+                service=service,
+            )
         if not request.preferred_time:
             if not slots:
                 return BookingDecision(
@@ -209,6 +257,44 @@ class AvitoBookingFlow:
         if not match:
             return ""
         return "+7" + "".join(match.groups())
+
+    async def _lookup_slots(self, city: str, service_id: int, preferred_date: str) -> dict[str, Any]:
+        if self.slot_lookup:
+            return await self.slot_lookup(city, service_id, preferred_date)
+        slots = await self.booking.get_free_slots(city, service_id, preferred_date)
+        return {"schedule_status": "known", "slots": slots}
+
+
+def _slots_from_lookup(result: dict[str, Any]) -> list[Slot]:
+    raw_slots = result.get("slots") if isinstance(result, dict) else []
+    slots: list[Slot] = []
+    for item in raw_slots or []:
+        if isinstance(item, Slot):
+            slots.append(item)
+        elif isinstance(item, dict):
+            starts_at = _parse_slot_datetime(item.get("starts_at"))
+            if starts_at:
+                slots.append(
+                    Slot(
+                        city=str(item.get("city") or ""),
+                        starts_at=starts_at,
+                        service_id=int(item.get("service_id") or 0),
+                        staff_id=int(item.get("staff_id") or 0),
+                    )
+                )
+    return slots
+
+
+def _parse_slot_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def booking_request_from_message(message: InboundMessage, cities: tuple[str, ...] = DEFAULT_CITIES) -> BookingRequest:

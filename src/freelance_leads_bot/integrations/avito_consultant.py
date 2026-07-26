@@ -11,7 +11,7 @@ from .agent_trace import JsonlAgentTraceLogger
 from .avito import avito_photo_handoff
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
 from .client_handlers import HandoffComposer, RagAnswerService
-from .client_router import ClientRoute, route_client_message
+from .client_router import ClientRoute, FIXED_CITIES_REPLY, route_client_message
 from .config import DEFAULT_CITIES
 from .expert_rag import ExpertRagStore
 from .rag_retrieval import RagRetrievalService
@@ -228,7 +228,21 @@ class AvitoConsultant:
         self.rag_handoff_threshold = rag_handoff_threshold
         self.rag_answer_service = RagAnswerService(autoanswer_threshold=rag_autoanswer_threshold)
         self.handoff_composer = HandoffComposer()
-        self.booking_flow = AvitoBookingFlow(toolbox.booking, cities=cities, allow_create=False)
+        self.booking_flow = AvitoBookingFlow(
+            toolbox.booking,
+            cities=cities,
+            allow_create=False,
+            slot_lookup=self._schedule_aware_slot_lookup,
+        )
+
+    async def _schedule_aware_slot_lookup(self, city: str, service_id: int, preferred_date: str) -> dict[str, Any]:
+        result = await self.toolbox.execute(
+            "yclients.slots.list",
+            {"city": city, "service_id": service_id, "date": preferred_date},
+        )
+        if not result.ok:
+            return {"schedule_status": "unknown", "slots": [], "error": result.error}
+        return result.data
 
     async def respond(
         self,
@@ -287,6 +301,12 @@ class AvitoConsultant:
                     "что хотите получить в результате, какой объём рассматриваете и были ли процедуры раньше. "
                     "Если есть фото при хорошем освещении, приложите его тоже."
                 ),
+                metadata={"planner": "client_router", "route": route.to_dict()},
+            )
+        if route.route == "unsupported_city":
+            return AvitoConsultantReply(
+                action="unsupported_city",
+                reply=FIXED_CITIES_REPLY,
                 metadata={"planner": "client_router", "route": route.to_dict()},
             )
         if route.route == "media_handoff":
@@ -932,7 +952,27 @@ def _expert_answer_autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
     if metadata.get("autoanswer_allowed") is False:
         return False
+    text = "\n".join(
+        str(answer.get(key) or "")
+        for key in ("question_canonical", "answer_client", "answer_internal", "topic")
+    )
+    if _price_like_expert_answer(text) and not _current_price_metadata(answer, metadata):
+        return False
     return not _temporal_answer_without_expiry(answer, metadata)
+
+
+def _price_like_expert_answer(text: str) -> bool:
+    return bool(re.search(r"(?iu)(?:\d[\d\s]{2,}\s*(?:₽|руб|р\b)?|стоимост|стоит|стоить|цена|прайс|как\s+модель|как\s+пациент)", str(text or "")))
+
+
+def _current_price_metadata(answer: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    if metadata.get("current_global_price") is not True:
+        return False
+    if not str(metadata.get("service_key") or "").strip():
+        return False
+    if not (metadata.get("valid_until") or metadata.get("expires_at") or answer.get("expires_at") or metadata.get("stable_price") is True):
+        return False
+    return bool(metadata.get("price_applies_to") or metadata.get("applicability") or metadata.get("model_policy"))
 
 
 def _temporal_answer_without_expiry(answer: dict[str, Any], metadata: dict[str, Any]) -> bool:

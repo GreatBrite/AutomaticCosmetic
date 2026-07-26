@@ -155,9 +155,25 @@ def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
     text = "\n".join(str(answer.get(key) or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
     if metadata.get("olga_approved_aesthetic_formula") is not True and AESTHETIC_PROMISE_RE.search(text):
         return False
+    if _price_like_answer(text) and not _current_price_metadata(answer, metadata):
+        return False
     if answer.get("expires_at") or metadata.get("valid_until") or metadata.get("expires_at"):
         return True
     return not TEMPORAL_FACT_RE.search(text)
+
+
+def _price_like_answer(text: str) -> bool:
+    return bool(re.search(r"(?iu)(?:\d[\d\s]{2,}\s*(?:₽|руб|р\b)?|стоимост|стоит|стоить|цена|прайс|как\s+модель|как\s+пациент)", str(text or "")))
+
+
+def _current_price_metadata(answer: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    if metadata.get("current_global_price") is not True:
+        return False
+    if not str(metadata.get("service_key") or "").strip():
+        return False
+    if not (metadata.get("valid_until") or metadata.get("expires_at") or answer.get("expires_at") or metadata.get("stable_price") is True):
+        return False
+    return bool(metadata.get("price_applies_to") or metadata.get("applicability") or metadata.get("model_policy"))
 
 
 def _strip_batch_system_text(text: str) -> str:

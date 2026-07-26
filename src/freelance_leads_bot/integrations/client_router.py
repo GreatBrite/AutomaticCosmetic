@@ -51,6 +51,19 @@ CONSULTATION_DETAIL_RE = re.compile(
     r"(?iu)(хочу|интересует|нужно|надо|цель|эффект|результат|исправ|убрать|увелич|"
     r"зона|губ|груд|ягод|поп|ботокс|морщин|асимметр|объ[её]м|мл|делал[аи]?|было|раньше)"
 )
+CONSULTATION_GOAL_RE = re.compile(r"(?iu)(цель|эффект|результат|исправ|убрать|увелич|беспоко|хочу|нужно|надо|как\s+будет)")
+CONSULTATION_HISTORY_RE = re.compile(r"(?iu)(раньше|было|была|был|делал[аи]?|не\s+делал[аи]?|первый\s+раз|уже\s+ставил[аи]?)")
+UNSUPPORTED_CITY_ALIASES = {
+    "Ейск": ("ейск", "ейске"),
+    "Анапа": ("анапа", "анапе", "анапу"),
+    "Новороссийск": ("новороссийск", "новороссийске"),
+    "Павловская": ("павловская", "павловской"),
+    "Абинск": ("абинск", "абинске"),
+}
+FIXED_CITIES_REPLY = (
+    "Сейчас прием ведем только в фиксированных городах: Ростов-на-Дону, Москва, "
+    "Санкт-Петербург, Краснодар, Геленджик. Если один из них удобен, подскажу по записи."
+)
 
 
 def route_client_message(
@@ -63,6 +76,7 @@ def route_client_message(
     text = str(message.text or "")
     lowered = text.casefold().replace("ё", "е")
     city = _explicit_city(text, conversation_history)
+    unsupported_city = _explicit_unsupported_city(text)
     service_key = _service_key_from_text(text)
     has_service_hint = bool(SERVICE_HINT_RE.search(lowered) or _history_service_hint(conversation_history))
 
@@ -94,6 +108,15 @@ def route_client_message(
             handoff_reason=HandoffReason.BOOKING_CRITICAL.value,
             block_autoanswer_reason="booking_critical",
             metadata={"urgent": True, "sla": "booking_critical"},
+        )
+
+    if unsupported_city and _unsupported_city_request(lowered):
+        return ClientRoute(
+            route="unsupported_city",
+            city=unsupported_city,
+            service_key=service_key,
+            block_autoanswer_reason="unsupported_city",
+            metadata={"city": unsupported_city, "reply": FIXED_CITIES_REPLY},
         )
 
     if _has_media(message):
@@ -187,11 +210,18 @@ def _needs_consultation_details(
         return False
     if not str(message.text or "").strip() or str(message.text or "").strip().casefold() in {"[фото]", "фото"}:
         return True
-    if _has_media(message) and not CONSULTATION_DETAIL_RE.search(lowered):
+    if _has_media(message) and not _consultation_details_complete(lowered):
         return True
     if _aesthetic_expectation_question(lowered, conversation_history):
-        return not _has_media(message)
+        return not (_has_media(message) and _consultation_details_complete(lowered))
     return False
+
+
+def _consultation_details_complete(lowered: str) -> bool:
+    has_zone = bool(SERVICE_HINT_RE.search(lowered))
+    has_goal = bool(CONSULTATION_GOAL_RE.search(lowered))
+    has_history = bool(CONSULTATION_HISTORY_RE.search(lowered))
+    return has_zone and has_goal and has_history
 
 
 def _history_consultation_details(conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
@@ -200,7 +230,7 @@ def _history_consultation_details(conversation_history: tuple[dict[str, Any], ..
     ).casefold().replace("ё", "е")
     if not recent_user_text:
         return False
-    return bool(CONSULTATION_DETAIL_RE.search(recent_user_text) and re.search(r"(?iu)(фото|сним|объ[её]м|мл|хочу|цель|результат)", recent_user_text))
+    return bool(_consultation_details_complete(recent_user_text) and re.search(r"(?iu)(фото|сним|объ[её]м|мл|хочу|цель|результат)", recent_user_text))
 
 
 def _aesthetic_expectation_question(lowered: str, conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
@@ -259,8 +289,6 @@ def _explicit_city(text: str, conversation_history: tuple[dict[str, Any], ...] |
         "москву": "Москва",
         "ростове": "Ростов-на-Дону",
         "ростов": "Ростов-на-Дону",
-        "абинске": "Абинск",
-        "абинск": "Абинск",
     }
     for raw, city in aliases.items():
         if re.search(rf"(?<![а-яa-z]){re.escape(raw)}(?![а-яa-z])", source):
@@ -273,6 +301,19 @@ def _explicit_city(text: str, conversation_history: tuple[dict[str, Any], ...] |
         if len(first) >= 5 and first in source:
             return city
     return ""
+
+
+def _explicit_unsupported_city(text: str) -> str:
+    source = str(text or "").casefold().replace("ё", "е")
+    for city, aliases in UNSUPPORTED_CITY_ALIASES.items():
+        for raw in aliases:
+            if re.search(rf"(?<![а-яa-z]){re.escape(raw)}(?![а-яa-z])", source):
+                return city
+    return ""
+
+
+def _unsupported_city_request(lowered: str) -> bool:
+    return bool(BOOKING_RE.search(lowered) or ADDRESS_RE.search(lowered) or re.search(r"(?iu)(при[её]м|принимаете|локац|где\s+вы)", lowered))
 
 
 def _service_key_from_text(text: str) -> str:

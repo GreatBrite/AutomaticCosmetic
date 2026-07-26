@@ -2010,6 +2010,100 @@ async def test_booking_flow_offers_slots_after_city_service_and_date() -> None:
 
 
 @pytest.mark.anyio
+async def test_booking_flow_unknown_schedule_creates_safe_handoff() -> None:
+    service = Service(id=101, title="Чистка лица", price=3500)
+
+    async def unknown_lookup(city: str, service_id: int, preferred_date: str) -> dict[str, object]:
+        assert city == "Ростов-на-Дону"
+        assert service_id == service.id
+        assert preferred_date == "2026-08-01"
+        return {"schedule_status": "unknown", "slots": []}
+
+    flow = AvitoBookingFlow(
+        DryRunYClientsGateway(services=[service], slots=[]),
+        cities=("Ростов-на-Дону",),
+        slot_lookup=unknown_lookup,
+    )
+    message = avito_inbound_message({"type": "message", "text": "Ростов, чистка лица 1 августа"})
+
+    decision = await flow.process(
+        BookingRequest(
+            message=message,
+            city="Ростов-на-Дону",
+            service_query="чистка лица",
+            preferred_date="2026-08-01",
+        )
+    )
+
+    assert decision.action == "booking_schedule_unknown"
+    assert decision.handoff is not None
+    assert decision.handoff.reason == HandoffReason.BOOKING_AMBIGUOUS
+    assert decision.reply == "Проверю эту дату и вернусь с подтверждением."
+    assert "мест нет" not in decision.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_booking_flow_known_empty_slots_can_state_no_slots() -> None:
+    service = Service(id=101, title="Чистка лица", price=3500)
+
+    async def known_empty_lookup(city: str, service_id: int, preferred_date: str) -> dict[str, object]:
+        return {"schedule_status": "known", "slots": []}
+
+    flow = AvitoBookingFlow(
+        DryRunYClientsGateway(services=[service], slots=[]),
+        cities=("Ростов-на-Дону",),
+        slot_lookup=known_empty_lookup,
+    )
+    message = avito_inbound_message({"type": "message", "text": "Ростов, чистка лица 1 августа"})
+
+    decision = await flow.process(
+        BookingRequest(
+            message=message,
+            city="Ростов-на-Дону",
+            service_query="чистка лица",
+            preferred_date="2026-08-01",
+        )
+    )
+
+    assert decision.action == "no_slots"
+    assert "свободного времени" in decision.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_booking_flow_wrong_schedule_city_does_not_state_no_slots() -> None:
+    service = Service(id=101, title="Чистка лица", price=3500)
+
+    async def wrong_city_lookup(city: str, service_id: int, preferred_date: str) -> dict[str, object]:
+        return {
+            "schedule_status": "known_wrong_city",
+            "slots": [],
+            "requested_city": "Ростов-на-Дону",
+            "schedule_city": "Москва",
+        }
+
+    flow = AvitoBookingFlow(
+        DryRunYClientsGateway(services=[service], slots=[]),
+        cities=("Ростов-на-Дону", "Москва"),
+        slot_lookup=wrong_city_lookup,
+    )
+    message = avito_inbound_message({"type": "message", "text": "Ростов, чистка лица 1 августа"})
+
+    decision = await flow.process(
+        BookingRequest(
+            message=message,
+            city="Ростов-на-Дону",
+            service_query="чистка лица",
+            preferred_date="2026-08-01",
+        )
+    )
+
+    assert decision.action == "booking_schedule_check_required"
+    assert decision.handoff is not None
+    assert "мест нет" not in decision.reply.casefold()
+    assert "Москва" in decision.reply
+
+
+@pytest.mark.anyio
 async def test_booking_flow_creates_dry_run_appointment() -> None:
     gateway = DryRunYClientsGateway()
     flow = AvitoBookingFlow(gateway)
@@ -2754,7 +2848,7 @@ def test_client_message_router_handoffs_aesthetic_expectation_after_client_detai
             channel=Channel.AVITO,
             client_id="client-expectation",
             chat_id="chat-expectation",
-            text="Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила.",
+            text="Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила, раньше не делала.",
             has_photo=True,
         )
     )
@@ -2821,11 +2915,53 @@ def test_client_message_router_blocks_risk_address_and_media() -> None:
             channel=Channel.AVITO,
             client_id="client-media-route",
             chat_id="chat-media-route",
-            text="Посмотрите фото, хочу понять по губам что можно исправить",
+            text="Посмотрите фото, хочу понять по губам что можно исправить, раньше не делала",
             has_photo=True,
         )
     )
     assert media_with_details.route == "media_handoff"
+
+    media_missing_details = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-media-route",
+            chat_id="chat-media-route",
+            text="Посмотрите фото, хочу грудь",
+            has_photo=True,
+        )
+    )
+    assert media_missing_details.route == "ask_consultation_details"
+
+
+@pytest.mark.parametrize("city", ["Ейск", "Анапа", "Новороссийск", "Павловская", "Абинск"])
+def test_client_message_router_blocks_unsupported_city_booking(city: str) -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-unsupported-city",
+            chat_id="chat-unsupported-city",
+            text=f"Хочу записаться в {city} на чистку лица",
+        )
+    )
+
+    assert route.route == "unsupported_city"
+    assert route.block_autoanswer_reason == "unsupported_city"
+    assert "Ростов-на-Дону, Москва, Санкт-Петербург, Краснодар, Геленджик" in route.metadata["reply"]
+    assert "сообщ" not in route.metadata["reply"].casefold()
+    assert "телефон" not in route.metadata["reply"].casefold()
+
+
+def test_client_message_router_keeps_supported_city_booking_flow() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-supported-city",
+            chat_id="chat-supported-city",
+            text="Хочу записаться в Краснодаре на чистку лица",
+        )
+    )
+
+    assert route.route != "unsupported_city"
 
 
 def test_client_message_router_routes_booking_critical_context_to_urgent_handoff() -> None:
@@ -2909,7 +3045,10 @@ async def test_avito_consultant_handoffs_aesthetic_volume_expectation_with_detai
         {
             "type": "message",
             "chat_id": "chat-expectation",
-            "content": {"text": "Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила.", "image": {"url": "https://img.example/photo.jpg"}},
+            "content": {
+                "text": "Хочу увеличить грудь, 300 мл хватит на плюс один размер? Фото приложила, раньше не делала.",
+                "image": {"url": "https://img.example/photo.jpg"},
+            },
         }
     )
 
@@ -2920,6 +3059,49 @@ async def test_avito_consultant_handoffs_aesthetic_volume_expectation_with_detai
     assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
     assert reply.reply == "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее."
     assert "нельзя автообещать результат по мл" in reply.handoff.summary
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_blocks_unsupported_city_booking(tmp_path) -> None:
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-unsupported-city",
+            "content": {"text": "Хочу записаться в Абинске на чистку лица"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "unsupported_city"
+    assert "Ростов-на-Дону, Москва, Санкт-Петербург, Краснодар, Геленджик" in reply.reply
+    assert "телефон" not in reply.reply.casefold()
+    assert "сообщ" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_uses_schedule_aware_slot_lookup(tmp_path) -> None:
+    service = Service(id=101, title="Чистка лица", price=3500)
+    gateway = DryRunYClientsGateway(services=[service], slots=[])
+    city_schedule = CityScheduleStore(tmp_path / "city_schedule.json")
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"), city_schedule=city_schedule)
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-schedule-unknown",
+            "content": {"text": "Ростов, чистка лица, 2026-08-01"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "booking_schedule_unknown"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.BOOKING_AMBIGUOUS
+    assert reply.reply == "Проверю эту дату и вернусь с подтверждением."
+    assert "мест нет" not in reply.reply.casefold()
 
 
 @pytest.mark.anyio
@@ -5985,13 +6167,18 @@ def test_processing_outcome_controls_dedup_for_webhook_and_missed_poller() -> No
     assert missed_poller_dedup_allowed({"ok": True, "processing_status": "ignored", "ignored": True, "reason": "unknown_silent_skip"}) is False
 
 
-def test_avito_webhook_processes_booking_decision_and_deduplicates() -> None:
+def test_avito_webhook_processes_booking_decision_and_deduplicates(tmp_path, monkeypatch) -> None:
     processed_events.seen.clear()
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
     settings = _settings()
     gateway = DryRunYClientsGateway()
     slot = gateway.slots[0]
+    city_schedule = CityScheduleStore(tmp_path / "city_schedule.json")
+    city_schedule.set_dates(slot.city, [slot.starts_at.date().isoformat()])
+    toolbox = AutomationToolbox(gateway, JsonKnowledgeStore(tmp_path / "knowledge.json"), city_schedule=city_schedule)
     avito_app.dependency_overrides[get_settings] = lambda: settings
     avito_app.dependency_overrides[get_booking] = lambda: gateway
+    avito_app.dependency_overrides[get_toolbox] = lambda: toolbox
     avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
     event = {
         "payload": {
@@ -6704,7 +6891,13 @@ def test_shared_rag_retrieval_blocks_unsafe_autoanswer_but_keeps_similar_answers
         answer_client="Губы стоят 20 000.",
         status=APPROVED,
         approved_by="olga",
-        metadata={"service_key": "guby", "autoanswer_allowed": True},
+        metadata={
+            "service_key": "guby",
+            "autoanswer_allowed": True,
+            "current_global_price": True,
+            "stable_price": True,
+            "price_applies_to": "standard",
+        },
     )
 
     result = RagRetrievalService(store, catalog).retrieve(
@@ -6766,7 +6959,13 @@ def test_shared_rag_retrieval_allows_price_only_volume_answer(tmp_path) -> None:
         answer_client="300 мл Tesoro Body стоит 75 000.",
         status=APPROVED,
         approved_by="olga",
-        metadata={"service_key": "yagodicy", "autoanswer_allowed": True},
+        metadata={
+            "service_key": "yagodicy",
+            "autoanswer_allowed": True,
+            "current_global_price": True,
+            "stable_price": True,
+            "price_applies_to": "standard",
+        },
     )
 
     result = RagRetrievalService(store, catalog).retrieve(
@@ -6775,6 +6974,27 @@ def test_shared_rag_retrieval_allows_price_only_volume_answer(tmp_path) -> None:
 
     assert result.answers
     assert result.safe_for_autoanswer is True
+
+
+def test_shared_rag_retrieval_blocks_price_text_without_current_metadata(tmp_path) -> None:
+    store = ExpertRagStore(tmp_path / "expert.sqlite3")
+    catalog = ServiceCatalogStore(tmp_path / "services.json")
+    catalog.upsert(service_key="yagodicy", title="Ягодицы", aliases=("ягодицы",), visibility=("avito",))
+    store.upsert_from_handoff(
+        question="Сколько стоит 300 мл ягодицы?",
+        answer_client="300 мл Tesoro Body стоит 75 000.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"service_key": "yagodicy", "autoanswer_allowed": True},
+    )
+
+    result = RagRetrievalService(store, catalog).retrieve(
+        RagRetrievalRequest(channel="avito", text="Сколько стоит 300 мл ягодицы?", min_score=0.0)
+    )
+
+    assert result.answers == ()
+    assert result.safe_for_autoanswer is False
+    assert result.handoff_reason == "no_approved_knowledge"
 
 
 def test_shared_rag_retrieval_detects_cross_city_price_conflict(tmp_path) -> None:
@@ -6786,14 +7006,26 @@ def test_shared_rag_retrieval_detects_cross_city_price_conflict(tmp_path) -> Non
         answer_client="Ботокс стоит 3 000 ₽.",
         status=APPROVED,
         approved_by="olga",
-        metadata={"service_key": "botoks", "autoanswer_allowed": True},
+        metadata={
+            "service_key": "botoks",
+            "autoanswer_allowed": True,
+            "current_global_price": True,
+            "stable_price": True,
+            "price_applies_to": "standard",
+        },
     )
     store.upsert_from_handoff(
         question="Сколько стоит ботокс в Ростове?",
         answer_client="Ботокс стоит 4 000 ₽.",
         status=APPROVED,
         approved_by="olga",
-        metadata={"service_key": "botoks", "autoanswer_allowed": True},
+        metadata={
+            "service_key": "botoks",
+            "autoanswer_allowed": True,
+            "current_global_price": True,
+            "stable_price": True,
+            "price_applies_to": "standard",
+        },
     )
 
     result = RagRetrievalService(store, catalog).retrieve(
@@ -6816,7 +7048,13 @@ def test_shared_rag_retrieval_allows_same_price_across_cities(tmp_path) -> None:
             answer_client="Ботокс стоит 3 000 ₽.",
             status=APPROVED,
             approved_by="olga",
-            metadata={"service_key": "botoks", "autoanswer_allowed": True},
+            metadata={
+                "service_key": "botoks",
+                "autoanswer_allowed": True,
+                "current_global_price": True,
+                "stable_price": True,
+                "price_applies_to": "standard",
+            },
         )
 
     result = RagRetrievalService(store, catalog).retrieve(
@@ -7591,6 +7829,25 @@ def test_mentor_memory_blocks_temporal_olga_answer_from_autoanswer(tmp_path) -> 
     assert answer.metadata["autoanswer_allowed"] is False
     assert answer.metadata["temporal_fact"] is True
     assert answer.metadata["autoanswer_block_reason"] == "temporal_without_expiry"
+
+
+def test_mentor_memory_blocks_freeform_price_answer_from_autoanswer(tmp_path) -> None:
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    expert = ExpertRagStore(tmp_path / "expert.sqlite3")
+    memory = MentorMemoryService(knowledge, expert_rag=expert)
+
+    result = memory.observe_avito_send(
+        chat_id="chat-1",
+        text="300 мл Tesoro Body стоит 75 000.",
+        actor="olga",
+        context={"client_message": "Сколько стоит 300 мл ягодицы?"},
+    )
+
+    assert result.expert_answers
+    answer = result.expert_answers[0]
+    assert answer.metadata["autoanswer_allowed"] is False
+    assert answer.metadata["price_fact"] is True
+    assert answer.metadata["autoanswer_block_reason"] == "price_requires_current_global_price_metadata"
 
 
 @pytest.mark.anyio
@@ -8978,7 +9235,7 @@ def test_avito_webhook_voice_transcription_failure_creates_critical_handoff() ->
         processed_events.seen.clear()
 
 
-def test_avito_webhook_reviewer_revises_before_send() -> None:
+def test_avito_webhook_reviewer_revises_before_send(tmp_path, monkeypatch) -> None:
     class FakePlanner:
         async def respond(self, context, toolbox):
             del context, toolbox
@@ -8990,6 +9247,7 @@ def test_avito_webhook_reviewer_revises_before_send() -> None:
             return replace(decision, reply="Точный адрес уточню у Ольги и напишу.", metadata={**decision.metadata, "draft_review": {"action": "revise"}})
 
     processed_events.seen.clear()
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
     avito_app.dependency_overrides[get_settings] = lambda: _settings()
     avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
     avito_app.dependency_overrides[get_planner] = lambda: FakePlanner()
@@ -9131,8 +9389,9 @@ def test_avito_webhook_skips_waiting_ack_after_pending_reply(tmp_path) -> None:
         processed_events.seen.clear()
 
 
-def test_avito_webhook_does_not_skip_waiting_address_after_pending_reply(tmp_path) -> None:
+def test_avito_webhook_does_not_skip_waiting_address_after_pending_reply(tmp_path, monkeypatch) -> None:
     processed_events.seen.clear()
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
     settings = replace(_settings(), telegram_admin_history_db_path=tmp_path / "history.sqlite3")
     store = LeadStore(settings.telegram_admin_history_db_path)
     store.add_codex_chat_message("assistant", "Уточню точный адрес и напишу вам.", "avito:client:chat-address-wait")
@@ -11609,6 +11868,61 @@ async def test_process_avito_message_pseudo_ok_handoff_is_retryable_when_no_deli
     assert result["processing_status"] == "retryable_error"
     assert result["error"] == "telegram_handoff_failed:unknown"
     assert result["mark_read"]["reason"] == "not_marked_read_delivery_failed"
+
+
+def test_avito_outgoing_promise_state_updates_and_closes(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "avito_unanswered_monitor_state.json"
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", state_path)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "id": "client-msg-1",
+            "chat_id": "chat-promise",
+            "created": 1779984000,
+            "content": {"text": "Подскажите адрес и подтвердите запись"},
+        }
+    )
+
+    decision = AvitoConsultantReply(action="booking_schedule_unknown", reply="Проверю эту дату и вернусь с подтверждением.")
+
+    created = avito_webhook_module._upsert_outgoing_promise_state(
+        account_id=123,
+        message=message,
+        outgoing_reply="Проверю эту дату и вернусь с подтверждением.",
+        decision=decision,
+        state_path=state_path,
+        now=1779987600,
+    )
+    updated = avito_webhook_module._upsert_outgoing_promise_state(
+        account_id=123,
+        message=message,
+        outgoing_reply="Передам Ольге и вернусь с ответом.",
+        decision=decision,
+        state_path=state_path,
+        now=1779987900,
+    )
+    closed = avito_webhook_module._close_outgoing_promises_if_final(
+        account_id=123,
+        message=message,
+        outgoing_reply="Вы записаны на 1 августа в 15:00, адрес отправила.",
+        state_path=state_path,
+        now=1779988200,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    followups = state["pending_followups"]
+
+    assert created["created"] is True
+    assert updated["created"] is True
+    assert closed["closed"] is True
+    assert len(followups) == 1
+    followup = next(iter(followups.values()))
+    assert followup["avito_chat_id"] == "chat-promise"
+    assert followup["client_waits_for"] == "ответ Ольги/оценка фото"
+    assert followup["last_outgoing_reply"] == "Передам Ольге и вернусь с ответом."
+    assert followup["business_status"] == "answered"
+    assert followup["business_resolved"] is True
+    assert followup["final_answer"] == "Вы записаны на 1 августа в 15:00, адрес отправила."
 
 
 @pytest.mark.anyio

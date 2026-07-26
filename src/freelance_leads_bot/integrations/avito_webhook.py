@@ -6,6 +6,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ processed_events = PersistentProcessedEventStore()
 app = FastAPI(title="Automatic Cosmetic Avito Webhook")
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 WEBHOOK_LOG_PATH = Path("data/avito_webhook.log")
+AVITO_PROMISE_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
 AVITO_DEBOUNCE_WORKER_INTERVAL_SECONDS = 2.0
 SAFE_IGNORE_REASONS = {
     "not_message_event",
@@ -511,6 +513,12 @@ def _remember_manual_avito_outgoing_if_needed(
     close_status = ""
     if _looks_like_final_outgoing_after_handoff(text):
         close_status = "closed" if update_latest_handoff_for_chat(message.chat_id, "closed") else ""
+        _close_outgoing_promises_if_final(
+            message=message,
+            account_id=_account_id((message.metadata or {}).get("account_id"), settings),
+            outgoing_reply=text,
+            state_path=AVITO_PROMISE_STATE_PATH,
+        )
     return {"remembered": bool(history_store), "closed_handoff": bool(close_status), "status": close_status}
 
 
@@ -557,6 +565,157 @@ def _looks_like_final_outgoing_after_handoff(text: str) -> bool:
         "оплат",
     )
     return any(marker in normalized for marker in final_markers)
+
+
+def _upsert_outgoing_promise_state(
+    *,
+    message: Any,
+    account_id: int,
+    outgoing_reply: str,
+    decision: Any,
+    state_path: Path,
+    now: int | None = None,
+) -> dict[str, Any]:
+    if not _looks_like_outgoing_promise(outgoing_reply):
+        return {"created": False, "reason": "not_promise"}
+    chat_id = str(getattr(message, "chat_id", "") or "")
+    if not chat_id:
+        return {"created": False, "reason": "missing_chat_id"}
+    created = int(now or time.time())
+    state = _read_json_file(state_path)
+    pending = state.get("pending_followups") if isinstance(state.get("pending_followups"), dict) else {}
+    key = _open_promise_key_for_chat(pending, account_id=account_id, chat_id=chat_id) or f"{int(account_id or 0)}:{chat_id}:webhook-promise"
+    row = pending.get(key) if isinstance(pending.get(key), dict) else {}
+    reason = str(decision.handoff.reason.value if getattr(decision, "handoff", None) else getattr(decision, "action", "") or "bot_promised_followup")
+    row.update(
+        {
+            "account_id": int(account_id or 0),
+            "chat_id": chat_id,
+            "avito_chat_id": chat_id,
+            "message_id": str(getattr(message, "message_id", "") or "webhook-promise"),
+            "reason": reason,
+            "client_waits_for": _client_waits_for_from_promise(outgoing_reply, reason),
+            "bot_promise": outgoing_reply,
+            "last_outgoing_reply": outgoing_reply,
+            "last_client_message": str(getattr(message, "text", "") or ""),
+            "last_client_message_at": int(getattr(message, "created_at", 0) or 0),
+            "promised_at": created,
+            "promised_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat(),
+            "deadline_at": created + 3600,
+            "escalation_at": created + 10800,
+            "business_status": "awaiting_olga",
+            "business_resolved": False,
+            "severity": "critical" if _promise_is_critical(outgoing_reply, reason) else "action",
+            "source": "avito_webhook",
+        }
+    )
+    pending[key] = row
+    state["pending_followups"] = pending
+    _write_json_file(state_path, state)
+    return {"created": True, "key": key}
+
+
+def _close_outgoing_promises_if_final(
+    *,
+    message: Any,
+    account_id: int,
+    outgoing_reply: str,
+    state_path: Path,
+    now: int | None = None,
+) -> dict[str, Any]:
+    if _looks_like_outgoing_promise(outgoing_reply) or not _looks_like_final_outgoing_after_handoff(outgoing_reply):
+        return {"closed": False, "reason": "not_final"}
+    chat_id = str(getattr(message, "chat_id", "") or "")
+    if not chat_id:
+        return {"closed": False, "reason": "missing_chat_id"}
+    state = _read_json_file(state_path)
+    pending = state.get("pending_followups") if isinstance(state.get("pending_followups"), dict) else {}
+    key = _open_promise_key_for_chat(pending, account_id=account_id, chat_id=chat_id)
+    row = pending.get(key) if key and isinstance(pending.get(key), dict) else None
+    if row is None:
+        return {"closed": False, "reason": "no_open_promise"}
+    closed_at = int(now or time.time())
+    row.update(
+        {
+            "business_status": "answered",
+            "business_resolved": True,
+            "closed_at": closed_at,
+            "closed_at_iso": datetime.fromtimestamp(closed_at, timezone.utc).isoformat(),
+            "final_answer": outgoing_reply,
+            "overdue": False,
+            "source": "avito_webhook_final_answer",
+        }
+    )
+    pending[key] = row
+    state["pending_followups"] = pending
+    _write_json_file(state_path, state)
+    return {"closed": True, "key": key}
+
+
+def _looks_like_outgoing_promise(text: str) -> bool:
+    normalized = " ".join(str(text or "").casefold().replace("ё", "е").split())
+    return bool(
+        normalized
+        and any(
+            marker in normalized
+            for marker in (
+                "уточню",
+                "уточним",
+                "проверю",
+                "проверим",
+                "передам",
+                "вернусь",
+                "вернемся",
+                "вернёмся",
+                "подтвержу",
+                "подтвердим",
+                "сверю",
+                "сверим",
+            )
+        )
+    )
+
+
+def _open_promise_key_for_chat(pending: dict[str, Any], *, account_id: int, chat_id: str) -> str:
+    for key, row in pending.items():
+        if not isinstance(row, dict) or row.get("business_resolved"):
+            continue
+        if int(row.get("account_id") or 0) == int(account_id or 0) and str(row.get("chat_id") or row.get("avito_chat_id") or "") == chat_id:
+            return str(key)
+    return ""
+
+
+def _client_waits_for_from_promise(text: str, reason: str) -> str:
+    normalized = str(text or "").casefold().replace("ё", "е")
+    if "дат" in normalized or "время" in normalized or "окн" in normalized:
+        return "проверка даты/окна записи"
+    if "адрес" in normalized:
+        return "точный адрес/подтверждение записи"
+    if "фото" in normalized or "ольг" in normalized or "передам" in normalized:
+        return "ответ Ольги/оценка фото"
+    if "цен" in normalized or "стоим" in normalized:
+        return "подтверждение цены"
+    return reason or "финальный ответ"
+
+
+def _promise_is_critical(text: str, reason: str) -> bool:
+    normalized = f"{text} {reason}".casefold().replace("ё", "е")
+    return bool(any(marker in normalized for marker in ("адрес", "запис", "подтверж", "дат", "время", "окн", "жалоб", "отзыв")))
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {}
+
+
+def _write_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
 async def transcribe_avito_voice_message(message: Any, *, voice_resolver: AvitoVoiceResolver | None) -> Any:
@@ -684,6 +843,20 @@ async def process_avito_message(
         history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
         if send_ok:
             remember_avito_outgoing(history_store, message.chat_id, outgoing_reply or decision.reply)
+    if send_ok and outgoing_reply:
+        _upsert_outgoing_promise_state(
+            message=message,
+            account_id=account_id,
+            outgoing_reply=outgoing_reply,
+            decision=decision,
+            state_path=AVITO_PROMISE_STATE_PATH,
+        )
+        _close_outgoing_promises_if_final(
+            message=message,
+            account_id=account_id,
+            outgoing_reply=outgoing_reply,
+            state_path=AVITO_PROMISE_STATE_PATH,
+        )
     mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id) if processing_ok else {"ok": False, "reason": "not_marked_read_delivery_failed"}
     return {
         "ok": processing_ok,
