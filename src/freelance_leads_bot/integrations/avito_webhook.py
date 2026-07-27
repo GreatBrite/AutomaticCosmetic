@@ -563,6 +563,7 @@ def _looks_like_final_outgoing_after_handoff(text: str) -> bool:
         "стоимость",
         "предоплат",
         "оплат",
+        "окош",
         "гарант",
         "миграц",
         "рассос",

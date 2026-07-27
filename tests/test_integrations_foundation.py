@@ -6490,7 +6490,7 @@ def test_avito_webhook_outgoing_final_answer_closes_open_handoff(tmp_path, monke
         client_id="1",
         chat_id="chat-handoff",
         message_id="out-final-1",
-        text="Ближайшее время есть на 29, 30 и 31 июля. Адрес отправлю после записи.",
+        text="Завтра окошек нет. Ближайшее окошко не раньше 30 июля.",
         metadata={"direction": "out"},
     )
 
@@ -6501,7 +6501,7 @@ def test_avito_webhook_outgoing_final_answer_closes_open_handoff(tmp_path, monke
     assert closed == [("chat-handoff", "closed")]
     history = history_store.recent_codex_chat(5, "avito:client:chat-handoff")
     assert history[-1]["role"] == "assistant"
-    assert "29, 30 и 31 июля" in history[-1]["content"]
+    assert "окошек нет" in history[-1]["content"]
 
 
 def test_avito_webhook_outgoing_voice_consultation_closes_open_handoff(tmp_path, monkeypatch) -> None:
