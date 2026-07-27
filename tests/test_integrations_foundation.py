@@ -8429,6 +8429,38 @@ def test_pending_followup_not_relevant_does_not_reopen_same_promise() -> None:
     assert all_rows[0]["business_resolved"] is True
 
 
+def test_pending_followup_sync_reuses_matching_webhook_promise() -> None:
+    chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Анна"}]}
+    state: dict[str, object] = {
+        "pending_followups": {
+            "1:chat-followup:webhook-promise": {
+                "account_id": 1,
+                "chat_id": "chat-followup",
+                "message_id": "m-client-1",
+                "bot_promise": "Уточню точный адрес и вернусь с ответом.",
+                "last_client_message": "Жду адрес",
+                "promised_at": 200,
+                "deadline_at": 2000,
+                "escalation_at": 4000,
+                "business_status": "awaiting_olga",
+                "business_resolved": False,
+            }
+        }
+    }
+    messages = [
+        {"id": "m-client-1", "author_id": 10, "direction": "in", "type": "text", "created": 100, "content": {"text": "Жду адрес"}},
+        {"id": "m-bot-1", "author_id": 1, "direction": "out", "type": "text", "created": 160, "content": {"text": "Уточню точный адрес и вернусь с ответом."}},
+    ]
+
+    sync_pending_followups(account_id=1, chat=chat, messages=messages, state=state, now=4000, reminder_seconds=1800, escalation_seconds=7200)
+
+    rows = pending_followup_rows(state, now=4000)
+    assert len(rows) == 1
+    assert rows[0]["key"] == "1:chat-followup:webhook-promise"
+    assert rows[0]["message_id"] == "m-bot-1"
+    assert rows[0]["bot_promise"] == "Уточню точный адрес и вернусь с ответом."
+
+
 def test_pending_followup_alert_includes_business_context_and_action() -> None:
     text = format_pending_followup_alert(
         [

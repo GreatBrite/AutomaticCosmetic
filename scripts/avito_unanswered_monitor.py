@@ -323,7 +323,19 @@ def sync_pending_followups(
 
         message_id = _message_id(message) or str(created)
         if _looks_like_bot_promise(text):
+            client_message = _latest_client_message_before(ordered, account_id=account_id, created_before=created)
+            client_text = _message_text(client_message) if client_message else ""
+            client_photo_urls = _photo_urls(client_message) if client_message else []
+            classification = _classify_client_message(client_text)
+            existing_key = _matching_open_promise_key(
+                pending,
+                active_keys,
+                bot_promise=text,
+                client_message=client_text,
+            )
             for key in list(active_keys):
+                if key == existing_key:
+                    continue
                 row = pending.get(key)
                 if not isinstance(row, dict) or row.get("business_resolved"):
                     continue
@@ -339,11 +351,7 @@ def sync_pending_followups(
                         }
                     )
                     active_keys.discard(key)
-            client_message = _latest_client_message_before(ordered, account_id=account_id, created_before=created)
-            client_text = _message_text(client_message) if client_message else ""
-            client_photo_urls = _photo_urls(client_message) if client_message else []
-            classification = _classify_client_message(client_text)
-            key = _followup_key(account_id=account_id, chat_id=chat_id, message_id=message_id)
+            key = existing_key or _followup_key(account_id=account_id, chat_id=chat_id, message_id=message_id)
             row = pending.get(key) if isinstance(pending.get(key), dict) else {}
             if _followup_row_is_manually_closed(row):
                 continue
@@ -431,6 +439,33 @@ def pending_followup_rows(state: dict[str, Any], *, now: int, include_resolved: 
         rows.append(item)
     rows.sort(key=lambda item: (0 if item.get("business_status") == "overdue" else 1, -int(item.get("urgent") is True), int(item.get("promised_at") or 0)))
     return rows
+
+
+def _matching_open_promise_key(
+    pending: dict[str, Any],
+    active_keys: set[str],
+    *,
+    bot_promise: str,
+    client_message: str,
+) -> str:
+    normalized_promise = _normalized_text(bot_promise)
+    normalized_client = _normalized_text(client_message)
+    if not normalized_promise:
+        return ""
+    for key in active_keys:
+        row = pending.get(key)
+        if not isinstance(row, dict) or row.get("business_resolved"):
+            continue
+        if _normalized_text(str(row.get("bot_promise") or "")) != normalized_promise:
+            continue
+        if normalized_client and _normalized_text(str(row.get("last_client_message") or "")) != normalized_client:
+            continue
+        return str(key)
+    return ""
+
+
+def _normalized_text(text: str) -> str:
+    return " ".join(str(text or "").casefold().replace("ё", "е").split())
 
 
 def _followup_row_is_manually_closed(row: dict[str, Any]) -> bool:
