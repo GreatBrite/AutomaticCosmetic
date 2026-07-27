@@ -1,0 +1,10 @@
+[Unit]
+Description=AutomaticCosmetic Olga manual task reminder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/AutomaticCosmetic
+Environment=PATH=/root/.local/bin:/root/AutomaticCosmetic/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/AutomaticCosmetic/.venv/bin/python /root/AutomaticCosmetic/scripts/send_olga_task_reminders.py

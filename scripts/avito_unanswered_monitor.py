@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -60,6 +61,7 @@ BOT_PROMISE_RE = re.compile(
     r"напишу точн(?:ый|ую)|подтверж(?:у|дим)|свер(?:ю|им)|передам|сейчас проверим)"
 )
 BOT_FINAL_RE = re.compile(r"(?iu)(подтвержден[ао]?|записал[аи]?|адрес[:\s]|принимаем по адресу|можете приходить|оплата|предоплата|стоимость)")
+UNANSWERED_ACTIONS = {"done", "stale", "later"}
 
 
 @dataclass(frozen=True)
@@ -447,6 +449,143 @@ def _state_key(item: UnansweredChat) -> str:
     return f"{item.account_id}:{item.chat_id}:{item.message_id}"
 
 
+def unanswered_token(key: str) -> str:
+    return hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()[:12]
+
+
+def unanswered_keyboard(key: str) -> dict[str, list[list[dict[str, str]]]]:
+    token = unanswered_token(key)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Закрыто", "callback_data": f"avun:{token}:done"},
+                {"text": "Не актуально", "callback_data": f"avun:{token}:stale"},
+            ],
+            [
+                {"text": "Напомнить позже", "callback_data": f"avun:{token}:later"},
+            ],
+        ]
+    }
+
+
+def parse_unanswered_callback(data: str) -> tuple[str, str] | None:
+    parts = str(data or "").split(":")
+    if len(parts) != 3 or parts[0] != "avun":
+        return None
+    token, action = parts[1].strip(), parts[2].strip()
+    if not token or action not in UNANSWERED_ACTIONS:
+        return None
+    return token, action
+
+
+def apply_unanswered_action(
+    *,
+    state_path: Path | str,
+    token: str,
+    action: str,
+    actor: str = "telegram_admin",
+    now: int | None = None,
+) -> dict[str, Any]:
+    parsed = parse_unanswered_callback(f"avun:{token}:{action}")
+    if parsed is None:
+        return {"ok": False, "reason": "invalid_callback"}
+    token, action = parsed
+    now_ts = int(time.time()) if now is None else int(now)
+    state = _load_state(Path(state_path))
+    refs = state.get("unanswered_alert_refs") if isinstance(state.get("unanswered_alert_refs"), dict) else {}
+    ref = refs.get(token) if isinstance(refs.get(token), dict) else {}
+    key = str(ref.get("key") or "").strip()
+    if not key:
+        return {"ok": False, "reason": "unanswered_not_found", "token": token, "action": action}
+    alerts = state.setdefault("alerts", {})
+    actions = state.setdefault("unanswered_actions", {})
+    if action == "later":
+        alerts[key] = {"last_alerted_at": now_ts, "chat_id": ref.get("chat_id"), "message_id": ref.get("message_id")}
+        actions[key] = {
+            "action": "later",
+            "status": "snoozed",
+            "actor": actor,
+            "updated_at": now_ts,
+            "chat_id": ref.get("chat_id"),
+            "message_id": ref.get("message_id"),
+        }
+    else:
+        reason = "not_relevant" if action == "stale" else "manual_closed"
+        handled = state.setdefault("handled", {})
+        handled[key] = {
+            "handled_at": now_ts,
+            "chat_id": ref.get("chat_id"),
+            "message_id": ref.get("message_id"),
+            "result": {
+                "ok": True,
+                "ignored": True,
+                "action": reason,
+                "reason": reason,
+                "actor": actor,
+            },
+        }
+        actions[key] = {
+            "action": action,
+            "status": reason,
+            "actor": actor,
+            "updated_at": now_ts,
+            "chat_id": ref.get("chat_id"),
+            "message_id": ref.get("message_id"),
+        }
+    _save_state(Path(state_path), state)
+    return {"ok": True, "token": token, "action": action, "key": key, "ref": ref, "state": state}
+
+
+def remember_unanswered_alert_ref(state: dict[str, Any], item: UnansweredChat) -> dict[str, Any]:
+    key = _state_key(item)
+    token = unanswered_token(key)
+    refs = state.setdefault("unanswered_alert_refs", {})
+    ref = {
+        "key": key,
+        "token": token,
+        "account_id": item.account_id,
+        "chat_id": item.chat_id,
+        "message_id": item.message_id,
+        "client_name": item.client_name,
+        "listing_title": item.listing_title,
+        "listing_city": item.listing_city,
+        "created": item.created,
+        "updated_at": int(time.time()),
+    }
+    refs[token] = ref
+    return ref
+
+
+def unanswered_card_text(item: UnansweredChat) -> str:
+    age_min = int(item.age_seconds / 60)
+    lines = [
+        "Avito: клиент ждёт ответа",
+        f"Клиент: {item.client_name or item.chat_id}",
+        f"Сколько висит: {age_min} мин",
+        f"Важность: {'КРИТИЧНО' if item.severity == 'critical' else 'нужно действие'}",
+    ]
+    listing = " | ".join(part for part in (item.listing_city, item.listing_title) if part)
+    if listing:
+        lines.append(f"Объявление: {listing}")
+    text = " ".join(str(item.text or "").split())
+    if len(text) > 260:
+        text = text[:257].rstrip() + "..."
+    lines.append(f"Последнее от клиента: {text}")
+    lines.append("Нужно сделать: ответить клиенту в Avito или закрыть чат как неактуальный.")
+    lines.append(f"Avito chat_id: {item.chat_id}")
+    return "\n".join(lines)
+
+
+def _unanswered_item_suppressed_by_state(item: UnansweredChat, state: dict[str, Any]) -> bool:
+    handled = state.get("handled") if isinstance(state.get("handled"), dict) else {}
+    row = handled.get(_state_key(item)) if isinstance(handled, dict) else None
+    if not isinstance(row, dict):
+        return False
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    stale_ack = item.needs_action and result.get("ignored") and result.get("reason") == "client_ack_after_pending_reply"
+    return not stale_ack
+
+
 def _report_item(item: UnansweredChat, state: dict[str, Any]) -> dict[str, Any]:
     key = _state_key(item)
     data = item.to_dict()
@@ -795,6 +934,8 @@ async def main() -> None:
     parser.add_argument("--max-alert-items", type=int, default=None)
     parser.add_argument("--followup-token", default="", help="Apply an admin action to a pending followup by token, or pass the full state key.")
     parser.add_argument("--followup-action", choices=("done", "stale", "urgent", "later"), default="done")
+    parser.add_argument("--unanswered-token", default="", help="Apply an admin action to an unanswered Avito alert by token.")
+    parser.add_argument("--unanswered-action", choices=("done", "stale", "later"), default="stale")
     parser.add_argument("--followup-actor", default="cli")
     parser.add_argument("--state-path", type=Path, default=Path(os.getenv("AVITO_UNANSWERED_STATE_PATH", str(DEFAULT_STATE_PATH))))
     parser.add_argument("--report-path", type=Path, default=Path(os.getenv("AVITO_UNANSWERED_REPORT_PATH", str(DEFAULT_REPORT_PATH))))
@@ -818,6 +959,15 @@ async def main() -> None:
             state_path=args.state_path,
             token=token,
             action=args.followup_action,
+            actor=args.followup_actor,
+        )
+        print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+        return
+    if args.unanswered_token:
+        result = apply_unanswered_action(
+            state_path=args.state_path,
+            token=args.unanswered_token,
+            action=args.unanswered_action,
             actor=args.followup_actor,
         )
         print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
@@ -869,7 +1019,7 @@ async def main() -> None:
             notified = 0
             followup_notified = 0
             autoreply = {}
-            actionable_items = [item for item in items if item.needs_action]
+            actionable_items = [item for item in items if item.needs_action and not _unanswered_item_suppressed_by_state(item, state)]
             if notifier and actionable_items:
                 alerts = state.setdefault("alerts", {})
                 fresh: list[UnansweredChat] = []
@@ -880,8 +1030,10 @@ async def main() -> None:
                         fresh.append(item)
                         alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
                 if fresh:
-                    await notifier.notify_text(_format_alert(fresh, max_items=max_alert_items))
-                    notified = len(fresh)
+                    for item in fresh[:max_alert_items]:
+                        ref = remember_unanswered_alert_ref(state, item)
+                        await notifier.notify_text(unanswered_card_text(item), reply_markup=unanswered_keyboard(str(ref.get("key") or "")))
+                    notified = min(len(fresh), max_alert_items)
 
             followup_alert_rows = [row for row in followups if row.get("overdue") or row.get("severity") == "critical"]
             followup_alert_rows = [row for row in followup_alert_rows if int(row.get("snoozed_until") or 0) <= now]
@@ -926,9 +1078,8 @@ async def main() -> None:
                 _save_state(args.state_path, state)
 
             handoff_sla = {}
-            if settings.handoff_notify_enabled:
-                sla_notifier = notifier or handoff_notifier_from_settings(settings)
-                handoff_sla = await process_handoff_sla(sla_notifier)
+            if notify_enabled and notifier and settings.handoff_notify_enabled:
+                handoff_sla = await process_handoff_sla(notifier)
 
             summary = {
                 "ok": True,

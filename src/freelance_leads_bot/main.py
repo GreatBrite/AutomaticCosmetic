@@ -76,6 +76,14 @@ from .integrations.handoff_refs import (
     update_handoff_status,
 )
 from .integrations.handoff_notify import _download_photo_url, handoff_notifier_from_settings
+from .integrations.olga_manual_tasks import (
+    apply_olga_manual_task_action,
+    format_olga_manual_task_card,
+    olga_manual_task_keyboard,
+    open_olga_manual_tasks,
+    parse_olga_manual_task_callback,
+    remember_olga_manual_task_delivery,
+)
 from .integrations.telegram_client_topics import get_or_create_client_topic, topic_request_from_avito_followup
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
@@ -89,6 +97,7 @@ from .integrations.telegram_admin_bot import (
     _history_user_content,
     _largest_telegram_photo,
 )
+from scripts.avito_unanswered_monitor import apply_unanswered_action, parse_unanswered_callback
 from .mfa import delete_totp_secret, mfa_code_text, mfa_status, save_totp_secret
 from .miniapp import start_miniapp_server
 from .scanner import scan
@@ -118,6 +127,7 @@ HELP = """Команды:
 /full_live_on - включить все live-флаги
 /full_live_off - выключить все live-флаги
 /olga_history - последние handoff-карточки для Ольги/админа
+/olga_tasks - ручные задачи Ольги по темам
 /open_cards - незакрытые handoff-карточки Ольги/админа
 /visit_confirmations - карточки проверки сегодняшних визитов для допродаж
 /care_followups - карточки due-задач отдела заботы
@@ -289,6 +299,9 @@ def feature_flags_keyboard() -> dict:
             {"text": "Открытые карточки", "callback_data": "open_cards"},
         ],
         [
+            {"text": "Задачи Ольги", "callback_data": "olga_tasks"},
+        ],
+        [
             {"text": "Avito обещания", "callback_data": "avito_followups"},
         ],
         [
@@ -318,6 +331,7 @@ def olga_history_keyboard() -> dict:
         "inline_keyboard": [
             [
                 {"text": "Обновить", "callback_data": "olga_history"},
+                {"text": "Задачи", "callback_data": "olga_tasks"},
                 {"text": "Открытые", "callback_data": "open_cards"},
                 {"text": "Меню", "callback_data": "menu"},
             ]
@@ -330,6 +344,7 @@ def open_cards_keyboard() -> dict:
         "inline_keyboard": [
             [
                 {"text": "Обновить", "callback_data": "open_cards"},
+                {"text": "Задачи", "callback_data": "olga_tasks"},
                 {"text": "История", "callback_data": "olga_history"},
                 {"text": "Меню", "callback_data": "menu"},
             ]
@@ -1742,6 +1757,75 @@ def send_avito_followup_media(
     return sent
 
 
+def send_olga_manual_task_cards(
+    bot: TelegramBot,
+    chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    *,
+    limit: int = 20,
+) -> int:
+    rows = open_olga_manual_tasks()
+    if not rows:
+        bot.send_message(chat_id, "Ручных задач для Ольги сейчас нет.", **(topic_params or {}))
+        return 0
+    bot.send_message(chat_id, f"<b>Ручные задачи для Ольги</b>\nОткрытых задач: {len(rows)}.", **(topic_params or {}))
+    sent = 0
+    for row in rows[:limit]:
+        task_id = str(row.get("task_id") or "")
+        response = bot.send_message(
+            chat_id,
+            escape(format_olga_manual_task_card(row)),
+            reply_markup=olga_manual_task_keyboard(task_id) if task_id else None,
+            **(topic_params or {}),
+        )
+        message_id = str((response.get("result") or {}).get("message_id") or "")
+        if task_id and message_id:
+            remember_olga_manual_task_delivery(
+                task_id=task_id,
+                telegram_chat_id=chat_id,
+                telegram_message_id=message_id,
+                telegram_message_thread_id=str((topic_params or {}).get("message_thread_id") or ""),
+                reminded=True,
+            )
+        sent += 1
+    if len(rows) > limit:
+        bot.send_message(chat_id, f"Показала {limit} из {len(rows)} задач.", **(topic_params or {}))
+    return sent
+
+
+def handle_olga_manual_task_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+) -> bool:
+    parsed = parse_olga_manual_task_callback(data)
+    if parsed is None:
+        return False
+    task_id, action = parsed
+    result = apply_olga_manual_task_action(task_id=task_id, action=action, actor="telegram_admin")
+    if not result.get("ok"):
+        bot.answer_callback_query(callback_id, "Задача не найдена")
+        bot.send_message(telegram_chat_id, "Не нашла эту задачу. Возможно, она уже закрыта или state обновился.", **(topic_params or {}))
+        return True
+    labels = {
+        "done": "Готово",
+        "stale": "Не актуально",
+        "help": "Отмечено: нужна помощь",
+        "later": "Напомню позже",
+    }
+    row = result.get("row") if isinstance(result.get("row"), dict) else {}
+    bot.answer_callback_query(callback_id, labels.get(action, "Готово"))
+    bot.send_message(
+        telegram_chat_id,
+        escape(f"{labels.get(action, 'Готово')}: {row.get('title') or task_id}"),
+        **(topic_params or {}),
+    )
+    return True
+
+
 def _avito_followup_media_urls(row: dict) -> list[str]:
     urls: list[str] = []
     for key in ("last_client_photo_urls", "last_client_media_urls", "photo_urls", "media_urls"):
@@ -1789,6 +1873,43 @@ def handle_avito_followup_callback(
     bot.send_message(
         telegram_chat_id,
         escape(f"{labels.get(action, 'Готово')}: {row.get('client_name') or row.get('chat_id') or 'Avito-обещание'}"),
+        **(topic_params or {}),
+    )
+    return True
+
+
+def handle_avito_unanswered_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    state_path: Path | str = AVITO_UNANSWERED_STATE_PATH,
+) -> bool:
+    parsed = parse_unanswered_callback(data)
+    if parsed is None:
+        return False
+    token, action = parsed
+    result = apply_unanswered_action(state_path=state_path, token=token, action=action, actor="telegram_admin")
+    if not result.get("ok"):
+        bot.answer_callback_query(callback_id, "Чат не найден")
+        bot.send_message(
+            telegram_chat_id,
+            "Не нашла этот Avito-чат в текущем state. Возможно, карточка старая или state уже обновился.",
+            **(topic_params or {}),
+        )
+        return True
+    labels = {
+        "done": "Закрыто",
+        "stale": "Не актуально",
+        "later": "Напомню позже",
+    }
+    ref = result.get("ref") if isinstance(result.get("ref"), dict) else {}
+    bot.answer_callback_query(callback_id, labels.get(action, "Готово"))
+    bot.send_message(
+        telegram_chat_id,
+        escape(f"{labels.get(action, 'Готово')}: {ref.get('client_name') or ref.get('chat_id') or 'Avito-чат'}"),
         **(topic_params or {}),
     )
     return True
@@ -2461,6 +2582,7 @@ def menu_text(store: LeadStore) -> str:
         "Auth: /codex_auth, /codex_login, /codex_logout\n"
         "MFA: /mfa, /mfa_status, /mfa_set, /mfa_delete\n"
         "История Ольги: /olga_history\n"
+        "Задачи Ольги: /olga_tasks\n"
         "Avito обещания: /avito_followups\n"
         "Флаги: /flags, /full_live_on, /full_live_off или команды ниже\n\n"
         + "\n".join(
@@ -3094,9 +3216,41 @@ def serve(settings: Settings) -> None:
                         topic_params=callback_topic_params,
                     ):
                         continue
+                if data.startswith("avun:"):
+                    callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
+                        callback,
+                        settings.telegram_chat_id,
+                        str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
+                    )
+                    if handle_avito_unanswered_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
+                if data.startswith("olgatask:"):
+                    callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
+                        callback,
+                        settings.telegram_chat_id,
+                        str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
+                    )
+                    if handle_olga_manual_task_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
                 if data == "olga_history":
                     bot.answer_callback_query(callback_id, "История Ольги")
                     bot.send_message(callback_chat_id, format_olga_history(), reply_markup=olga_history_keyboard(), **callback_topic_params)
+                    continue
+                if data == "olga_tasks":
+                    bot.answer_callback_query(callback_id, "Задачи Ольги")
+                    send_olga_manual_task_cards(bot, callback_chat_id, callback_topic_params)
                     continue
                 if data == "open_cards":
                     bot.answer_callback_query(callback_id, "Открытые карточки")
@@ -3358,6 +3512,8 @@ def serve(settings: Settings) -> None:
                 bot.send_message(reply_chat_id, set_all_feature_flags(True, store=store), reply_markup=feature_flags_keyboard(), **topic_params)
             elif text.startswith("/full_live_off"):
                 bot.send_message(reply_chat_id, set_all_feature_flags(False, store=store), reply_markup=feature_flags_keyboard(), **topic_params)
+            elif text.startswith("/olga_tasks") or text.startswith("/tasks_olga"):
+                send_olga_manual_task_cards(bot, reply_chat_id, topic_params)
             elif text.startswith("/olga_history") or text.startswith("/olga"):
                 bot.send_message(reply_chat_id, format_olga_history(), reply_markup=olga_history_keyboard(), **topic_params)
             elif text.startswith("/open_cards") or text.startswith("/open"):

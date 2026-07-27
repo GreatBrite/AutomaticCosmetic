@@ -127,6 +127,15 @@ from src.freelance_leads_bot.integrations.ops_status import (
     read_telegram_handoff_status,
     report_data,
 )
+from src.freelance_leads_bot.integrations.olga_manual_tasks import (
+    apply_olga_manual_task_action,
+    due_olga_manual_tasks,
+    ensure_default_olga_manual_tasks,
+    format_olga_manual_task_card,
+    olga_manual_task_keyboard,
+    open_olga_manual_tasks,
+    parse_olga_manual_task_callback,
+)
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, review_suggestion, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
@@ -165,14 +174,20 @@ from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntent
 from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
 from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
 from scripts.avito_unanswered_monitor import (
+    UnansweredChat,
+    apply_unanswered_action,
     _find_unanswered as find_unanswered_avito_chat,
     _format_alert as format_unanswered_alert,
     _format_followup_alert as format_pending_followup_alert,
     _report_item as report_unanswered_item,
+    remember_unanswered_alert_ref,
     audit_once as audit_unanswered_once,
     autoreply_once as autoreply_unanswered_once,
     pending_followup_rows,
+    parse_unanswered_callback,
     sync_pending_followups,
+    unanswered_keyboard,
+    unanswered_token,
 )
 from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
 from scripts.avito_missed_message_poller import _dedup_allowed as missed_poller_dedup_allowed
@@ -8072,6 +8087,80 @@ def test_unanswered_monitor_report_reopens_stale_ack_for_actionable_text() -> No
     assert row["severity"] == "critical"
 
 
+def test_unanswered_alert_not_relevant_button_marks_message_handled(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    item = UnansweredChat(
+        account_id=1,
+        chat_id="chat-old",
+        client_name="Анна",
+        message_id="m-old",
+        message_type="text",
+        text="Уже не актуально",
+        created=1000,
+        age_seconds=3600,
+    )
+    state = {"handled": {}, "alerts": {}}
+    ref = remember_unanswered_alert_ref(state, item)
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    token = unanswered_token("1:chat-old:m-old")
+
+    assert ref["token"] == token
+    assert parse_unanswered_callback(f"avun:{token}:stale") == (token, "stale")
+    assert unanswered_keyboard("1:chat-old:m-old")["inline_keyboard"][0][1]["callback_data"] == f"avun:{token}:stale"
+
+    result = apply_unanswered_action(state_path=state_path, token=token, action="stale", now=2000)
+    updated = json.loads(state_path.read_text(encoding="utf-8"))
+    row = report_unanswered_item(item, updated)
+
+    assert result["ok"] is True
+    assert updated["handled"]["1:chat-old:m-old"]["result"]["reason"] == "not_relevant"
+    assert row["autoreply_state"] == "handled"
+    assert row["needs_action"] is False
+
+
+def test_main_avito_unanswered_callback_handles_stale(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self):
+            self.answers = []
+            self.messages = []
+
+        def answer_callback_query(self, callback_id, text):
+            self.answers.append((callback_id, text))
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    state_path = tmp_path / "state.json"
+    item = UnansweredChat(
+        account_id=1,
+        chat_id="chat-old",
+        client_name="Анна",
+        message_id="m-old",
+        message_type="text",
+        text="Неактуально",
+        created=1000,
+        age_seconds=3600,
+    )
+    state = {"handled": {}, "alerts": {}}
+    remember_unanswered_alert_ref(state, item)
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    bot = FakeBot()
+    handled = main_module.handle_avito_unanswered_callback(
+        bot=bot,
+        callback_id="cb-1",
+        data=f"avun:{unanswered_token('1:chat-old:m-old')}:stale",
+        telegram_chat_id="admin",
+        state_path=state_path,
+    )
+    updated = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert handled is True
+    assert bot.answers == [("cb-1", "Не актуально")]
+    assert updated["handled"]["1:chat-old:m-old"]["result"]["reason"] == "not_relevant"
+
+
 def test_unanswered_monitor_classifies_final_ack_as_not_actionable() -> None:
     chat = {"id": "chat-ack", "users": [{"id": 10, "name": "Анна"}]}
     for text in ("Спасибо большое", "Хорошо 🌸", "Спасибо не надо я хотела первый раз попробовать"):
@@ -12221,3 +12310,76 @@ async def test_avito_sdk_sender_file_reports_caption_failure(tmp_path) -> None:
     assert result["reason"] == "caption_send_failed"
     assert result["image_id"] == "img-1"
     assert result["caption_result"]["error"] == "caption down"
+
+
+def test_olga_manual_tasks_seed_once_and_callbacks(tmp_path) -> None:
+    path = tmp_path / "olga_manual_tasks.json"
+
+    first = ensure_default_olga_manual_tasks(path, now=1000)
+    second = ensure_default_olga_manual_tasks(path, now=2000)
+
+    assert len(first["created"]) == 6
+    assert second["created"] == []
+    rows = open_olga_manual_tasks(path, seed=False)
+    assert len(rows) == 6
+    assert "Avito" in format_olga_manual_task_card(rows[0])
+    callback = olga_manual_task_keyboard("avito_clients")["inline_keyboard"][0][0]["callback_data"]
+    assert parse_olga_manual_task_callback(callback) == ("avito_clients", "done")
+
+    done = apply_olga_manual_task_action(path=path, task_id="avito_clients", action="done", now=3000)
+    assert done["ok"] is True
+    assert done["row"]["status"] == "done"
+    assert len(open_olga_manual_tasks(path, seed=False)) == 5
+    assert all(row["task_id"] != "avito_clients" for row in due_olga_manual_tasks(path, now=20000, seed=False))
+
+
+def test_olga_manual_task_help_and_later_keep_task_open(tmp_path) -> None:
+    path = tmp_path / "olga_manual_tasks.json"
+    ensure_default_olga_manual_tasks(path, now=1000)
+
+    help_result = apply_olga_manual_task_action(path=path, task_id="prices_services", action="help", now=2000)
+    assert help_result["ok"] is True
+    assert help_result["row"]["status"] == "needs_help"
+    assert help_result["row"]["last_reminded_at"] == 2000
+    assert due_olga_manual_tasks(path, now=2000 + 3 * 60 * 60 - 1, seed=False) == [
+        row for row in due_olga_manual_tasks(path, now=2000 + 3 * 60 * 60 - 1, seed=False) if row["task_id"] != "prices_services"
+    ]
+
+    later = apply_olga_manual_task_action(path=path, task_id="prices_services", action="later", now=3000)
+    assert later["ok"] is True
+    assert later["row"]["status"] == "open"
+    assert later["row"]["last_reminded_at"] == 3000
+    due_ids = {row["task_id"] for row in due_olga_manual_tasks(path, now=3000 + 3 * 60 * 60, seed=False)}
+    assert "prices_services" in due_ids
+
+
+def test_olga_task_reminder_sends_due_only_after_success(tmp_path) -> None:
+    from scripts.send_olga_task_reminders import send_olga_task_reminders_once
+
+    class FakeBot:
+        def __init__(self, fail_first: bool = False):
+            self.fail_first = fail_first
+            self.messages = []
+
+        def send_message(self, chat_id, text, reply_markup=None):
+            if self.fail_first:
+                self.fail_first = False
+                raise RuntimeError("telegram down")
+            self.messages.append((chat_id, text, reply_markup))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    path = tmp_path / "olga_manual_tasks.json"
+    ensure_default_olga_manual_tasks(path, now=1000)
+
+    failed = send_olga_task_reminders_once(bot=FakeBot(fail_first=True), chat_id="admin", path=path, now=1000, limit=1)
+    assert failed["ok"] is False
+    assert failed["sent"] == 0
+    assert due_olga_manual_tasks(path, now=1000, seed=False)[0]["last_reminded_at"] == 0
+
+    bot = FakeBot()
+    sent = send_olga_task_reminders_once(bot=bot, chat_id="admin", path=path, now=1000, limit=1)
+    assert sent["ok"] is True
+    assert sent["sent"] == 1
+    assert len(bot.messages) == 1
+    assert "Напоминание" in bot.messages[0][1]
+    assert due_olga_manual_tasks(path, now=1000 + 3 * 60 * 60 - 1, seed=False)[0]["task_id"] != "avito_clients"
