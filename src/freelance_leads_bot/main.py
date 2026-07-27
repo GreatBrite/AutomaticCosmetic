@@ -84,6 +84,7 @@ from .integrations.olga_manual_tasks import (
     parse_olga_manual_task_callback,
     remember_olga_manual_task_delivery,
 )
+from .integrations.rag_manual_review import apply_rag_manual_review_action, parse_rag_manual_review_callback
 from .integrations.telegram_client_topics import get_or_create_client_topic, topic_request_from_avito_followup
 from .integrations.codex_review import sanitize_consultation_language
 from .integrations.roles import telegram_role_for_user
@@ -1826,6 +1827,39 @@ def handle_olga_manual_task_callback(
     return True
 
 
+def handle_rag_manual_review_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    telegram_chat_id: str,
+    settings: IntegrationSettings,
+    topic_params: dict[str, str] | None = None,
+) -> bool:
+    parsed = parse_rag_manual_review_callback(data)
+    if parsed is None:
+        return False
+    item_id, action = parsed
+    result = apply_rag_manual_review_action(
+        store=ExpertRagStore(settings.rag_expert_db_path),
+        item_id=item_id,
+        action=action,
+        actor="telegram_admin",
+    )
+    if not result.get("ok"):
+        bot.answer_callback_query(callback_id, "RAG-запись не найдена")
+        bot.send_message(telegram_chat_id, "Не нашла эту RAG-запись. Возможно, она уже изменена.", **(topic_params or {}))
+        return True
+    labels = {
+        "keep": "Оставлено для автоответа",
+        "block": "Автоответ выключен",
+        "edit": "Отмечено: нужна правка",
+    }
+    bot.answer_callback_query(callback_id, labels.get(action, "Готово"))
+    bot.send_message(telegram_chat_id, escape(f"{labels.get(action, 'Готово')}: RAG #{item_id}"), **(topic_params or {}))
+    return True
+
+
 def _avito_followup_media_urls(row: dict) -> list[str]:
     urls: list[str] = []
     for key in ("last_client_photo_urls", "last_client_media_urls", "photo_urls", "media_urls"):
@@ -3169,6 +3203,21 @@ def serve(settings: Settings) -> None:
                         callback_id=callback_id,
                         data=data,
                         service=codex_tool_service,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
+                if data.startswith("ragreview:"):
+                    callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
+                        callback,
+                        settings.telegram_chat_id,
+                        str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
+                    )
+                    if handle_rag_manual_review_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        settings=integration_settings,
                         telegram_chat_id=callback_chat_id,
                         topic_params=callback_topic_params,
                     ):

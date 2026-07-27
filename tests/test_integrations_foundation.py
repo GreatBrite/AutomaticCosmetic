@@ -136,6 +136,12 @@ from src.freelance_leads_bot.integrations.olga_manual_tasks import (
     open_olga_manual_tasks,
     parse_olga_manual_task_callback,
 )
+from src.freelance_leads_bot.integrations.rag_manual_review import (
+    apply_rag_manual_review_action,
+    format_rag_manual_review_card,
+    parse_rag_manual_review_callback,
+    rag_manual_review_keyboard,
+)
 from src.freelance_leads_bot.integrations.prelaunch import build_prelaunch_report
 from src.freelance_leads_bot.integrations.expert_rag_review import DEFAULT_AUDIT_LOG_PATH, review_suggestion, run_review_command, resolve_audit_log_path
 import src.freelance_leads_bot.integrations.roles as roles_module
@@ -7907,6 +7913,75 @@ def test_expert_rag_review_temporal_cleanup_markdown_decisions_dry_run_and_apply
     assert "temporal_cleanup_decision" in audit_path.read_text(encoding="utf-8")
 
 
+def test_rag_manual_review_buttons_apply_metadata_decisions(tmp_path) -> None:
+    db_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Скиньте свой номер",
+        answer_client="Оставьте, пожалуйста, ваш номер телефона, и Ольга свяжется с вами.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+
+    callback = rag_manual_review_keyboard(item.id)["inline_keyboard"][0][1]["callback_data"]
+    assert parse_rag_manual_review_callback(callback) == (item.id, "block")
+    assert "RAG: нужна проверка" in format_rag_manual_review_card(item)
+
+    blocked = apply_rag_manual_review_action(store=store, item_id=item.id, action="block", actor="admin")
+    assert blocked["ok"] is True
+    assert store.get(item.id).metadata["autoanswer_allowed"] is False  # type: ignore[union-attr]
+
+    kept = apply_rag_manual_review_action(store=store, item_id=item.id, action="keep", actor="admin")
+    assert kept["ok"] is True
+    assert store.get(item.id).metadata["autoanswer_allowed"] is True  # type: ignore[union-attr]
+
+    edited = apply_rag_manual_review_action(store=store, item_id=item.id, action="edit", actor="admin")
+    updated = store.get(item.id)
+    assert edited["ok"] is True
+    assert updated is not None
+    assert updated.metadata["autoanswer_allowed"] is False
+    assert updated.metadata["needs_olga_rewrite"] is True
+
+
+def test_main_rag_manual_review_callback_handles_block(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self):
+            self.answers = []
+            self.messages = []
+
+        def answer_callback_query(self, callback_id, text):
+            self.answers.append((callback_id, text))
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    db_path = tmp_path / "expert.sqlite3"
+    store = ExpertRagStore(db_path)
+    item = store.upsert_from_handoff(
+        question="Скиньте свой номер",
+        answer_client="Оставьте, пожалуйста, ваш номер телефона, и Ольга свяжется с вами.",
+        status=APPROVED,
+        approved_by="olga",
+        metadata={"autoanswer_allowed": True},
+    )
+    settings = replace(_settings(), rag_expert_db_path=db_path)
+    bot = FakeBot()
+
+    handled = main_module.handle_rag_manual_review_callback(
+        bot=bot,
+        callback_id="cb-1",
+        data=f"ragreview:{item.id}:block",
+        telegram_chat_id="admin",
+        settings=settings,
+    )
+
+    assert handled is True
+    assert bot.answers == [("cb-1", "Автоответ выключен")]
+    assert store.get(item.id).metadata["autoanswer_allowed"] is False  # type: ignore[union-attr]
+
+
 def test_expert_rag_review_temporal_cleanup_decisions_reject_invalid_without_partial_apply(tmp_path) -> None:
     db_path = tmp_path / "expert.sqlite3"
     audit_path = tmp_path / "audit.jsonl"
@@ -10559,7 +10634,7 @@ def test_codex_planner_prompt_and_json_parser() -> None:
     assert "фото до/после" in prompt
     assert "тихую задачу" in prompt
     assert "подтверждённое решение" in prompt
-    assert "Не предлагай очную консультацию" in prompt
+    assert "Не склоняй клиента на консультацию" in prompt
     assert "Если уже есть оценка Ольги/подтверждённое решение" in prompt
     assert "Прайс единый для всех городов" in prompt
     assert "Города приёма фиксированы" in prompt
@@ -10695,7 +10770,7 @@ def test_codex_review_prompt_checks_internals_offtopic_and_unconfirmed_facts() -
     assert "выдуманный адрес" in prompt
     assert "Codex/tool/handoff" in prompt
     assert "оффтопик" in prompt
-    assert "Не спамь онлайн-консультацией" in prompt
+    assert "Не спамь консультацией" in prompt
     assert "оценка Ольги" in prompt
     assert "Прайс единый для всех городов" in prompt
     assert "Города приёма фиксированы" in prompt
