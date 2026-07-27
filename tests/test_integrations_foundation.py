@@ -9386,6 +9386,16 @@ def test_extract_date_ignores_invalid_dates() -> None:
     assert extract_date("Запишите на 2026-99-15", today=date(2026, 7, 1)) == ""
 
 
+def test_extract_date_accepts_russian_business_smoke_phrases() -> None:
+    today = date(2026, 7, 27)
+
+    assert extract_date("Давайте 30 июля днём", today=today) == "2026-07-30"
+    assert extract_date("Можно 30-го в 14:00", today=today) == "2026-07-30"
+    assert extract_date("Запишите на 4 августа", today=today) == "2026-08-04"
+    assert extract_date("Завтра к 20:00", today=today) == "2026-07-28"
+    assert extract_date("Буду в городе только 10 сентября", today=today) == "2026-09-10"
+
+
 def test_avito_webhook_greets_empty_created_chat() -> None:
     processed_events.seen.clear()
     avito_app.dependency_overrides[get_settings] = lambda: _settings()
@@ -9596,13 +9606,13 @@ def test_avito_webhook_keeps_memory_per_avito_client(tmp_path) -> None:
     avito_app.dependency_overrides[get_history_store] = lambda: store
     try:
         client = TestClient(avito_app)
-        first = client.post("/avito/webhook?token=webhook", json={"type": "message", "message_id": "m1", "chat_id": "chat-memory", "text": "Можно на 30 мая?"})
+        first = client.post("/avito/webhook?token=webhook", json={"type": "message", "message_id": "m1", "chat_id": "chat-memory", "text": "Можно подробнее по процедуре?"})
         second = client.post("/avito/webhook?token=webhook", json={"type": "message", "message_id": "m2", "chat_id": "chat-memory", "text": "да"})
 
         assert first.status_code == 200
         assert second.status_code == 200
         assert histories[0] == []
-        assert any("Можно на 30 мая" in item["content"] for item in histories[1])
+        assert any("Можно подробнее по процедуре" in item["content"] for item in histories[1])
         saved = store.recent_codex_chat(10, "avito:client:chat-memory")
         assert [item["role"] for item in saved] == ["user", "assistant", "user", "assistant"]
     finally:

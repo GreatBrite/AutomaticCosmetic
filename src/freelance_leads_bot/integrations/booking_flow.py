@@ -15,6 +15,12 @@ from .yclients import YClientsGateway
 PHONE_RE = re.compile(r"(?:\+7|8)?[\s(.-]*(\d{3})[\s).-]*(\d{3})[\s.-]*(\d{2})[\s.-]*(\d{2})")
 DATE_ISO_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 DATE_DMY_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?\b")
+DATE_RU_MONTH_RE = re.compile(
+    r"(?iu)\b(\d{1,2})(?:[-\s]*(?:го|ого|е))?\s+"
+    r"(январ[яье]|феврал[яье]|март[ае]?|апрел[яье]|ма[йяе]|июн[яье]|июл[яье]|"
+    r"август[ае]?|сентябр[яье]|октябр[яье]|ноябр[яье]|декабр[яье])\b"
+)
+DATE_ORDINAL_DAY_RE = re.compile(r"(?iu)\b(\d{1,2})(?:[-\s]*(?:го|ого|е))\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.](\d{2})\b|\b(?:в\s*)?([01]?\d|2[0-3])\s*(?:час(?:а|ов)?|ч)\b")
 def _cities_text(cities: tuple[str, ...]) -> str:
     return cities_text(cities)
@@ -322,6 +328,41 @@ def extract_date(text: str, today: date | None = None) -> str:
             except ValueError:
                 return ""
         return candidate.isoformat()
+    match = DATE_RU_MONTH_RE.search(text)
+    if match:
+        day = int(match.group(1))
+        month = _ru_month_number(match.group(2))
+        if not month:
+            return ""
+        try:
+            candidate = date(current.year, month, day)
+        except ValueError:
+            return ""
+        if candidate < current:
+            try:
+                candidate = date(current.year + 1, month, day)
+            except ValueError:
+                return ""
+        return candidate.isoformat()
+    match = DATE_ORDINAL_DAY_RE.search(text)
+    if match:
+        day = int(match.group(1))
+        year = current.year
+        month = current.month
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return ""
+        if candidate < current:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                return ""
+        return candidate.isoformat()
     return ""
 
 
@@ -332,6 +373,30 @@ def extract_time(text: str) -> str:
     hour = match.group(1) or match.group(3)
     minute = match.group(2) or "00"
     return f"{int(hour):02d}:{int(minute):02d}"
+
+
+def _ru_month_number(value: str) -> int:
+    normalized = str(value or "").casefold().replace("ё", "е")
+    for index, prefixes in enumerate(
+        (
+            ("январ",),
+            ("феврал",),
+            ("март",),
+            ("апрел",),
+            ("май", "мая", "мае"),
+            ("июн",),
+            ("июл",),
+            ("август",),
+            ("сентябр",),
+            ("октябр",),
+            ("ноябр",),
+            ("декабр",),
+        ),
+        start=1,
+    ):
+        if any(normalized.startswith(prefix) for prefix in prefixes):
+            return index
+    return 0
 
 
 class _NoopBookingGateway:
