@@ -563,6 +563,9 @@ def _looks_like_final_outgoing_after_handoff(text: str) -> bool:
         "стоимость",
         "предоплат",
         "оплат",
+        "гарант",
+        "миграц",
+        "рассос",
     )
     return any(marker in normalized for marker in final_markers)
 

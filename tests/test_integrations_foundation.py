@@ -6484,38 +6484,56 @@ def test_avito_webhook_outgoing_final_answer_closes_open_handoff(tmp_path, monke
 
     history_store = LeadStore(tmp_path / "history.sqlite3")
     monkeypatch.setattr(avito_webhook_module, "update_latest_handoff_for_chat", fake_update_latest_handoff_for_chat)
-    processed_events.seen.clear()
-    avito_app.dependency_overrides[get_settings] = lambda: _settings()
-    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
-    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
-    avito_app.dependency_overrides[get_history_store] = lambda: history_store
-    event = {
-        "payload": {
-            "type": "message_created",
-            "value": {
-                "id": "out-final-1",
-                "chat_id": "chat-handoff",
-                "direction": "out",
-                "content": {"text": "Ближайшее время есть на 29, 30 и 31 июля. Адрес отправлю после записи."},
-            },
-        }
-    }
-    try:
-        client = TestClient(avito_app)
-        response = client.post("/avito/webhook?token=webhook", json=event)
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="1",
+        chat_id="chat-handoff",
+        message_id="out-final-1",
+        text="Ближайшее время есть на 29, 30 и 31 июля. Адрес отправлю после записи.",
+        metadata={"direction": "out"},
+    )
 
-        assert response.status_code == 200
-        assert response.json()["ignored"] is True
-        assert response.json()["reason"] == "not_incoming"
-        assert response.json()["manual_outgoing"]["remembered"] is True
-        assert response.json()["manual_outgoing"]["closed_handoff"] is True
-        assert closed == [("chat-handoff", "closed")]
-        history = history_store.recent_codex_chat(5, "avito:client:chat-handoff")
-        assert history[-1]["role"] == "assistant"
-        assert "29, 30 и 31 июля" in history[-1]["content"]
-    finally:
-        avito_app.dependency_overrides.clear()
-        processed_events.seen.clear()
+    result = avito_webhook_module._remember_manual_avito_outgoing_if_needed(message, _settings(), history_store, "not_incoming")
+
+    assert result["remembered"] is True
+    assert result["closed_handoff"] is True
+    assert closed == [("chat-handoff", "closed")]
+    history = history_store.recent_codex_chat(5, "avito:client:chat-handoff")
+    assert history[-1]["role"] == "assistant"
+    assert "29, 30 и 31 июля" in history[-1]["content"]
+
+
+def test_avito_webhook_outgoing_voice_consultation_closes_open_handoff(tmp_path, monkeypatch) -> None:
+    import src.freelance_leads_bot.integrations.avito_webhook as avito_webhook_module
+
+    closed: list[tuple[str, str]] = []
+
+    def fake_update_latest_handoff_for_chat(chat_id: str, status: str) -> str:
+        closed.append((chat_id, status))
+        return "handoff-voice-1"
+
+    history_store = LeadStore(tmp_path / "history.sqlite3")
+    monkeypatch.setattr(avito_webhook_module, "update_latest_handoff_for_chat", fake_update_latest_handoff_for_chat)
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="1",
+        chat_id="chat-handoff",
+        message_id="out-voice-final-1",
+        text="Никто не даст гарантию, что препарат не мигрирует или не рассосется раньше срока.",
+        metadata={"direction": "out", "message_type": "voice", "voice_transcribed": True},
+    )
+
+    result = avito_webhook_module._remember_manual_avito_outgoing_if_needed(message, _settings(), history_store, "not_incoming")
+
+    assert result["remembered"] is True
+    assert result["closed_handoff"] is True
+    assert closed == [("chat-handoff", "closed")]
+    history = history_store.recent_codex_chat(5, "avito:client:chat-handoff")
+    assert history[-1]["role"] == "assistant"
+    assert "гарантию" in history[-1]["content"]
+
 
 
 def test_avito_webhook_outgoing_promise_does_not_close_handoff(tmp_path, monkeypatch) -> None:
@@ -6524,33 +6542,21 @@ def test_avito_webhook_outgoing_promise_does_not_close_handoff(tmp_path, monkeyp
     closed: list[tuple[str, str]] = []
     history_store = LeadStore(tmp_path / "history.sqlite3")
     monkeypatch.setattr(avito_webhook_module, "update_latest_handoff_for_chat", lambda chat_id, status: closed.append((chat_id, status)) or "handoff-1")
-    processed_events.seen.clear()
-    avito_app.dependency_overrides[get_settings] = lambda: _settings()
-    avito_app.dependency_overrides[get_booking] = lambda: DryRunYClientsGateway()
-    avito_app.dependency_overrides[get_sender] = lambda: PreviewAvitoSender()
-    avito_app.dependency_overrides[get_history_store] = lambda: history_store
-    event = {
-        "payload": {
-            "type": "message_created",
-            "value": {
-                "id": "out-promise-1",
-                "chat_id": "chat-handoff",
-                "direction": "out",
-                "content": {"text": "Уточню свободное время и напишу вам."},
-            },
-        }
-    }
-    try:
-        client = TestClient(avito_app)
-        response = client.post("/avito/webhook?token=webhook", json=event)
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", tmp_path / "promise_state.json")
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="1",
+        chat_id="chat-handoff",
+        message_id="out-promise-1",
+        text="Уточню свободное время и напишу вам.",
+        metadata={"direction": "out"},
+    )
 
-        assert response.status_code == 200
-        assert response.json()["manual_outgoing"]["remembered"] is True
-        assert response.json()["manual_outgoing"]["closed_handoff"] is False
-        assert closed == []
-    finally:
-        avito_app.dependency_overrides.clear()
-        processed_events.seen.clear()
+    result = avito_webhook_module._remember_manual_avito_outgoing_if_needed(message, _settings(), history_store, "not_incoming")
+
+    assert result["remembered"] is True
+    assert result["closed_handoff"] is False
+    assert closed == []
 
 
 def test_avito_webhook_ignores_deleted_messages() -> None:
