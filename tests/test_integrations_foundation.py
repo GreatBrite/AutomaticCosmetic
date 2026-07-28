@@ -83,6 +83,7 @@ from src.freelance_leads_bot.integrations.avito_media import enrich_reply_handof
 from src.freelance_leads_bot.integrations.avito_followup_admin import (
     apply_pending_followup_action,
     parse_pending_followup_callback,
+    pending_followup_card_text,
     pending_followup_keyboard,
     pending_followup_token,
 )
@@ -8521,26 +8522,29 @@ def test_pending_followup_sync_reuses_matching_webhook_promise() -> None:
 
 
 def test_pending_followup_alert_includes_business_context_and_action() -> None:
+    row = {
+        "chat_id": "chat-followup",
+        "client_name": "Анна",
+        "business_status": "overdue",
+        "severity": "critical",
+        "age_seconds": 5400,
+        "listing_city": "Геленджик",
+        "listing_title": "Увеличение губ",
+        "bot_promise": "Уточню точный адрес и напишу вам.",
+        "client_waits_for": "booking_ambiguous",
+        "last_client_message": "Жду адрес",
+    }
     text = format_pending_followup_alert(
-        [
-            {
-                "chat_id": "chat-followup",
-                "client_name": "Анна",
-                "business_status": "overdue",
-                "severity": "critical",
-                "age_seconds": 5400,
-                "listing_city": "Геленджик",
-                "listing_title": "Увеличение губ",
-                "bot_promise": "Уточню точный адрес и напишу вам.",
-                "last_client_message": "Жду адрес",
-            }
-        ],
+        [row],
         max_items=10,
     )
+    card = pending_followup_card_text(row)
 
     assert "Анна" in text
     assert "Геленджик | Увеличение губ" in text
     assert "Обещал бот: Уточню точный адрес" in text
+    assert "Клиент ждёт: подтверждение даты, окна или условий записи" in text
+    assert "Клиент ждёт: подтверждение даты, окна или условий записи" in card
     assert "Последнее от клиента: Жду адрес" in text
     assert "Нужно сделать: дать клиенту финальный ответ" in text
     assert "chat_id: chat-followup" in text

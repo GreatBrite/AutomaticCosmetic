@@ -64,6 +64,9 @@ def pending_followup_card_text(row: dict[str, Any]) -> str:
     bot_promise = _text_preview(str(row.get("bot_promise") or ""), 260)
     if bot_promise:
         lines.append(f"Обещал бот: {bot_promise}")
+    waits_for = _text_preview(client_waits_for_label(str(row.get("client_waits_for") or "")), 180)
+    if waits_for:
+        lines.append(f"Клиент ждёт: {waits_for}")
     last_client = _text_preview(str(row.get("last_client_message") or ""), 260)
     if last_client:
         lines.append(f"Последнее от клиента: {last_client}")
@@ -222,6 +225,19 @@ def _text_preview(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(0, limit - 1)].rstrip() + "..."
+
+
+def client_waits_for_label(value: str) -> str:
+    normalized = " ".join(str(value or "").strip().split())
+    if not normalized:
+        return ""
+    aliases = {
+        "booking_ambiguous": "подтверждение даты, окна или условий записи",
+        "booking_critical": "срочное подтверждение записи или адреса",
+        "photo_consultation": "оценка фото специалистом",
+        "missing_data": "уточнение недостающей информации",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _iso(ts: int) -> str:

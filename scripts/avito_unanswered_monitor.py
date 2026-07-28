@@ -31,6 +31,7 @@ from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import ExpertRagStore
 from src.freelance_leads_bot.integrations.avito_followup_admin import (
     apply_pending_followup_action,
+    client_waits_for_label,
     pending_followup_card_text,
     pending_followup_keyboard,
     pending_followup_token,
@@ -723,6 +724,9 @@ def _format_followup_alert(rows: list[dict[str, Any]], *, max_items: int) -> str
         if listing:
             lines.append(f"   Объявление: {listing}")
         lines.append(f"   Обещал бот: {text}")
+        waits_for = client_waits_for_label(str(row.get("client_waits_for") or ""))
+        if waits_for:
+            lines.append(f"   Клиент ждёт: {waits_for[:150]}")
         last_client = " ".join(str(row.get("last_client_message") or "").split())
         if last_client:
             lines.append(f"   Последнее от клиента: {last_client[:150]}")
