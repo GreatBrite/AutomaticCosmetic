@@ -94,7 +94,14 @@ from src.freelance_leads_bot.integrations.codex_review import (
     sanitize_consultation_language,
 )
 from src.freelance_leads_bot.integrations.avito_history_import import import_telegram_zip_to_knowledge, parse_telegram_html_export
-from src.freelance_leads_bot.integrations.handoff_notify import PreviewHandoffNotifier, format_handoff_message, process_handoff_sla
+from src.freelance_leads_bot.integrations.handoff_notify import (
+    PreviewHandoffNotifier,
+    format_handoff_message,
+    handoff_followup_keyboard,
+    handoff_followup_token,
+    parse_handoff_followup_callback,
+    process_handoff_sla,
+)
 from src.freelance_leads_bot.integrations.handoff_refs import (
     find_telegram_handoff_ref,
     handoff_ref_is_critical,
@@ -3302,17 +3309,17 @@ async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, mo
             self.edits = []
             self.photos = []
 
-        def send_message(self, chat_id, text):
+        def send_message(self, chat_id, text, **kwargs):
             message_id = len(self.messages) + 1
-            self.messages.append((chat_id, text))
+            self.messages.append((chat_id, text, kwargs))
             return {"ok": True, "result": {"message_id": message_id}}
 
-        def edit_message_text(self, chat_id, message_id, text):
-            self.edits.append((chat_id, message_id, text))
+        def edit_message_text(self, chat_id, message_id, text, **kwargs):
+            self.edits.append((chat_id, message_id, text, kwargs))
             return {"ok": True, "result": {"message_id": message_id}}
 
-        def send_photo(self, chat_id, path, caption=None):
-            self.photos.append((chat_id, str(path), caption))
+        def send_photo(self, chat_id, path, caption=None, **kwargs):
+            self.photos.append((chat_id, str(path), caption, kwargs))
             return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
 
     async def direct_retry(func, *args, **kwargs):
@@ -9047,6 +9054,54 @@ def test_avito_followup_callback_updates_report_immediately(tmp_path) -> None:
     assert report["pending_followups"][0]["business_resolved"] is True
 
 
+def test_handoff_followup_callback_closes_ref_in_same_topic(tmp_path) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.answers = []
+            self.messages = []
+
+        def answer_callback_query(self, callback_id, text):
+            self.answers.append((callback_id, text))
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    ref = remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id="10",
+        telegram_message_thread_id="77",
+        avito_chat_id="chat-handoff",
+        client_name="Анна",
+        handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
+        urgency="critical",
+        reason="booking_critical",
+        path=ref_path,
+    )
+    token = handoff_followup_token(ref["handoff_id"])
+    bot = FakeBot()
+
+    handled = main_module.handle_handoff_followup_callback(
+        bot=bot,
+        callback_id="cb-1",
+        data=f"hfu:{token}:done",
+        telegram_chat_id="admin-chat",
+        topic_params={"message_thread_id": "77"},
+        ref_path=ref_path,
+    )
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:10"]
+
+    assert handled is True
+    assert parse_handoff_followup_callback(f"hfu:{token}:done") == (token, "done")
+    assert handoff_followup_keyboard(ref)["inline_keyboard"][0][0]["callback_data"] == f"hfu:{token}:done"
+    assert bot.answers == [("cb-1", "Закрыто")]
+    assert bot.messages == [("admin-chat", "Закрыто: Анна", {"message_thread_id": "77"})]
+    assert updated["status"] == "closed_manual"
+    assert updated["closed_at"] > 0
+    assert updated["resolution_source"] == "telegram_handoff_followup"
+
+
 def test_pending_followup_done_keeps_noncritical_manual_close(tmp_path) -> None:
     state_path = tmp_path / "state.json"
     audit_path = tmp_path / "audit.jsonl"
@@ -10286,13 +10341,20 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     class FakeNotifier:
         def __init__(self) -> None:
             self.texts = []
+            self.calls = []
 
         async def notify(self, handoff):
             raise AssertionError("SLA processing sends text notifications only")
 
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             self.texts.append(text)
-            return {"sent": True, "text": text}
+            self.calls.append((text, kwargs))
+            return {
+                "sent": True,
+                "text": text,
+                "reply_markup": kwargs.get("reply_markup") or {},
+                "topic_params": kwargs.get("topic_params") or {},
+            }
 
     ref_path = tmp_path / "handoff_refs.json"
     now = 1780000000
@@ -10301,6 +10363,7 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
         telegram_message_id=1,
         avito_chat_id="chat-reminder",
         handoff_text="Нужна ручная проверка",
+        telegram_message_thread_id="77",
         path=ref_path,
     )
     critical = remember_telegram_handoff_ref(
@@ -10321,6 +10384,7 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
         service="Увеличение губ",
         confirmation_needed="актуальность записи и время прихода",
         assignee="Ольга/админ",
+        telegram_message_thread_id="88",
         path=ref_path,
     )
     stale = remember_telegram_handoff_ref(
@@ -10353,6 +10417,9 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     assert any("Последнее от клиента: Я не получила ответ по записи" in text for text in notifier.texts)
     assert any("Контекст: Нужно проверить наличие записи клиента" in text for text in notifier.texts)
     assert any("Детали записи: Увеличение губ | Краснодар" in text for text in notifier.texts)
+    assert all(call[1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("hfu:") for call in notifier.calls)
+    assert {"message_thread_id": "77"} in [call[1]["topic_params"] for call in notifier.calls]
+    assert {"message_thread_id": "88"} in [call[1]["topic_params"] for call in notifier.calls]
 
 
 @pytest.mark.anyio
@@ -10361,9 +10428,9 @@ async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(
         def __init__(self) -> None:
             self.texts = []
 
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             self.texts.append(text)
-            return {"sent": True, "text": text}
+            return {"sent": True, "text": text, "reply_markup": kwargs.get("reply_markup") or {}, "topic_params": kwargs.get("topic_params") or {}}
 
     ref_path = tmp_path / "handoff_refs.json"
     now = 1780000000
@@ -10408,7 +10475,7 @@ async def test_handoff_sla_does_not_mark_failed_notifications_as_sent(tmp_path) 
         def __init__(self) -> None:
             self.texts = []
 
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             self.texts.append(text)
             return {}
 
@@ -10445,7 +10512,7 @@ async def test_handoff_sla_does_not_mark_failed_notifications_as_sent(tmp_path) 
 @pytest.mark.anyio
 async def test_handoff_sla_does_not_mark_pseudo_ok_notifications_as_sent(tmp_path) -> None:
     class PseudoOkNotifier:
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             return {"ok": True, "text": text}
 
     ref_path = tmp_path / "handoff_refs.json"
@@ -10484,9 +10551,9 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
         def __init__(self) -> None:
             self.texts = []
 
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             self.texts.append(text)
-            return {"sent": True, "text": text}
+            return {"sent": True, "text": text, "reply_markup": kwargs.get("reply_markup") or {}, "topic_params": kwargs.get("topic_params") or {}}
 
     ref_path = tmp_path / "handoff_refs.json"
     now = 1780000000
@@ -10542,7 +10609,7 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
 @pytest.mark.anyio
 async def test_handoff_sla_marks_critical_expired_separately(tmp_path) -> None:
     class FakeNotifier:
-        async def notify_text(self, text):
+        async def notify_text(self, text, **kwargs):
             return {"sent": True, "text": text}
 
     ref_path = tmp_path / "handoff_refs.json"

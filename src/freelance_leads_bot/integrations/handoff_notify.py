@@ -23,6 +23,7 @@ from .handoff_refs import (
     load_telegram_handoff_refs,
     remember_telegram_handoff_ref,
     save_telegram_handoff_refs,
+    update_handoff_status,
 )
 from .avito_identity import client_display_name, dialog_ref
 from .config import IntegrationSettings
@@ -60,6 +61,80 @@ class HandoffNotifier(Protocol):
 
     async def notify_avito_followup(self, row: dict[str, Any], text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
         ...
+
+
+HANDOFF_FOLLOWUP_ACTIONS = {"done", "stale", "later"}
+
+
+def handoff_followup_token(handoff_id: str) -> str:
+    return hashlib.sha256(str(handoff_id or "").encode("utf-8")).hexdigest()[:12]
+
+
+def handoff_followup_keyboard(ref: dict[str, Any]) -> dict[str, list[list[dict[str, str]]]]:
+    token = handoff_followup_token(str(ref.get("handoff_id") or ""))
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Закрыто", "callback_data": f"hfu:{token}:done"},
+                {"text": "Не актуально", "callback_data": f"hfu:{token}:stale"},
+            ],
+            [
+                {"text": "Напомнить позже", "callback_data": f"hfu:{token}:later"},
+            ],
+        ]
+    }
+
+
+def parse_handoff_followup_callback(data: str) -> tuple[str, str] | None:
+    parts = str(data or "").split(":")
+    if len(parts) != 3 or parts[0] != "hfu":
+        return None
+    token, action = parts[1].strip(), parts[2].strip()
+    if not token or action not in HANDOFF_FOLLOWUP_ACTIONS:
+        return None
+    return token, action
+
+
+def apply_handoff_followup_action(
+    *,
+    ref_path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
+    token: str,
+    action: str,
+    actor: str = "telegram_admin",
+    now: int | None = None,
+) -> dict[str, Any]:
+    parsed = parse_handoff_followup_callback(f"hfu:{token}:{action}")
+    if parsed is None:
+        return {"ok": False, "reason": "invalid_callback"}
+    token, action = parsed
+    now_ts = int(time.time()) if now is None else int(now)
+    refs = load_telegram_handoff_refs(ref_path)
+    ref = _find_handoff_ref_by_followup_token(refs, token)
+    if not ref:
+        return {"ok": False, "reason": "handoff_not_found", "token": token, "action": action}
+    handoff_id = str(ref.get("handoff_id") or "").strip()
+    if action == "done":
+        ok = update_handoff_status(
+            handoff_id,
+            "closed_manual",
+            resolution_note=f"Закрыто кнопкой Telegram reminder ({actor})",
+            resolution_source="telegram_handoff_followup",
+            resolution_action="done",
+            path=ref_path,
+        )
+    elif action == "stale":
+        ok = update_handoff_status(
+            handoff_id,
+            "not_relevant",
+            resolution_note=f"Не актуально по кнопке Telegram reminder ({actor})",
+            resolution_source="telegram_handoff_followup",
+            resolution_action="stale",
+            path=ref_path,
+        )
+    else:
+        ok = _snooze_handoff_followup(refs, handoff_id, now=now_ts, ref_path=ref_path, actor=actor)
+    updated = _find_handoff_ref_by_followup_token(load_telegram_handoff_refs(ref_path), token) if ok else ref
+    return {"ok": bool(ok), "action": action, "token": token, "handoff_id": handoff_id, "ref": updated or ref}
 
 
 class PreviewHandoffNotifier:
@@ -560,9 +635,15 @@ async def process_handoff_sla(
             not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
         )
         if can_send_reminder:
-            result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="reminder"))
+            result = await notifier.notify_text(
+                _format_handoff_sla_notification(ref, event="reminder"),
+                reply_markup=handoff_followup_keyboard(ref),
+                topic_params=_handoff_sla_topic_params(ref),
+            )
             notifications.append(result)
             if _notification_delivered(result):
+                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
+                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
                 ref["reminder_sent_at"] = now
                 ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
                 ref["updated_at"] = now
@@ -575,9 +656,15 @@ async def process_handoff_sla(
             and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
         )
         if can_send_escalation:
-            result = await notifier.notify_text(_format_handoff_sla_notification(ref, event="escalation"))
+            result = await notifier.notify_text(
+                _format_handoff_sla_notification(ref, event="escalation"),
+                reply_markup=handoff_followup_keyboard(ref),
+                topic_params=_handoff_sla_topic_params(ref),
+            )
             notifications.append(result)
             if _notification_delivered(result):
+                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
+                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
                 ref["escalation_sent_at"] = now
                 ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
                 ref["updated_at"] = now
@@ -604,6 +691,47 @@ def _notification_delivered(result: Any) -> bool:
     if _telegram_delivery_ok(result.get("telegram") or result):
         return True
     return result.get("reason") == "preview_only" and bool(result.get("outbox") or result.get("outbox_path"))
+
+
+def _handoff_sla_topic_params(ref: dict[str, Any]) -> dict[str, str]:
+    thread_id = str(ref.get("telegram_message_thread_id") or "").strip()
+    return {"message_thread_id": thread_id} if thread_id else {}
+
+
+def _find_handoff_ref_by_followup_token(refs: dict[str, dict], token: str) -> dict[str, Any] | None:
+    for ref in refs.values():
+        if not isinstance(ref, dict):
+            continue
+        handoff_id = str(ref.get("handoff_id") or "").strip()
+        if handoff_id and handoff_followup_token(handoff_id) == token:
+            return ref
+    return None
+
+
+def _snooze_handoff_followup(
+    refs: dict[str, dict],
+    handoff_id: str,
+    *,
+    now: int,
+    ref_path: Path | str,
+    actor: str,
+) -> bool:
+    handoff_id = str(handoff_id or "").strip()
+    if not handoff_id:
+        return False
+    changed = False
+    for ref in refs.values():
+        if not isinstance(ref, dict) or str(ref.get("handoff_id") or "") != handoff_id:
+            continue
+        ref["reminder_sent_at"] = now
+        ref["escalation_sent_at"] = now
+        ref["snoozed_at"] = now
+        ref["snoozed_by"] = actor
+        ref["updated_at"] = now
+        changed = True
+    if changed:
+        save_telegram_handoff_refs(refs, ref_path)
+    return changed
 
 
 def _canonical_handoff_sla_refs(refs: dict[str, dict], *, now: int) -> tuple[list[dict], int]:

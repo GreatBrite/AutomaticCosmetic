@@ -75,7 +75,12 @@ from .integrations.handoff_refs import (
     remember_telegram_handoff_ref,
     update_handoff_status,
 )
-from .integrations.handoff_notify import _download_photo_url, handoff_notifier_from_settings
+from .integrations.handoff_notify import (
+    _download_photo_url,
+    apply_handoff_followup_action,
+    handoff_notifier_from_settings,
+    parse_handoff_followup_callback,
+)
 from .integrations.olga_manual_tasks import (
     apply_olga_manual_task_action,
     format_olga_manual_task_card,
@@ -1912,6 +1917,43 @@ def handle_avito_followup_callback(
     return True
 
 
+def handle_handoff_followup_callback(
+    *,
+    bot: TelegramBot,
+    callback_id: str,
+    data: str,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    ref_path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
+) -> bool:
+    parsed = parse_handoff_followup_callback(data)
+    if parsed is None:
+        return False
+    token, action = parsed
+    result = apply_handoff_followup_action(ref_path=ref_path, token=token, action=action, actor="telegram_admin")
+    if not result.get("ok"):
+        bot.answer_callback_query(callback_id, "Handoff не найден")
+        bot.send_message(
+            telegram_chat_id,
+            "Не нашла этот handoff в текущих карточках. Возможно, он уже закрыт или state обновился.",
+            **(topic_params or {}),
+        )
+        return True
+    labels = {
+        "done": "Закрыто",
+        "stale": "Не актуально",
+        "later": "Напомню позже",
+    }
+    ref = result.get("ref") if isinstance(result.get("ref"), dict) else {}
+    bot.answer_callback_query(callback_id, labels.get(action, "Готово"))
+    bot.send_message(
+        telegram_chat_id,
+        escape(f"{labels.get(action, 'Готово')}: {ref.get('client_name') or ref.get('avito_chat_id') or 'handoff'}"),
+        **(topic_params or {}),
+    )
+    return True
+
+
 def handle_avito_unanswered_callback(
     *,
     bot: TelegramBot,
@@ -3272,6 +3314,20 @@ def serve(settings: Settings) -> None:
                         str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
                     )
                     if handle_avito_unanswered_callback(
+                        bot=bot,
+                        callback_id=callback_id,
+                        data=data,
+                        telegram_chat_id=callback_chat_id,
+                        topic_params=callback_topic_params,
+                    ):
+                        continue
+                if data.startswith("hfu:"):
+                    callback_chat_id, callback_topic_params = telegram_callback_delivery_target(
+                        callback,
+                        settings.telegram_chat_id,
+                        str(update.get("business_connection_id") or callback.get("business_connection_id") or "").strip(),
+                    )
+                    if handle_handoff_followup_callback(
                         bot=bot,
                         callback_id=callback_id,
                         data=data,
