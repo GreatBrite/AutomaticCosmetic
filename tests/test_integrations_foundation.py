@@ -8434,6 +8434,51 @@ def test_pending_followup_stays_open_after_client_ack_and_closes_on_final_answer
     assert all_rows[0]["final_answer"].startswith("Адрес:")
 
 
+def test_pending_followup_closes_on_booking_slot_answer_with_confirmation_word() -> None:
+    chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Мария"}]}
+    state: dict[str, object] = {}
+    messages = [
+        {
+            "id": "m-client-1",
+            "author_id": 10,
+            "direction": "in",
+            "type": "text",
+            "created": 100,
+            "content": {"text": "Москва"},
+        },
+        {
+            "id": "m-bot-promise",
+            "author_id": 1,
+            "direction": "out",
+            "type": "text",
+            "created": 160,
+            "content": {"text": "Проверим модельную запись на 4 августа по увеличению груди и свяжемся с вами."},
+        },
+        {
+            "id": "m-bot-final",
+            "author_id": 1,
+            "direction": "out",
+            "type": "text",
+            "created": 5000,
+            "content": {
+                "text": (
+                    "Мария, на 4 августа в Москве есть окошко на 11:00 на модельную запись "
+                    "по увеличению груди. Если для вас актуально, оставьте, пожалуйста, телефон "
+                    "для связи и подтверждения записи."
+                )
+            },
+        },
+    ]
+
+    sync_pending_followups(account_id=1, chat=chat, messages=messages, state=state, now=5100, reminder_seconds=1800, escalation_seconds=7200)
+
+    assert pending_followup_rows(state, now=5100) == []
+    all_rows = pending_followup_rows(state, now=5100, include_resolved=True)
+    assert len(all_rows) == 1
+    assert all_rows[0]["business_status"] == "business_resolved"
+    assert "есть окошко на 11:00" in all_rows[0]["final_answer"]
+
+
 def test_pending_followup_keeps_client_photo_urls_for_olga_card() -> None:
     chat = {"id": "chat-followup", "users": [{"id": 10, "name": "Анна"}]}
     state: dict[str, object] = {}

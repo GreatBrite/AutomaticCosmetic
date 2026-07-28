@@ -62,6 +62,10 @@ BOT_PROMISE_RE = re.compile(
     r"напишу точн(?:ый|ую)|подтверж(?:у|дим)|свер(?:ю|им)|передам|сейчас проверим)"
 )
 BOT_FINAL_RE = re.compile(r"(?iu)(подтвержден[ао]?|записал[аи]?|адрес[:\s]|принимаем по адресу|можете приходить|оплата|предоплата|стоимость)")
+BOT_BOOKING_SLOT_FINAL_RE = re.compile(
+    r"(?iu)(есть\s+(?:окошк|окн|вариант|свободн(?:ое|ые)\s+врем)|"
+    r"можем\s+предложить\s+запись|на\s+\d{1,2}(?:[.:]\d{2})?\s+есть\s+вариант)"
+)
 UNANSWERED_ACTIONS = {"done", "stale", "later"}
 
 
@@ -245,7 +249,15 @@ def _looks_like_bot_promise(text: str) -> bool:
 
 def _looks_like_bot_final_answer(text: str) -> bool:
     normalized = " ".join(str(text or "").split())
-    return bool(normalized and not _looks_like_bot_promise(normalized))
+    if not normalized:
+        return False
+    if BOT_BOOKING_SLOT_FINAL_RE.search(normalized):
+        return True
+    if _looks_like_bot_promise(normalized):
+        return False
+    if BOT_FINAL_RE.search(normalized):
+        return True
+    return not _looks_like_bot_promise(normalized)
 
 
 def _followup_key(*, account_id: int, chat_id: str, message_id: str) -> str:
@@ -323,6 +335,25 @@ def sync_pending_followups(
             continue
 
         message_id = _message_id(message) or str(created)
+        if _looks_like_bot_final_answer(text):
+            for key in list(active_keys):
+                row = pending.get(key)
+                if not isinstance(row, dict) or row.get("business_resolved"):
+                    continue
+                if created >= int(row.get("promised_at") or 0):
+                    row.update(
+                        {
+                            "business_status": "business_resolved",
+                            "business_resolved": True,
+                            "closed_at": created,
+                            "closed_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else "",
+                            "final_answer": text,
+                            "overdue": False,
+                        }
+                    )
+                    active_keys.discard(key)
+            continue
+
         if _looks_like_bot_promise(text):
             client_message = _latest_client_message_before(ordered, account_id=account_id, created_before=created)
             client_text = _message_text(client_message) if client_message else ""
@@ -386,24 +417,6 @@ def sync_pending_followups(
             pending[key] = row
             active_keys.add(key)
             continue
-
-        if _looks_like_bot_final_answer(text):
-            for key in list(active_keys):
-                row = pending.get(key)
-                if not isinstance(row, dict) or row.get("business_resolved"):
-                    continue
-                if created >= int(row.get("promised_at") or 0):
-                    row.update(
-                        {
-                            "business_status": "business_resolved",
-                            "business_resolved": True,
-                            "closed_at": created,
-                            "closed_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat() if created else "",
-                            "final_answer": text,
-                            "overdue": False,
-                        }
-                    )
-                    active_keys.discard(key)
 
     for key in list(active_keys):
         row = pending.get(key)
