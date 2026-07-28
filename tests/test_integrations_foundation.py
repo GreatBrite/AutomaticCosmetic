@@ -11164,6 +11164,8 @@ def test_ops_status_errors_when_overdue_avito_promises_exceed_sla(tmp_path) -> N
     assert check.ok is False
     assert check.severity == "error"
     assert report.summary["avito_max_overdue_followup_age_seconds"] == 7200
+    assert "Immediate action required: review pending Avito follow-ups." in format_ops_status_report(report)
+    assert "Immediate action required: review open Olga handoffs." not in format_ops_status_report(report)
     assert ops_status_exit_code(report, strict=True) == 1
 
 

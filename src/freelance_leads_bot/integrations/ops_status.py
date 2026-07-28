@@ -952,8 +952,10 @@ def format_ops_status_report(report: OpsStatusReport) -> str:
     if failing_warnings:
         lines.append("Warnings:")
         lines.extend(f"- {check.name}: {check.detail}" for check in failing_warnings)
-    if summary.get("handoff_error_count") or summary.get("handoff_warning_count") or summary.get("avito_critical_followups"):
+    if summary.get("handoff_error_count") or summary.get("handoff_warning_count"):
         lines.append("Immediate action required: review open Olga handoffs.")
+    if summary.get("avito_critical_followups") or summary.get("avito_overdue_followups"):
+        lines.append("Immediate action required: review pending Avito follow-ups.")
     if not failing_errors and not failing_warnings:
         lines.append("No immediate action required.")
     return "\n".join(lines)
