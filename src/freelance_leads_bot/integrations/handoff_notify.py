@@ -32,6 +32,8 @@ from .telegram_client_topics import (
     DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
     client_topic_key,
     get_or_create_client_topic,
+    load_client_topics,
+    topic_params_from_row,
     topic_request_from_avito_followup,
     topic_title_for_client,
 )
@@ -281,6 +283,7 @@ class TelegramHandoffNotifier:
                 telegram_message_id=telegram_message_id,
                 avito_chat_id=handoff.message.chat_id,
                 telegram_message_thread_id=topic_params.get("message_thread_id", ""),
+                account_id=str((handoff.message.metadata or {}).get("account_id") or ""),
                 client_name=str((handoff.message.metadata or {}).get("client_name") or ""),
                 handoff_text=handoff_text,
                 source_message_id=str(handoff.message.message_id or ""),
@@ -420,6 +423,7 @@ class TelegramHandoffNotifier:
             telegram_message_id=telegram_message_id,
             avito_chat_id=handoff.message.chat_id,
             telegram_message_thread_id=str(existing_ref.get("telegram_message_thread_id") or ""),
+            account_id=str((handoff.message.metadata or {}).get("account_id") or existing_ref.get("account_id") or ""),
             client_name=str((handoff.message.metadata or {}).get("client_name") or ""),
             handoff_text=handoff_text,
             handoff_id=handoff_id,
@@ -588,6 +592,31 @@ class TelegramHandoffNotifier:
             **request,
         )
 
+    async def topic_for_handoff_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
+        topic_params = _handoff_sla_topic_params(ref)
+        if topic_params:
+            return {"ok": True, "created": False, "reason": "handoff_ref_thread", "topic_params": topic_params}
+        existing = await asyncio.to_thread(_find_client_topic_for_handoff_ref, ref, self.chat_id, self.topics_path)
+        if existing:
+            return {
+                "ok": True,
+                "created": False,
+                "reason": "existing_client_topic",
+                "topic": existing,
+                "topic_params": topic_params_from_row(existing),
+            }
+        request = _topic_request_from_handoff_ref(ref)
+        if not request:
+            return {"ok": False, "reason": "missing_handoff_topic_key", "topic_params": {}}
+        return await asyncio.to_thread(
+            get_or_create_client_topic,
+            self.bot,
+            self.chat_id,
+            enabled=self.topics_enabled,
+            path=self.topics_path,
+            **request,
+        )
+
 
 async def process_handoff_sla(
     notifier: HandoffNotifier,
@@ -635,11 +664,14 @@ async def process_handoff_sla(
             not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
         )
         if can_send_reminder:
+            topic_result = await _handoff_sla_topic_result(notifier, ref)
             result = await notifier.notify_text(
                 _format_handoff_sla_notification(ref, event="reminder"),
                 reply_markup=handoff_followup_keyboard(ref),
-                topic_params=_handoff_sla_topic_params(ref),
+                topic_params=dict(topic_result.get("topic_params") or {}),
             )
+            if isinstance(result, dict) and "topic" not in result:
+                result["topic"] = topic_result
             notifications.append(result)
             if _notification_delivered(result):
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
@@ -656,11 +688,14 @@ async def process_handoff_sla(
             and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
         )
         if can_send_escalation:
+            topic_result = await _handoff_sla_topic_result(notifier, ref)
             result = await notifier.notify_text(
                 _format_handoff_sla_notification(ref, event="escalation"),
                 reply_markup=handoff_followup_keyboard(ref),
-                topic_params=_handoff_sla_topic_params(ref),
+                topic_params=dict(topic_result.get("topic_params") or {}),
             )
+            if isinstance(result, dict) and "topic" not in result:
+                result["topic"] = topic_result
             notifications.append(result)
             if _notification_delivered(result):
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
@@ -696,6 +731,96 @@ def _notification_delivered(result: Any) -> bool:
 def _handoff_sla_topic_params(ref: dict[str, Any]) -> dict[str, str]:
     thread_id = str(ref.get("telegram_message_thread_id") or "").strip()
     return {"message_thread_id": thread_id} if thread_id else {}
+
+
+async def _handoff_sla_topic_result(notifier: HandoffNotifier, ref: dict[str, Any]) -> dict[str, Any]:
+    resolver = getattr(notifier, "topic_for_handoff_ref", None)
+    if callable(resolver):
+        try:
+            result = await resolver(ref)
+            if isinstance(result, dict) and result.get("topic_params"):
+                return result
+        except Exception as exc:
+            return {"ok": False, "reason": "topic_resolver_failed", "error": repr(exc), "topic_params": _handoff_sla_topic_params(ref)}
+    return {"ok": bool(_handoff_sla_topic_params(ref)), "reason": "handoff_ref_thread", "topic_params": _handoff_sla_topic_params(ref)}
+
+
+def _find_client_topic_for_handoff_ref(
+    ref: dict[str, Any],
+    telegram_chat_id: str,
+    topics_path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+) -> dict[str, Any] | None:
+    external_chat_id = str(ref.get("avito_chat_id") or "").strip()
+    if not external_chat_id:
+        return None
+    account_id = str(ref.get("account_id") or "").strip()
+    candidates = [
+        row
+        for row in load_client_topics(topics_path).values()
+        if isinstance(row, dict)
+        and str(row.get("telegram_chat_id") or "").strip() == str(telegram_chat_id or "").strip()
+        and str(row.get("channel") or "").casefold() == "avito"
+        and str(row.get("external_chat_id") or "").strip() == external_chat_id
+        and str(row.get("message_thread_id") or "").strip()
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda row: (
+            1 if account_id and str(row.get("account_id") or "").strip() == account_id else 0,
+            int(row.get("updated_at") or row.get("created_at") or 0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _topic_request_from_handoff_ref(ref: dict[str, Any]) -> dict[str, Any]:
+    external_chat_id = str(ref.get("avito_chat_id") or "").strip()
+    if not external_chat_id:
+        return {}
+    account_id = str(ref.get("account_id") or "").strip()
+    client_name = str(ref.get("client_name") or _handoff_ref_text_value(ref, "Клиент") or "").strip()
+    listing_title, listing_city = _listing_parts_from_handoff_ref(ref)
+    city = str(ref.get("city") or listing_city or "").strip()
+    listing_title = str(listing_title or ref.get("service") or "").strip()
+    title = topic_title_for_client(
+        client_name=client_name,
+        channel="avito",
+        city=city,
+        listing_title=listing_title,
+        external_chat_id=external_chat_id,
+    )
+    return {
+        "key": client_topic_key(channel="avito", account_id=account_id, external_chat_id=external_chat_id),
+        "title": title,
+        "channel": "avito",
+        "external_chat_id": external_chat_id,
+        "account_id": account_id,
+        "client_name": client_name,
+        "listing_title": listing_title,
+        "city": city,
+    }
+
+
+def _handoff_ref_text_value(ref: dict[str, Any], label: str) -> str:
+    prefix = f"{label}:"
+    for line in str(ref.get("handoff_text") or "").splitlines():
+        if line.strip().startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _listing_parts_from_handoff_ref(ref: dict[str, Any]) -> tuple[str, str]:
+    listing = _handoff_ref_text_value(ref, "Объявление")
+    if not listing:
+        return "", ""
+    parts = [part.strip() for part in listing.split("|") if part.strip()]
+    if not parts:
+        return "", ""
+    city = parts[-1] if len(parts) > 1 else ""
+    title = " | ".join(parts[:-1]) if city else parts[0]
+    return title, city
 
 
 def _find_handoff_ref_by_followup_token(refs: dict[str, dict], token: str) -> dict[str, Any] | None:

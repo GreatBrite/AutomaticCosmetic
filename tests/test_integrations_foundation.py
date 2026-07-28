@@ -96,6 +96,7 @@ from src.freelance_leads_bot.integrations.codex_review import (
 from src.freelance_leads_bot.integrations.avito_history_import import import_telegram_zip_to_knowledge, parse_telegram_html_export
 from src.freelance_leads_bot.integrations.handoff_notify import (
     PreviewHandoffNotifier,
+    TelegramHandoffNotifier,
     format_handoff_message,
     handoff_followup_keyboard,
     handoff_followup_token,
@@ -10420,6 +10421,70 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     assert all(call[1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("hfu:") for call in notifier.calls)
     assert {"message_thread_id": "77"} in [call[1]["topic_params"] for call in notifier.calls]
     assert {"message_thread_id": "88"} in [call[1]["topic_params"] for call in notifier.calls]
+
+
+@pytest.mark.anyio
+async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missing(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.topics = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": 10 + len(self.messages)}}
+
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": 99}}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    topics_path = tmp_path / "topics.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-reminder",
+        handoff_text=(
+            "СРОЧНО: Нужна ручная проверка\n"
+            "Причина: booking_ambiguous\n"
+            "Канал: avito\n"
+            "Клиент: Татьяна\n"
+            "Объявление: Модель на ботокс | Санкт-Петербург\n"
+            "Сообщение: Да"
+        ),
+        reason="booking_ambiguous",
+        urgency="critical",
+        path=ref_path,
+    )
+    remember_client_topic(
+        key="avito:355539652:chat-reminder",
+        telegram_chat_id="admin-chat",
+        message_thread_id="55",
+        title="Татьяна | Avito / Санкт-Петербург",
+        channel="avito",
+        external_chat_id="chat-reminder",
+        account_id="355539652",
+        client_name="Татьяна",
+        city="Санкт-Петербург",
+        path=topics_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 61 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    bot = FakeBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=ref_path, topics_path=topics_path)
+
+    result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    updated = load_telegram_handoff_refs(ref_path)
+
+    assert result["reminders"] == 1
+    assert bot.topics == []
+    assert bot.messages[0][2]["message_thread_id"] == "55"
+    assert bot.messages[0][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("hfu:")
+    assert updated["admin-chat:1"]["telegram_message_thread_id"] == "55"
 
 
 @pytest.mark.anyio
