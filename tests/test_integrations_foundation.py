@@ -1386,6 +1386,22 @@ async def test_booking_flow_exposes_explicit_state_for_slot_lifecycle() -> None:
     assert awaiting.state == "awaiting_olga"
 
 
+@pytest.mark.anyio
+async def test_booking_flow_routes_messenger_contact_to_olga_without_phone(tmp_path) -> None:
+    service = Service(id=4, title="Губы", price=9000, duration_minutes=45)
+    slot = Slot(city="Москва", starts_at=datetime(2026, 6, 2, 12, 0), service_id=4)
+    message = InboundMessage(channel=Channel.AVITO, client_id="client-1", chat_id="chat-1", text="Москва губы 02.06 в 12:00 telegram @anna_beauty")
+
+    decision = await AvitoBookingFlow(DryRunYClientsGateway(services=[service], slots=[slot]), allow_create=False).process(
+        BookingRequest(message=message, city="Москва", service_query="губы", preferred_date="2026-06-02", preferred_time="12:00")
+    )
+
+    assert decision.action == "booking_confirmation_required"
+    assert decision.handoff is not None
+    assert "контакт для связи: @anna_beauty" in decision.handoff.summary
+    assert "телефон @anna_beauty" not in decision.handoff.summary
+
+
 def test_codex_logout_reset_moves_auth_json_to_backup(tmp_path, monkeypatch) -> None:
     auth_dir = tmp_path / ".codex"
     auth_path = auth_dir / "auth.json"
@@ -7986,7 +8002,7 @@ def test_rag_manual_review_buttons_apply_metadata_decisions(tmp_path) -> None:
     store = ExpertRagStore(db_path)
     item = store.upsert_from_handoff(
         question="Скиньте свой номер",
-        answer_client="Оставьте, пожалуйста, ваш номер телефона, и Ольга свяжется с вами.",
+        answer_client="Оставьте, пожалуйста, номер или аккаунт удобного мессенджера/соцсети — передам Ольге для переписки.",
         status=APPROVED,
         approved_by="olga",
         metadata={"autoanswer_allowed": True},
@@ -8029,7 +8045,7 @@ def test_main_rag_manual_review_callback_handles_block(tmp_path) -> None:
     store = ExpertRagStore(db_path)
     item = store.upsert_from_handoff(
         question="Скиньте свой номер",
-        answer_client="Оставьте, пожалуйста, ваш номер телефона, и Ольга свяжется с вами.",
+        answer_client="Оставьте, пожалуйста, номер или аккаунт удобного мессенджера/соцсети — передам Ольге для переписки.",
         status=APPROVED,
         approved_by="olga",
         metadata={"autoanswer_allowed": True},
@@ -10917,6 +10933,8 @@ def test_codex_planner_prompt_and_json_parser() -> None:
     assert "тихую задачу" in prompt
     assert "подтверждённое решение" in prompt
     assert "Не склоняй клиента на консультацию" in prompt
+    assert "мессенджера/соцсети" in prompt
+    assert "Не обещай телефонный звонок" in prompt
     assert "Если уже есть оценка Ольги/подтверждённое решение" in prompt
     assert "Прайс единый для всех городов" in prompt
     assert "Города приёма фиксированы" in prompt
@@ -11054,6 +11072,8 @@ def test_codex_review_prompt_checks_internals_offtopic_and_unconfirmed_facts() -
     assert "оффтопик" in prompt
     assert "Не спамь консультацией" in prompt
     assert "оценка Ольги" in prompt
+    assert "мессенджера/соцсети" in prompt
+    assert "Не обещай телефонный звонок" in prompt
     assert "Прайс единый для всех городов" in prompt
     assert "Города приёма фиксированы" in prompt
 

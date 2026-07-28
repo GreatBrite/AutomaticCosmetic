@@ -117,7 +117,7 @@ def apply_rag_manual_review_action(
 def _review_reason(item: ExpertAnswer) -> str:
     text = "\n".join([item.question_canonical, item.answer_client]).casefold()
     if "номер" in text or "свяжется" in text or "рассроч" in text:
-        return "можно оставить только если это стабильное правило сбора телефона"
+        return "можно оставить только если это стабильное правило сбора контакта для мессенджера/соцсети"
     return "оставшаяся автоответная RAG-запись после автоматической очистки"
 
 

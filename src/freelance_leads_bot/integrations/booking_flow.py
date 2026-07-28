@@ -13,6 +13,15 @@ from .yclients import YClientsGateway
 
 
 PHONE_RE = re.compile(r"(?:\+7|8)?[\s(.-]*(\d{3})[\s).-]*(\d{3})[\s.-]*(\d{2})[\s.-]*(\d{2})")
+MESSENGER_CONTACT_RE = re.compile(
+    r"(?iu)(?:"
+    r"(?P<handle>@[a-zа-яё0-9_.-]{3,32})|"
+    r"(?P<url>(?:https?://)?(?:t\.me|telegram\.me|vk\.com|wa\.me|"
+    r"api\.whatsapp\.com|instagram\.com|ig\.me|m\.me)/[^\s,;]+)|"
+    r"(?P<label>(?:telegram|телеграм|тг|whatsapp|ватсап|вацап|вотсап|vk|вк|"
+    r"instagram|инстаграм|max|мах)\s*[:\-]?\s*[a-zа-яё0-9_.@+-]{3,64})"
+    r")"
+)
 DATE_ISO_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 DATE_DMY_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?\b")
 DATE_RU_MONTH_RE = re.compile(
@@ -35,6 +44,7 @@ class BookingRequest:
     preferred_time: str = ""
     client_name: str = ""
     phone: str = ""
+    contact: str = ""
     notes: str = ""
 
 
@@ -170,10 +180,20 @@ class AvitoBookingFlow:
             )
 
         phone = request.phone or self.extract_phone(request.message.text)
-        if not phone:
+        contact = request.contact or phone or self.extract_contact(request.message.text)
+        if not contact:
             return BookingDecision(
                 action="ask_contact",
-                reply="Пришлите, пожалуйста, имя для записи и номер телефона для связи.",
+                reply="Пришлите, пожалуйста, имя для записи и контакт для связи: номер или аккаунт удобного мессенджера/соцсети.",
+                state="offered_slot",
+                slots=slots,
+                service=service,
+            )
+
+        if self.allow_create and not phone:
+            return BookingDecision(
+                action="ask_phone_for_booking",
+                reply="Для оформления записи нужен номер телефона. Пришлите, пожалуйста, номер, а удобный мессенджер я тоже передам.",
                 state="offered_slot",
                 slots=slots,
                 service=service,
@@ -193,7 +213,7 @@ class AvitoBookingFlow:
                     message=request.message,
                     summary=(
                         f"Клиент хочет записаться: {service.title}, {city}, "
-                        f"{selected_slot.starts_at.strftime('%d.%m.%Y %H:%M')}, телефон {phone}. "
+                        f"{selected_slot.starts_at.strftime('%d.%m.%Y %H:%M')}, контакт для связи: {contact}. "
                         "Fallback Avito не создаёт live-запись автоматически; нужно подтвердить оформление."
                     ),
                 ),
@@ -249,6 +269,17 @@ class AvitoBookingFlow:
             return ""
         return "+7" + "".join(match.groups())
 
+    def extract_contact(self, text: str) -> str:
+        phone = self.extract_phone(text)
+        if phone:
+            return phone
+        match = MESSENGER_CONTACT_RE.search(text)
+        if not match:
+            return ""
+        contact = next((value.strip() for value in match.groupdict().values() if value), "")
+        handle = re.search(r"@[a-zа-яё0-9_.-]{3,32}", contact, re.IGNORECASE)
+        return handle.group(0) if handle else contact
+
     async def _lookup_slots(self, city: str, service_id: int, preferred_date: str) -> dict[str, Any]:
         if self.slot_lookup:
             return await self.slot_lookup(city, service_id, preferred_date)
@@ -297,6 +328,7 @@ def booking_request_from_message(message: InboundMessage, cities: tuple[str, ...
         preferred_date=extract_date(message.text),
         preferred_time=extract_time(message.text),
         phone=flow.extract_phone(message.text),
+        contact=flow.extract_contact(message.text),
     )
 
 
