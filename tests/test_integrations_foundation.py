@@ -3238,6 +3238,59 @@ async def test_aesthetic_expectation_handoff_ref_is_critical_for_sla(tmp_path) -
 
 
 @pytest.mark.anyio
+async def test_handoff_notifier_falls_back_when_saved_topic_is_missing(tmp_path, monkeypatch) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+    from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
+    import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            if kwargs.get("message_thread_id") == "missing-thread":
+                raise RuntimeError('Telegram API sendMessage failed: HTTP 400: {"description":"Bad Request: message thread not found"}')
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    async def direct_retry(func, *args, **kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(handoff_notify, "_to_thread_retry", direct_retry)
+    topics_path = tmp_path / "topics.json"
+    remember_client_topic(
+        key="avito:chat-missing-topic",
+        telegram_chat_id="admin-chat",
+        message_thread_id="missing-thread",
+        title="Old topic",
+        channel="avito",
+        external_chat_id="chat-missing-topic",
+        path=topics_path,
+    )
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "id": "m-topic-1",
+            "chat_id": "chat-missing-topic",
+            "content": {"text": "Нужно подтвердить запись"},
+        }
+    )
+    handoff = Handoff(reason=HandoffReason.BOOKING_CRITICAL, message=message, summary="Проверить запись.")
+    bot = FakeTelegramBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=tmp_path / "refs.json", topics_path=topics_path)
+
+    result = await notifier.notify(handoff)
+
+    assert result["sent"] is True
+    assert result["topic_fallback"]["reason"] == "message_thread_not_found"
+    assert bot.messages[0][2]["message_thread_id"] == "missing-thread"
+    assert bot.messages[1][2] == {}
+    refs = load_telegram_handoff_refs(tmp_path / "refs.json")
+    ref = next(iter(refs.values()))
+    assert ref["telegram_message_thread_id"] == ""
+
+
+@pytest.mark.anyio
 async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
@@ -12279,6 +12332,59 @@ def test_avito_outgoing_promise_state_updates_and_closes(tmp_path, monkeypatch) 
     assert followup["business_status"] == "answered"
     assert followup["business_resolved"] is True
     assert followup["final_answer"] == "Вы записаны на 1 августа в 15:00, адрес отправила."
+
+
+def test_avito_outgoing_promise_reopen_clears_old_closure_fields(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "avito_unanswered_monitor_state.json"
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", state_path)
+    key = "123:chat-promise:webhook-promise"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    key: {
+                        "business_status": "not_relevant",
+                        "business_resolved": False,
+                        "close_reason": "not_relevant",
+                        "closed_at": 1779987000,
+                        "closed_at_iso": "2026-05-28T23:30:00+00:00",
+                        "closed_by": "markdown_review",
+                        "client_answer_confirmed": True,
+                        "final_answer": "old answer",
+                        "resolution_note": "old duplicate row",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "id": "client-msg-2",
+            "chat_id": "chat-promise",
+            "created": 1779988000,
+            "content": {"text": "Проверьте запись"},
+        }
+    )
+    decision = AvitoConsultantReply(action="handoff", reply="Проверю и напишу.")
+
+    created = avito_webhook_module._upsert_outgoing_promise_state(
+        account_id=123,
+        message=message,
+        outgoing_reply="Проверю и напишу.",
+        decision=decision,
+        state_path=state_path,
+        now=1779988200,
+    )
+
+    assert created["created"] is True
+    row = json.loads(state_path.read_text(encoding="utf-8"))["pending_followups"][key]
+    assert row["business_status"] == "awaiting_olga"
+    assert row["business_resolved"] is False
+    for stale_key in ("close_reason", "closed_at", "closed_at_iso", "closed_by", "client_answer_confirmed", "final_answer", "resolution_note"):
+        assert stale_key not in row
 
 
 @pytest.mark.anyio

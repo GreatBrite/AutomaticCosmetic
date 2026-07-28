@@ -355,6 +355,7 @@ def sync_pending_followups(
             row = pending.get(key) if isinstance(pending.get(key), dict) else {}
             if _followup_row_is_manually_closed(row):
                 continue
+            _clear_followup_closure_fields(row)
             row.update(
                 {
                     "account_id": account_id,
@@ -478,6 +479,21 @@ def _followup_row_is_manually_closed(row: dict[str, Any]) -> bool:
         "manual_closed",
         "closed_manual_no_client_reply",
     }
+
+
+def _clear_followup_closure_fields(row: dict[str, Any]) -> None:
+    for key in (
+        "close_reason",
+        "closed_at",
+        "closed_at_iso",
+        "closed_by",
+        "client_answer_confirmed",
+        "final_answer",
+        "resolution_note",
+        "sent_to_client_at",
+        "sent_to_client_at_iso",
+    ):
+        row.pop(key, None)
 
 
 def _state_key(item: UnansweredChat) -> str:

@@ -187,15 +187,14 @@ class TelegramHandoffNotifier:
                 if merged.get("merged"):
                     return merged
 
-        notify_error = ""
-        try:
-            result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, text, **topic_params))
-        except Exception as exc:
-            result = {"ok": False, "error": repr(exc)}
-            notify_error = repr(exc)
+        result, topic_params, topic_fallback = await _send_message_with_topic_fallback(
+            self.bot,
+            self.chat_id,
+            text,
+            topic_params=topic_params,
+        )
+        notify_error = "" if _telegram_delivery_ok(result) else _telegram_send_error(result, "telegram_message_not_delivered")
         telegram_message_id = _telegram_message_id(result) if isinstance(result, dict) else ""
-        if not telegram_message_id and not notify_error:
-            notify_error = _telegram_send_error(result, "telegram_message_not_delivered")
         ref = {}
         if telegram_message_id:
             task_fields = _booking_task_fields(handoff) if urgent else _handoff_task_fields(handoff)
@@ -248,6 +247,7 @@ class TelegramHandoffNotifier:
             "media_failure_notify": failure_notify,
             "topic": topic_result,
             "topic_params": topic_params,
+            "topic_fallback": topic_fallback,
             "text": handoff_text,
         }
 
@@ -395,29 +395,23 @@ class TelegramHandoffNotifier:
         reply_markup: dict | None = None,
         topic_params: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        try:
-            if reply_markup:
-                result = await _to_thread_retry(
-                    lambda: self.bot.send_message(
-                        self.chat_id,
-                        escape(text),
-                        reply_markup=reply_markup,
-                        **(topic_params or {}),
-                    )
-                )
-            else:
-                result = await _to_thread_retry(lambda: self.bot.send_message(self.chat_id, escape(text), **(topic_params or {})))
-            sent = _telegram_delivery_ok(result)
-            return {
-                "sent": sent,
-                "error": "" if sent else _telegram_send_error(result, "telegram_message_not_delivered"),
-                "telegram": result,
-                "text": text,
-                "reply_markup": reply_markup or {},
-                "topic_params": topic_params or {},
-            }
-        except Exception as exc:
-            return {"sent": False, "error": repr(exc), "text": text, "reply_markup": reply_markup or {}, "topic_params": topic_params or {}}
+        result, used_topic_params, topic_fallback = await _send_message_with_topic_fallback(
+            self.bot,
+            self.chat_id,
+            escape(text),
+            topic_params=topic_params,
+            reply_markup=reply_markup,
+        )
+        sent = _telegram_delivery_ok(result)
+        return {
+            "sent": sent,
+            "error": "" if sent else _telegram_send_error(result, "telegram_message_not_delivered"),
+            "telegram": result,
+            "text": text,
+            "reply_markup": reply_markup or {},
+            "topic_params": used_topic_params,
+            "topic_fallback": topic_fallback,
+        }
 
     async def notify_photo_url(
         self,
@@ -910,6 +904,37 @@ def _telegram_send_error(send_response: Any, fallback: str) -> str:
     if not isinstance(send_response, dict):
         return fallback
     return str(send_response.get("error") or send_response.get("description") or fallback)
+
+
+async def _send_message_with_topic_fallback(
+    bot: Any,
+    chat_id: str,
+    text: str,
+    *,
+    topic_params: dict[str, str] | None = None,
+    reply_markup: dict | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    topic_params = dict(topic_params or {})
+    kwargs = dict(topic_params)
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    try:
+        result = await _to_thread_retry(lambda: bot.send_message(chat_id, text, **kwargs))
+    except Exception as exc:
+        result = {"ok": False, "error": repr(exc)}
+    if _telegram_delivery_ok(result) or not topic_params or not _message_thread_not_found(result):
+        return result, topic_params, {}
+    fallback_kwargs = {"reply_markup": reply_markup} if reply_markup else {}
+    try:
+        fallback_result = await _to_thread_retry(lambda: bot.send_message(chat_id, text, **fallback_kwargs))
+    except Exception as exc:
+        fallback_result = {"ok": False, "error": repr(exc)}
+    return fallback_result, {}, {"reason": "message_thread_not_found", "original": result, "topic_params": topic_params}
+
+
+def _message_thread_not_found(send_response: Any) -> bool:
+    error = _telegram_send_error(send_response, "")
+    return "message thread not found" in error.casefold()
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:

@@ -591,6 +591,7 @@ def _upsert_outgoing_promise_state(
     key = _open_promise_key_for_chat(pending, account_id=account_id, chat_id=chat_id) or f"{int(account_id or 0)}:{chat_id}:webhook-promise"
     row = pending.get(key) if isinstance(pending.get(key), dict) else {}
     reason = str(decision.handoff.reason.value if getattr(decision, "handoff", None) else getattr(decision, "action", "") or "bot_promised_followup")
+    _clear_followup_closure_fields(row)
     row.update(
         {
             "account_id": int(account_id or 0),
@@ -720,6 +721,21 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 def _write_json_file(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _clear_followup_closure_fields(row: dict[str, Any]) -> None:
+    for key in (
+        "close_reason",
+        "closed_at",
+        "closed_at_iso",
+        "closed_by",
+        "client_answer_confirmed",
+        "final_answer",
+        "resolution_note",
+        "sent_to_client_at",
+        "sent_to_client_at_iso",
+    ):
+        row.pop(key, None)
 
 
 async def transcribe_avito_voice_message(message: Any, *, voice_resolver: AvitoVoiceResolver | None) -> Any:
