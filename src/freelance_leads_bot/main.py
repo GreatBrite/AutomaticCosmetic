@@ -343,7 +343,8 @@ def avito_reminder_settings_text() -> str:
         lines.append(f"<code>{key}</code> = <b>{_duration_text(value)}</b> - {escape(description)}")
     lines.append("")
     lines.append("Чтобы изменить: напиши переменную в <code>.env</code> и выполни <code>/bot_restart</code>.")
-    lines.append("Быстрая команда: <code>/avito_reminders 6 часов</code> или <code>напоминай раз в 6 часов</code>.")
+    lines.append("Быстрая команда: <code>/avito_reminders 6 часов</code>.")
+    lines.append("Свободная фраза вроде «сделай Avito-напоминания два раза в день» понимается через intent parser, если включён LLM.")
     lines.append("Закрытые кнопками карточки и отвеченные диалоги не должны всплывать повторно до нового сообщения клиента.")
     return "\n".join(lines)
 
@@ -359,18 +360,28 @@ def _parse_reminder_interval_seconds(raw_text: str) -> int | None:
     return None
 
 
-def _looks_like_avito_reminder_command(raw_text: str) -> bool:
-    text = str(raw_text or "").strip().casefold()
-    return text.startswith(("напоминай", "напоминать", "поставь напоминания", "сделай напоминания"))
+def _operation_interval_seconds(operation: dict[str, Any], raw_text: str = "") -> int | None:
+    for key in ("interval_seconds", "repeat_seconds", "reminder_seconds", "value"):
+        value = operation.get(key)
+        if value in ("", None):
+            continue
+        try:
+            seconds = int(float(str(value).replace(",", ".")))
+        except ValueError:
+            continue
+        if seconds > 0:
+            return max(900, seconds)
+    return _parse_reminder_interval_seconds(raw_text)
 
 
-def set_avito_reminder_settings_from_text(
-    raw_text: str,
+def set_avito_reminder_settings(
+    interval_seconds: int,
     *,
     env_path: Path = ROOT / ".env",
 ) -> str | None:
-    interval_seconds = _parse_reminder_interval_seconds(raw_text)
-    if interval_seconds is None:
+    try:
+        interval_seconds = max(900, int(interval_seconds))
+    except (TypeError, ValueError):
         return None
     escalation_seconds = max(interval_seconds * 2, interval_seconds)
     for key in REMINDER_INTERVAL_KEYS:
@@ -386,6 +397,17 @@ def set_avito_reminder_settings_from_text(
         f"Критичный срок: <b>{_duration_text(escalation_seconds)}</b>.\n"
         "Применится после рестарта сервиса. Команда: /bot_restart"
     )
+
+
+def set_avito_reminder_settings_from_text(
+    raw_text: str,
+    *,
+    env_path: Path = ROOT / ".env",
+) -> str | None:
+    interval_seconds = _parse_reminder_interval_seconds(raw_text)
+    if interval_seconds is None:
+        return None
+    return set_avito_reminder_settings(interval_seconds, env_path=env_path)
 
 
 def feature_flags_keyboard() -> dict:
@@ -1317,6 +1339,39 @@ def handle_rag_admin_freeform_command(
         reply_markup=rag_admin_plan_keyboard(plan.id),
         **(topic_params or {}),
     )
+    return True
+
+
+def handle_avito_reminder_freeform_intent(
+    *,
+    bot: TelegramBot,
+    text: str,
+    service: CodexTelegramAdminService | None,
+    telegram_chat_id: str,
+    topic_params: dict[str, str] | None = None,
+    env_path: Path = ROOT / ".env",
+) -> bool:
+    expert_admin = getattr(getattr(service, "toolbox", None), "expert_rag_admin", None)
+    parser = getattr(expert_admin, "intent_parser", None)
+    if not parser or not getattr(parser, "enabled", False) or not getattr(parser, "llm", None):
+        return False
+    intent = parser.parse(
+        text,
+        context={
+            "feature": "avito_reminder_settings",
+            "allowed_intent": "avito_reminder_cadence_update",
+            "current_defaults": {key: seconds for key, seconds, _description in REMINDER_SETTING_DEFAULTS},
+        },
+    )
+    if intent.intent != "avito_reminder_cadence_update" or intent.confidence < 0.55 or intent.parser_source != "llm":
+        return False
+    interval_seconds = _operation_interval_seconds(dict(intent.operation or {}), text)
+    if interval_seconds is None:
+        question = intent.clarification_question or "На какой интервал поставить Avito-напоминания? Например: 6 часов."
+        bot.send_message(telegram_chat_id, escape(question), **(topic_params or {}))
+        return True
+    result = set_avito_reminder_settings(interval_seconds, env_path=env_path)
+    bot.send_message(telegram_chat_id, result or "Не смогла применить интервал Avito-напоминаний.", **(topic_params or {}))
     return True
 
 
@@ -3643,6 +3698,14 @@ def serve(settings: Settings) -> None:
                 topic_params=topic_params,
             ):
                 continue
+            if has_codex_text and handle_avito_reminder_freeform_intent(
+                bot=bot,
+                text=raw_text,
+                service=codex_tool_service,
+                telegram_chat_id=reply_chat_id,
+                topic_params=topic_params,
+            ):
+                continue
             if has_codex_text and handle_rag_admin_freeform_command(
                 bot=bot,
                 text=raw_text,
@@ -3708,7 +3771,7 @@ def serve(settings: Settings) -> None:
                 )
             elif text.startswith("/flags") or text.startswith("/feature_flags"):
                 bot.send_message(reply_chat_id, feature_flags_text(), reply_markup=feature_flags_keyboard(), **topic_params)
-            elif text.startswith("/avito_reminders") or text.startswith("/remind") or _looks_like_avito_reminder_command(text):
+            elif text.startswith("/avito_reminders") or text.startswith("/remind"):
                 reminder_result = set_avito_reminder_settings_from_text(text) or avito_reminder_settings_text()
                 bot.send_message(reply_chat_id, reminder_result, **topic_params)
             elif text.startswith("/full_live_on"):

@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import tarfile
 import time
+from types import SimpleNamespace
 import zipfile
 
 import httpx
@@ -259,6 +260,7 @@ from src.freelance_leads_bot.main import (
     format_avito_client_draft_card,
     format_olga_history,
     format_open_cards,
+    handle_avito_reminder_freeform_intent,
     menu_text,
     parse_care_followup_callback,
     parse_feature_flag_command,
@@ -1549,6 +1551,76 @@ def test_avito_reminder_command_updates_env_for_operator(tmp_path, monkeypatch) 
     assert values["AVITO_HANDOFF_REMINDER_REPEAT_SECONDS"] == "21600"
     assert values["AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS"] == "21600"
     assert os.environ["AVITO_UNANSWERED_REPEAT_ALERT_SECONDS"] == "21600"
+
+
+def test_avito_reminder_freeform_uses_llm_intent_not_keywords(tmp_path, monkeypatch) -> None:
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+    prompts: list[str] = []
+
+    def llm(prompt: str) -> str:
+        prompts.append(prompt)
+        assert "avito_reminder_cadence_update" in prompt
+        return json.dumps(
+            {
+                "intent": "avito_reminder_cadence_update",
+                "confidence": 0.93,
+                "operation": {"type": "set_cadence", "interval_seconds": 43200},
+                "requires_confirmation": False,
+            },
+            ensure_ascii=False,
+        )
+
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(main_module, "RUNTIME_LOG_PATH", tmp_path / "runtime.log")
+    parser = RagAdminIntentParser(llm=llm)
+    service = SimpleNamespace(toolbox=SimpleNamespace(expert_rag_admin=SimpleNamespace(intent_parser=parser)))
+    bot = FakeBot()
+
+    handled = handle_avito_reminder_freeform_intent(
+        bot=bot,
+        text="сделай авитовские пинки два раза в день, а то шумно",
+        service=service,
+        telegram_chat_id="admin-chat",
+        env_path=env_path,
+    )
+    values = dict(
+        line.split("=", 1)
+        for line in env_path.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+
+    assert handled is True
+    assert prompts
+    assert values["AVITO_UNANSWERED_REPEAT_ALERT_SECONDS"] == "43200"
+    assert values["AVITO_PROMISE_ESCALATION_SECONDS"] == "86400"
+    assert "12 ч" in bot.messages[0][1]
+    assert "24 ч" in bot.messages[0][1]
+
+
+def test_avito_reminder_freeform_without_llm_does_not_keyword_trigger(tmp_path) -> None:
+    class FakeBot:
+        def send_message(self, chat_id, text, **kwargs):
+            raise AssertionError("freeform reminder text must not be handled without LLM intent")
+
+    parser = RagAdminIntentParser()
+    service = SimpleNamespace(toolbox=SimpleNamespace(expert_rag_admin=SimpleNamespace(intent_parser=parser)))
+
+    handled = handle_avito_reminder_freeform_intent(
+        bot=FakeBot(),
+        text="напоминай раз в 6 часов",
+        service=service,
+        telegram_chat_id="admin-chat",
+        env_path=tmp_path / ".env",
+    )
+
+    assert handled is False
 
 
 def test_feature_flags_keyboard_exposes_full_live_presets() -> None:
