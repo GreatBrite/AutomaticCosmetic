@@ -10745,6 +10745,73 @@ async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missin
 
 
 @pytest.mark.anyio
+async def test_handoff_sla_replaces_card_without_deleting_photo_messages(tmp_path, monkeypatch) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+    import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.photos = []
+            self.deleted = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            message_id = len(self.messages) + 1
+            self.messages.append((chat_id, text, kwargs, message_id))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def send_photo(self, chat_id, path, caption=None, **kwargs):
+            message_id = 100 + len(self.photos) + 1
+            self.photos.append((chat_id, str(path), caption, kwargs, message_id))
+            return {"ok": True, "result": {"message_id": message_id}}
+
+        def api(self, method, payload, timeout=30):
+            self.deleted.append((method, payload, timeout))
+            return {"ok": True, "result": True}
+
+    async def direct_retry(func, *args, **kwargs):
+        return func(*args)
+
+    def download_photo(url, media_dir):
+        path = tmp_path / "photo.jpg"
+        path.write_bytes(b"image")
+        return path
+
+    monkeypatch.setattr(handoff_notify, "_to_thread_retry", direct_retry)
+    monkeypatch.setattr(handoff_notify, "_download_photo_url", download_photo)
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    bot = FakeTelegramBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=ref_path, topics_enabled=False)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "id": "m-photo",
+            "chat_id": "chat-photo",
+            "content": {"text": "Посмотрите фото, хочу понять по губам что можно исправить", "image": {"url": "https://img.example/one.jpg"}},
+        }
+    )
+    handoff = avito_photo_handoff(message)
+    assert handoff is not None
+
+    notify_result = await notifier.notify(handoff)
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 61 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+
+    result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    updated = load_telegram_handoff_refs(ref_path)
+
+    assert notify_result["photos_sent"] == 1
+    assert bot.photos[0][4] == 101
+    assert result["reminders"] == 1
+    assert bot.deleted == [("deleteMessage", {"chat_id": "admin-chat", "message_id": "1"}, 8)]
+    assert all(str(photo[4]) != str(call[1]["message_id"]) for photo in bot.photos for call in bot.deleted)
+    assert "admin-chat:1" not in updated
+    assert updated["admin-chat:2"]["previous_telegram_message_id"] == "1"
+
+
+@pytest.mark.anyio
 async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(tmp_path) -> None:
     class FakeNotifier:
         def __init__(self) -> None:
