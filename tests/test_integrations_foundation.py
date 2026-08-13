@@ -263,6 +263,7 @@ from src.freelance_leads_bot.main import (
     parse_care_followup_callback,
     parse_feature_flag_command,
     set_all_feature_flags,
+    set_avito_reminder_settings_from_text,
     set_feature_flag,
     send_open_handoff_cards,
     telegram_callback_delivery_target,
@@ -1524,6 +1525,30 @@ def test_avito_reminder_settings_text_exposes_six_hour_defaults(tmp_path, monkey
     assert "AVITO_PROMISE_ESCALATION_SECONDS" in text
     assert "12 ч" in text
     assert "/bot_restart" in text
+
+
+def test_avito_reminder_command_updates_env_for_operator(tmp_path, monkeypatch) -> None:
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(main_module, "RUNTIME_LOG_PATH", tmp_path / "runtime.log")
+
+    result = set_avito_reminder_settings_from_text("напоминай раз в 6 часов", env_path=env_path)
+    values = dict(
+        line.split("=", 1)
+        for line in env_path.read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+
+    assert result is not None
+    assert "6 ч" in result
+    assert "12 ч" in result
+    assert values["AVITO_UNANSWERED_REPEAT_ALERT_SECONDS"] == "21600"
+    assert values["AVITO_PROMISE_REMINDER_SECONDS"] == "21600"
+    assert values["AVITO_PROMISE_ESCALATION_SECONDS"] == "43200"
+    assert values["AVITO_HANDOFF_REMINDER_AFTER_SECONDS"] == "21600"
+    assert values["AVITO_HANDOFF_ESCALATION_AFTER_SECONDS"] == "43200"
+    assert values["AVITO_HANDOFF_REMINDER_REPEAT_SECONDS"] == "21600"
+    assert values["AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS"] == "21600"
+    assert os.environ["AVITO_UNANSWERED_REPEAT_ALERT_SECONDS"] == "21600"
 
 
 def test_feature_flags_keyboard_exposes_full_live_presets() -> None:

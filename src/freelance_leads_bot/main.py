@@ -262,6 +262,17 @@ REMINDER_SETTING_DEFAULTS: tuple[tuple[str, int, str], ...] = (
     ("AVITO_HANDOFF_REMINDER_REPEAT_SECONDS", 21600, "повтор ручного напоминания"),
     ("AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS", 21600, "повтор критичного ручного напоминания"),
 )
+REMINDER_INTERVAL_KEYS = (
+    "AVITO_UNANSWERED_REPEAT_ALERT_SECONDS",
+    "AVITO_PROMISE_REMINDER_SECONDS",
+    "AVITO_HANDOFF_REMINDER_AFTER_SECONDS",
+    "AVITO_HANDOFF_REMINDER_REPEAT_SECONDS",
+    "AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS",
+)
+REMINDER_ESCALATION_KEYS = (
+    "AVITO_PROMISE_ESCALATION_SECONDS",
+    "AVITO_HANDOFF_ESCALATION_AFTER_SECONDS",
+)
 
 
 def format_active_age(age: float | None) -> str:
@@ -332,9 +343,49 @@ def avito_reminder_settings_text() -> str:
         lines.append(f"<code>{key}</code> = <b>{_duration_text(value)}</b> - {escape(description)}")
     lines.append("")
     lines.append("Чтобы изменить: напиши переменную в <code>.env</code> и выполни <code>/bot_restart</code>.")
-    lines.append("Пример для 6 часов: <code>AVITO_UNANSWERED_REPEAT_ALERT_SECONDS=21600</code>.")
+    lines.append("Быстрая команда: <code>/avito_reminders 6 часов</code> или <code>напоминай раз в 6 часов</code>.")
     lines.append("Закрытые кнопками карточки и отвеченные диалоги не должны всплывать повторно до нового сообщения клиента.")
     return "\n".join(lines)
+
+
+def _parse_reminder_interval_seconds(raw_text: str) -> int | None:
+    text = str(raw_text or "").strip().casefold().replace(",", ".")
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(ч|час|часа|часов|h|hr|hrs|hour|hours)\b", text)
+    if match:
+        return max(900, int(float(match.group(1)) * 3600))
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(м|мин|минут|минуты|minute|minutes|min)\b", text)
+    if match:
+        return max(900, int(float(match.group(1)) * 60))
+    return None
+
+
+def _looks_like_avito_reminder_command(raw_text: str) -> bool:
+    text = str(raw_text or "").strip().casefold()
+    return text.startswith(("напоминай", "напоминать", "поставь напоминания", "сделай напоминания"))
+
+
+def set_avito_reminder_settings_from_text(
+    raw_text: str,
+    *,
+    env_path: Path = ROOT / ".env",
+) -> str | None:
+    interval_seconds = _parse_reminder_interval_seconds(raw_text)
+    if interval_seconds is None:
+        return None
+    escalation_seconds = max(interval_seconds * 2, interval_seconds)
+    for key in REMINDER_INTERVAL_KEYS:
+        _write_env_value(env_path, key, str(interval_seconds))
+        os.environ[key] = str(interval_seconds)
+    for key in REMINDER_ESCALATION_KEYS:
+        _write_env_value(env_path, key, str(escalation_seconds))
+        os.environ[key] = str(escalation_seconds)
+    runtime_log(f"avito_reminders set interval_seconds={interval_seconds} escalation_seconds={escalation_seconds}")
+    return (
+        "<b>Avito напоминания обновлены</b>\n"
+        f"Обычные повторы: <b>{_duration_text(interval_seconds)}</b>.\n"
+        f"Критичный срок: <b>{_duration_text(escalation_seconds)}</b>.\n"
+        "Применится после рестарта сервиса. Команда: /bot_restart"
+    )
 
 
 def feature_flags_keyboard() -> dict:
@@ -3657,8 +3708,9 @@ def serve(settings: Settings) -> None:
                 )
             elif text.startswith("/flags") or text.startswith("/feature_flags"):
                 bot.send_message(reply_chat_id, feature_flags_text(), reply_markup=feature_flags_keyboard(), **topic_params)
-            elif text.startswith("/avito_reminders") or text.startswith("/remind"):
-                bot.send_message(reply_chat_id, avito_reminder_settings_text(), **topic_params)
+            elif text.startswith("/avito_reminders") or text.startswith("/remind") or _looks_like_avito_reminder_command(text):
+                reminder_result = set_avito_reminder_settings_from_text(text) or avito_reminder_settings_text()
+                bot.send_message(reply_chat_id, reminder_result, **topic_params)
             elif text.startswith("/full_live_on"):
                 bot.send_message(reply_chat_id, set_all_feature_flags(True, store=store), reply_markup=feature_flags_keyboard(), **topic_params)
             elif text.startswith("/full_live_off"):
