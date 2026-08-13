@@ -70,6 +70,10 @@ def pending_followup_card_text(row: dict[str, Any]) -> str:
     last_client = _text_preview(str(row.get("last_client_message") or ""), 260)
     if last_client:
         lines.append(f"Последнее от клиента: {last_client}")
+    context = str(row.get("dialog_context") or "").strip()
+    if context:
+        lines.append("Контекст диалога:")
+        lines.extend(context.splitlines()[:6])
     lines.append("Нужно сделать: дать клиенту финальный ответ или закрыть обещание как неактуальное.")
     lines.append(f"Avito chat_id: {row.get('chat_id') or '-'}")
     return "\n".join(lines)
@@ -104,6 +108,7 @@ def apply_pending_followup_action(
             row["final_answer"] = str(resolution_note).strip()[:1000]
     if action == "done":
         close_status = "closed_manual_no_client_reply" if _critical_without_client_reply(row) else "manual_closed"
+        _remember_closed_dialog(state, row=row, now_ts=now_ts, reason=close_status, actor=actor)
         row.update(
             {
                 "business_status": close_status,
@@ -119,6 +124,7 @@ def apply_pending_followup_action(
         if resolution_note:
             row["resolution_note"] = str(resolution_note).strip()[:1000]
     elif action == "stale":
+        _remember_closed_dialog(state, row=row, now_ts=now_ts, reason="not_relevant", actor=actor)
         row.update(
             {
                 "business_status": "not_relevant",
@@ -179,6 +185,26 @@ def _find_pending_key_by_token(pending: dict[str, Any], token: str) -> str:
         if pending_followup_token(str(key)) == token:
             return str(key)
     return ""
+
+
+def _remember_closed_dialog(state: dict[str, Any], *, row: dict[str, Any], now_ts: int, reason: str, actor: str) -> None:
+    chat_id = str(row.get("chat_id") or row.get("avito_chat_id") or "").strip()
+    if not chat_id:
+        return
+    account_id = int(row.get("account_id") or 0)
+    closed = state.setdefault("closed_dialogs", {})
+    if not isinstance(closed, dict):
+        closed = {}
+        state["closed_dialogs"] = closed
+    closed[f"{account_id}:{chat_id}"] = {
+        "account_id": account_id,
+        "chat_id": chat_id,
+        "message_id": str(row.get("message_id") or ""),
+        "message_created_at": int(row.get("last_client_message_at") or row.get("promised_at") or 0),
+        "closed_at": int(now_ts or 0),
+        "reason": reason,
+        "actor": actor,
+    }
 
 
 def _critical_without_client_reply(row: dict[str, Any]) -> bool:

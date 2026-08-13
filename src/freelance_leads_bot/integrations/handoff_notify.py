@@ -334,12 +334,18 @@ class TelegramHandoffNotifier:
         handoff: Handoff,
         *,
         topic_params: dict[str, str] | None = None,
+        skip_url_hashes: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         photo_results: list[dict[str, Any]] = []
         photo_errors: list[dict[str, Any]] = []
         statuses: list[dict[str, Any]] = []
+        skip_url_hashes = skip_url_hashes or set()
         for index, photo_url in enumerate(_handoff_photo_urls(handoff), start=1):
-            status = {"kind": "photo", "index": index, "url_hash": _url_hash(photo_url), "status": "received"}
+            url_hash = _url_hash(photo_url)
+            if url_hash in skip_url_hashes:
+                statuses.append({"kind": "photo", "index": index, "url_hash": url_hash, "status": "already_sent_to_olga"})
+                continue
+            status = {"kind": "photo", "index": index, "url_hash": url_hash, "status": "received"}
             try:
                 photo_path = await _to_thread_retry(_download_photo_url, photo_url, self.media_dir)
                 status.update({"status": "downloaded", "path": str(photo_path)})
@@ -348,7 +354,7 @@ class TelegramHandoffNotifier:
                 send_result = await _to_thread_retry(lambda: self.bot.send_photo(self.chat_id, photo_path, caption, **(topic_params or {})))
             except Exception as exc:
                 status.update({"status": "manual_avito_check_required", "download_failed": True, "error": repr(exc)})
-                photo_errors.append({"kind": "photo", "url_hash": _url_hash(photo_url), "status": "manual_avito_check_required", "error": repr(exc), "index": index})
+                photo_errors.append({"kind": "photo", "url_hash": url_hash, "status": "manual_avito_check_required", "error": repr(exc), "index": index})
                 statuses.append(status)
                 continue
             status.update({"status": "sent_to_olga"})
@@ -361,13 +367,19 @@ class TelegramHandoffNotifier:
         handoff: Handoff,
         *,
         topic_params: dict[str, str] | None = None,
+        skip_url_hashes: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         media_results: list[dict[str, Any]] = []
         media_errors: list[dict[str, Any]] = []
         statuses: list[dict[str, Any]] = []
+        skip_url_hashes = skip_url_hashes or set()
         photo_urls = set(_handoff_photo_urls(handoff))
         for index, media_url in enumerate([url for url in _handoff_media_urls(handoff) if url not in photo_urls], start=1):
-            status = {"kind": "media", "index": index, "url_hash": _url_hash(media_url), "status": "received"}
+            url_hash = _url_hash(media_url)
+            if url_hash in skip_url_hashes:
+                statuses.append({"kind": "media", "index": index, "url_hash": url_hash, "status": "already_sent_to_olga"})
+                continue
+            status = {"kind": "media", "index": index, "url_hash": url_hash, "status": "received"}
             try:
                 media_path = await _to_thread_retry(_download_photo_url, media_url, self.media_dir)
                 status.update({"status": "downloaded", "path": str(media_path)})
@@ -376,7 +388,7 @@ class TelegramHandoffNotifier:
                 send_result = await _to_thread_retry(lambda: self.bot.send_document(self.chat_id, media_path, caption, **(topic_params or {})))
             except Exception as exc:
                 status.update({"status": "manual_avito_check_required", "download_failed": True, "error": repr(exc)})
-                media_errors.append({"kind": "media", "url_hash": _url_hash(media_url), "status": "manual_avito_check_required", "error": repr(exc), "index": index})
+                media_errors.append({"kind": "media", "url_hash": url_hash, "status": "manual_avito_check_required", "error": repr(exc), "index": index})
                 statuses.append(status)
                 continue
             status.update({"status": "sent_to_olga"})
@@ -441,8 +453,9 @@ class TelegramHandoffNotifier:
         if not topic_params:
             topic_result = await self._topic_for_handoff(handoff)
             topic_params = dict(topic_result.get("topic_params") or {})
-        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params)
-        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params)
+        sent_url_hashes = _sent_media_url_hashes(existing_ref)
+        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params, skip_url_hashes=sent_url_hashes)
+        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params, skip_url_hashes=sent_url_hashes)
         attachment_statuses = photo_statuses + media_statuses
         if attachment_statuses:
             await asyncio.to_thread(_store_ref_media_statuses, self.chat_id, telegram_message_id, attachment_statuses, self.ref_path)
@@ -1218,6 +1231,20 @@ def _handoff_media_ids(handoff: Handoff) -> list[str]:
 def _handoff_media_types(handoff: Handoff) -> list[str]:
     raw = handoff.message.metadata.get("media_types") or []
     return [str(item) for item in raw if str(item)]
+
+
+def _sent_media_url_hashes(ref: dict[str, Any]) -> set[str]:
+    statuses = ref.get("media_statuses") if isinstance(ref, dict) else []
+    if not isinstance(statuses, list):
+        return set()
+    sent_statuses = {"sent_to_olga", "sent_to_telegram", "sent_to_admin", "already_sent_to_olga"}
+    return {
+        str(status.get("url_hash") or "")
+        for status in statuses
+        if isinstance(status, dict)
+        and str(status.get("status") or "") in sent_statuses
+        and str(status.get("url_hash") or "")
+    }
 
 
 def _download_photo_url(photo_url: str, media_dir: Path) -> Path:

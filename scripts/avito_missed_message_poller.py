@@ -162,6 +162,7 @@ def _inbound_from_message(
     message_type = str(raw_message.get("type") or "")
     author_id = str(raw_message.get("author_id") or "")
     has_photo = message_type in {"image", "photo", "video", "file"} or bool(content.get("image") or content.get("photo") or content.get("video") or content.get("file"))
+    media_ids = _media_ids(raw_message)
     is_own_account = author_id == str(account_id)
     client_name = client_name_from_chat(chat, account_id=account_id, author_id=author_id)
     return InboundMessage(
@@ -182,9 +183,9 @@ def _inbound_from_message(
             "is_own_account": is_own_account,
             "message_type": message_type,
             "photo_urls": _photo_urls(raw_message),
-            "photo_ids": [],
+            "photo_ids": media_ids if message_type in {"image", "photo"} else [],
             "media_urls": _photo_urls(raw_message),
-            "media_ids": _media_ids(raw_message),
+            "media_ids": media_ids,
             "media_types": _media_types(raw_message),
             "voice_id": _voice_id(raw_message),
             "raw": {"chat": chat, "message": raw_message},

@@ -590,7 +590,12 @@ def _upsert_outgoing_promise_state(
     pending = state.get("pending_followups") if isinstance(state.get("pending_followups"), dict) else {}
     key = _open_promise_key_for_chat(pending, account_id=account_id, chat_id=chat_id) or f"{int(account_id or 0)}:{chat_id}:webhook-promise"
     row = pending.get(key) if isinstance(pending.get(key), dict) else {}
+    if _dialog_closed_for_message(state, account_id=account_id, chat_id=chat_id, message_created_at=int(getattr(message, "created_at", 0) or 0)):
+        return {"created": False, "reason": "dialog_closed", "key": key}
     reason = str(decision.handoff.reason.value if getattr(decision, "handoff", None) else getattr(decision, "action", "") or "bot_promised_followup")
+    settings = IntegrationSettings.from_env()
+    reminder_seconds = settings.avito_promise_reminder_seconds
+    escalation_seconds = settings.avito_promise_escalation_seconds
     _clear_followup_closure_fields(row)
     row.update(
         {
@@ -606,8 +611,8 @@ def _upsert_outgoing_promise_state(
             "last_client_message_at": int(getattr(message, "created_at", 0) or 0),
             "promised_at": created,
             "promised_at_iso": datetime.fromtimestamp(created, timezone.utc).isoformat(),
-            "deadline_at": created + 3600,
-            "escalation_at": created + 10800,
+            "deadline_at": created + reminder_seconds,
+            "escalation_at": created + escalation_seconds,
             "business_status": "awaiting_olga",
             "business_resolved": False,
             "severity": "critical" if _promise_is_critical(outgoing_reply, reason) else "action",
@@ -706,6 +711,17 @@ def _client_waits_for_from_promise(text: str, reason: str) -> str:
 def _promise_is_critical(text: str, reason: str) -> bool:
     normalized = f"{text} {reason}".casefold().replace("ё", "е")
     return bool(any(marker in normalized for marker in ("адрес", "запис", "подтверж", "дат", "время", "окн", "жалоб", "отзыв")))
+
+
+def _dialog_closed_for_message(state: dict[str, Any], *, account_id: int, chat_id: str, message_created_at: int) -> bool:
+    closed = state.get("closed_dialogs") if isinstance(state.get("closed_dialogs"), dict) else {}
+    row = closed.get(f"{int(account_id or 0)}:{str(chat_id or '').strip()}") if isinstance(closed, dict) else None
+    if not isinstance(row, dict):
+        return False
+    closed_at = int(row.get("closed_at") or 0)
+    if not closed_at:
+        return False
+    return not message_created_at or int(message_created_at or 0) <= closed_at
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:

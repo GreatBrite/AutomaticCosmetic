@@ -253,6 +253,15 @@ FEATURE_FLAGS: tuple[FeatureFlag, ...] = (
 FEATURE_FLAG_BY_COMMAND = {flag.name.casefold(): flag for flag in FEATURE_FLAGS}
 TRUE_VALUES = {"1", "true", "yes", "on", "вкл", "включить", "enable", "enabled"}
 FALSE_VALUES = {"0", "false", "no", "off", "выкл", "выключить", "disable", "disabled"}
+REMINDER_SETTING_DEFAULTS: tuple[tuple[str, int, str], ...] = (
+    ("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600, "повтор по одному неотвеченному диалогу"),
+    ("AVITO_PROMISE_REMINDER_SECONDS", 21600, "первое напоминание по обещанию бота"),
+    ("AVITO_PROMISE_ESCALATION_SECONDS", 43200, "критичный срок по обещанию бота"),
+    ("AVITO_HANDOFF_REMINDER_AFTER_SECONDS", 21600, "первое напоминание по ручной карточке"),
+    ("AVITO_HANDOFF_ESCALATION_AFTER_SECONDS", 43200, "критичная ручная карточка"),
+    ("AVITO_HANDOFF_REMINDER_REPEAT_SECONDS", 21600, "повтор ручного напоминания"),
+    ("AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS", 21600, "повтор критичного ручного напоминания"),
+)
 
 
 def format_active_age(age: float | None) -> str:
@@ -291,6 +300,40 @@ def feature_flags_text() -> str:
     lines.append("")
     lines.append("Пример: <code>/AVITO_POLLER_AUTOSTART вкл</code> или <code>/AVITO_POLLER_AUTOSTART выкл</code>.")
     lines.append("После env-флагов: <code>/bot_restart</code>, чтобы применить без ssh.")
+    return "\n".join(lines)
+
+
+def _env_int_text(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _duration_text(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours} ч"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} мин"
+    return f"{seconds} сек"
+
+
+def avito_reminder_settings_text() -> str:
+    lines = ["<b>Avito напоминания</b>"]
+    lines.append("Сейчас один и тот же открытый диалог напоминается примерно раз в 6 часов.")
+    lines.append("")
+    for key, default, description in REMINDER_SETTING_DEFAULTS:
+        value = _env_int_text(key, default)
+        lines.append(f"<code>{key}</code> = <b>{_duration_text(value)}</b> - {escape(description)}")
+    lines.append("")
+    lines.append("Чтобы изменить: напиши переменную в <code>.env</code> и выполни <code>/bot_restart</code>.")
+    lines.append("Пример для 6 часов: <code>AVITO_UNANSWERED_REPEAT_ALERT_SECONDS=21600</code>.")
+    lines.append("Закрытые кнопками карточки и отвеченные диалоги не должны всплывать повторно до нового сообщения клиента.")
     return "\n".join(lines)
 
 
@@ -2660,6 +2703,7 @@ def menu_text(store: LeadStore) -> str:
         "История Ольги: /olga_history\n"
         "Задачи Ольги: /olga_tasks\n"
         "Avito обещания: /avito_followups\n"
+        "Avito напоминания: /avito_reminders\n"
         "Флаги: /flags, /full_live_on, /full_live_off или команды ниже\n\n"
         + "\n".join(
             f"<code>{flag.command}</code> - вкл/выкл - сейчас <b>{feature_flag_state(flag)}</b> - {escape(flag.description)}"
@@ -3613,6 +3657,8 @@ def serve(settings: Settings) -> None:
                 )
             elif text.startswith("/flags") or text.startswith("/feature_flags"):
                 bot.send_message(reply_chat_id, feature_flags_text(), reply_markup=feature_flags_keyboard(), **topic_params)
+            elif text.startswith("/avito_reminders") or text.startswith("/remind"):
+                bot.send_message(reply_chat_id, avito_reminder_settings_text(), **topic_params)
             elif text.startswith("/full_live_on"):
                 bot.send_message(reply_chat_id, set_all_feature_flags(True, store=store), reply_markup=feature_flags_keyboard(), **topic_params)
             elif text.startswith("/full_live_off"):

@@ -67,6 +67,13 @@ class IntegrationSettings:
     avito_unanswered_min_age_seconds: int
     avito_unanswered_interval_seconds: int
     avito_unanswered_lookback_seconds: int
+    avito_unanswered_repeat_alert_seconds: int
+    avito_promise_reminder_seconds: int
+    avito_promise_escalation_seconds: int
+    avito_handoff_reminder_after_seconds: int
+    avito_handoff_escalation_after_seconds: int
+    avito_handoff_reminder_repeat_seconds: int
+    avito_handoff_escalation_repeat_seconds: int
     rag_retrieval_enabled: bool
     rag_autoanswer_threshold: float
     rag_handoff_threshold: float
@@ -140,6 +147,13 @@ class IntegrationSettings:
             avito_unanswered_min_age_seconds=_env_int("AVITO_UNANSWERED_MIN_AGE_SECONDS", 1200),
             avito_unanswered_interval_seconds=_env_int("AVITO_UNANSWERED_INTERVAL_SECONDS", 300),
             avito_unanswered_lookback_seconds=_env_int("AVITO_UNANSWERED_LOOKBACK_SECONDS", 86400),
+            avito_unanswered_repeat_alert_seconds=_env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600),
+            avito_promise_reminder_seconds=_env_int("AVITO_PROMISE_REMINDER_SECONDS", 21600),
+            avito_promise_escalation_seconds=_env_int("AVITO_PROMISE_ESCALATION_SECONDS", 43200),
+            avito_handoff_reminder_after_seconds=_env_int("AVITO_HANDOFF_REMINDER_AFTER_SECONDS", 21600),
+            avito_handoff_escalation_after_seconds=_env_int("AVITO_HANDOFF_ESCALATION_AFTER_SECONDS", 43200),
+            avito_handoff_reminder_repeat_seconds=_env_int("AVITO_HANDOFF_REMINDER_REPEAT_SECONDS", 21600),
+            avito_handoff_escalation_repeat_seconds=_env_int("AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS", 21600),
             rag_retrieval_enabled=_env_bool("RAG_RETRIEVAL_ENABLED", True),
             rag_dynamic_intent_enabled=_env_bool("RAG_DYNAMIC_INTENT_ENABLED", True),
             rag_service_catalog_enabled=_env_bool("RAG_SERVICE_CATALOG_ENABLED", True),

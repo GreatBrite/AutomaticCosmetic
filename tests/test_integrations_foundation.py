@@ -194,6 +194,7 @@ from scripts.avito_unanswered_monitor import (
     _find_unanswered as find_unanswered_avito_chat,
     _format_alert as format_unanswered_alert,
     _format_followup_alert as format_pending_followup_alert,
+    _unanswered_item_suppressed_by_state as unanswered_item_suppressed_by_state,
     _report_item as report_unanswered_item,
     remember_unanswered_alert_ref,
     audit_once as audit_unanswered_once,
@@ -206,6 +207,7 @@ from scripts.avito_unanswered_monitor import (
 )
 from scripts.avito_missed_message_poller import _list_recent_chats as list_recent_missed_avito_chats
 from scripts.avito_missed_message_poller import _dedup_allowed as missed_poller_dedup_allowed
+from scripts.avito_missed_message_poller import _inbound_from_message as missed_poller_inbound_from_message
 from scripts.avito_missed_message_poller import _should_process as should_process_missed_avito_message
 from scripts.backup_runtime_data import backup_runtime_data
 from scripts.export_open_handoffs import (
@@ -244,6 +246,7 @@ from src.freelance_leads_bot.main import (
     FEATURE_FLAG_BY_COMMAND,
     annotate_sender_for_codex,
     avito_context_hint_from_history,
+    avito_reminder_settings_text,
     codex_tool_conversation_history,
     codex_tool_cross_topic_context,
     codex_history_prefix,
@@ -1497,6 +1500,30 @@ def test_menu_exposes_feature_flag_commands(tmp_path, monkeypatch) -> None:
     assert "AVITO_POLLER_AUTOSTART" in flags_text
     assert flag == FEATURE_FLAG_BY_COMMAND["avito_poller_autostart"]
     assert action == "вкл"
+
+
+def test_avito_reminder_settings_text_exposes_six_hour_defaults(tmp_path, monkeypatch) -> None:
+    for key in (
+        "AVITO_UNANSWERED_REPEAT_ALERT_SECONDS",
+        "AVITO_PROMISE_REMINDER_SECONDS",
+        "AVITO_PROMISE_ESCALATION_SECONDS",
+        "AVITO_HANDOFF_REMINDER_AFTER_SECONDS",
+        "AVITO_HANDOFF_ESCALATION_AFTER_SECONDS",
+        "AVITO_HANDOFF_REMINDER_REPEAT_SECONDS",
+        "AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    store = LeadStore(tmp_path / "leads.sqlite3")
+
+    menu = menu_text(store)
+    text = avito_reminder_settings_text()
+
+    assert "/avito_reminders" in menu
+    assert "AVITO_UNANSWERED_REPEAT_ALERT_SECONDS" in text
+    assert "6 ч" in text
+    assert "AVITO_PROMISE_ESCALATION_SECONDS" in text
+    assert "12 ч" in text
+    assert "/bot_restart" in text
 
 
 def test_feature_flags_keyboard_exposes_full_live_presets() -> None:
@@ -3484,6 +3511,26 @@ def test_telegram_client_inbound_message_extracts_identity_and_photos() -> None:
     assert message.has_photo is True
     assert message.metadata["client_name"] == "Анна Петрова"
     assert message.metadata["photo_ids"] == ["small", "big"]
+
+
+def test_avito_missed_poller_preserves_photo_ids_without_url() -> None:
+    message = missed_poller_inbound_from_message(
+        account_id=1,
+        chat={"id": "chat-photo", "users": [{"id": 10, "name": "Анна"}]},
+        raw_message={
+            "id": "m-photo",
+            "author_id": 10,
+            "direction": "in",
+            "type": "image",
+            "created": 1_720_000_000,
+            "content": {"text": "[фото]", "image": {"id": "img-1"}},
+        },
+    )
+
+    assert message.has_photo is True
+    assert message.metadata["photo_ids"] == ["img-1"]
+    assert message.metadata["media_ids"] == ["img-1"]
+    assert message.metadata["photo_urls"] == []
 
 
 @pytest.mark.anyio
@@ -5933,6 +5980,13 @@ def _settings(allow_mutations: bool = False) -> IntegrationSettings:
         avito_unanswered_min_age_seconds=1200,
         avito_unanswered_interval_seconds=300,
         avito_unanswered_lookback_seconds=86400,
+        avito_unanswered_repeat_alert_seconds=21600,
+        avito_promise_reminder_seconds=21600,
+        avito_promise_escalation_seconds=43200,
+        avito_handoff_reminder_after_seconds=21600,
+        avito_handoff_escalation_after_seconds=43200,
+        avito_handoff_reminder_repeat_seconds=21600,
+        avito_handoff_escalation_repeat_seconds=21600,
         rag_retrieval_enabled=True,
         rag_autoanswer_threshold=0.82,
         rag_handoff_threshold=0.65,
@@ -8277,6 +8331,32 @@ def test_unanswered_alert_not_relevant_button_marks_message_handled(tmp_path) ->
     assert row["needs_action"] is False
 
 
+def test_unanswered_done_suppresses_same_dialog_until_new_client_message(tmp_path) -> None:
+    state_path = tmp_path / "state.json"
+    item = UnansweredChat(
+        account_id=1,
+        chat_id="chat-done",
+        client_name="Анна",
+        message_id="m-old",
+        message_type="text",
+        text="Жду адрес",
+        created=1000,
+        age_seconds=3600,
+    )
+    state = {"handled": {}, "alerts": {}}
+    remember_unanswered_alert_ref(state, item)
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    result = apply_unanswered_action(state_path=state_path, token=unanswered_token("1:chat-done:m-old"), action="done", now=2000)
+    updated = json.loads(state_path.read_text(encoding="utf-8"))
+    later_item = replace(item, message_id="m-new", created=2500)
+
+    assert result["ok"] is True
+    assert unanswered_item_suppressed_by_state(item, updated) is True
+    assert unanswered_item_suppressed_by_state(later_item, updated) is False
+    assert updated["closed_dialogs"]["1:chat-done"]["reason"] == "answered"
+
+
 def test_main_avito_unanswered_callback_handles_stale(tmp_path) -> None:
     class FakeBot:
         def __init__(self):
@@ -8602,6 +8682,7 @@ def test_pending_followup_alert_includes_business_context_and_action() -> None:
         "bot_promise": "Уточню точный адрес и напишу вам.",
         "client_waits_for": "booking_ambiguous",
         "last_client_message": "Жду адрес",
+        "dialog_context": "Клиент: По какому адресу?\nБот/админ: Уточню точный адрес и напишу вам.\nКлиент: Жду адрес",
     }
     text = format_pending_followup_alert(
         [row],
@@ -8615,6 +8696,9 @@ def test_pending_followup_alert_includes_business_context_and_action() -> None:
     assert "Клиент ждёт: подтверждение даты, окна или условий записи" in text
     assert "Клиент ждёт: подтверждение даты, окна или условий записи" in card
     assert "Последнее от клиента: Жду адрес" in text
+    assert "Контекст диалога" in text
+    assert "Клиент: По какому адресу?" in text
+    assert "Контекст диалога" in card
     assert "Нужно сделать: дать клиенту финальный ответ" in text
     assert "chat_id: chat-followup" in text
 
@@ -8632,6 +8716,7 @@ def test_pending_followup_admin_action_closes_state_and_writes_audit(tmp_path) -
                         "chat_id": "chat-followup",
                         "message_id": "m-bot-1",
                         "client_name": "Анна",
+                        "last_client_message_at": 1779999900,
                         "business_status": "overdue",
                         "business_resolved": False,
                     }
@@ -8658,6 +8743,8 @@ def test_pending_followup_admin_action_closes_state_and_writes_audit(tmp_path) -
     assert updated["pending_followups"][key]["business_resolved"] is True
     assert updated["pending_followups"][key]["business_status"] == "not_relevant"
     assert updated["pending_followups"][key]["closed_by"] == "olga"
+    assert updated["closed_dialogs"]["1:chat-followup"]["reason"] == "not_relevant"
+    assert updated["closed_dialogs"]["1:chat-followup"]["message_created_at"] == 1779999900
     assert audit[0]["action"] == "stale"
     assert audit[0]["chat_id"] == "chat-followup"
     assert parse_pending_followup_callback(f"avfu:{token}:done") == (token, "done")
@@ -10770,12 +10857,16 @@ async def test_telegram_handoff_notifier_sends_photos_when_merging_existing_card
 
     await notifier.notify(first)
     second_result = await notifier.notify(second)
+    duplicate_result = await notifier.notify(second)
 
     assert second_result["merged"] is True
     assert second_result["photos_sent"] == 1
     assert second_result["photos_failed"] == 0
+    assert duplicate_result["merged"] is True
+    assert duplicate_result["photos_sent"] == 0
+    assert duplicate_result["media_statuses"][0]["status"] == "already_sent_to_olga"
     assert len(bot.messages) == 1
-    assert len(bot.edits) == 1
+    assert len(bot.edits) == 2
     assert len(bot.photos) == 1
     assert "Фото из avito" in bot.photos[0][2]
 
