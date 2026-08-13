@@ -20,7 +20,7 @@ def dialog_ref(chat_id: str) -> str:
 def legacy_hash_ref(chat_id: str) -> str:
     if not chat_id:
         return "-"
-    return "#" + hashlib.sha1(chat_id.encode("utf-8")).hexdigest()[:6].upper()
+    return "#" + hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:6].upper()
 
 
 def clean_client_name(value: Any) -> str:

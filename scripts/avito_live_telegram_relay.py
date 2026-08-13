@@ -321,7 +321,7 @@ def preview_event_key(row: dict[str, Any]) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
-    return "preview:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return "preview:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def iter_preview_outbox(path: Path, *, since_ts: int) -> list[dict[str, Any]]:
@@ -362,7 +362,7 @@ def handoff_event_key(row: dict[str, Any]) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
-    return "handoff:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return "handoff:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def iter_handoff_outbox(path: Path, *, since_ts: int) -> list[dict[str, Any]]:

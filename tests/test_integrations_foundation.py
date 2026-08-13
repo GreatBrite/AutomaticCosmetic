@@ -243,6 +243,7 @@ from scripts.avito_live_telegram_relay import (
 )
 import src.freelance_leads_bot.codex_runner as codex_runner_module
 import src.freelance_leads_bot.main as main_module
+import src.freelance_leads_bot.sources as sources_module
 from src.freelance_leads_bot.codex_runner import build_chat_prompt, codex_chat_timeout_seconds
 from src.freelance_leads_bot.main import (
     FEATURE_FLAGS,
@@ -275,6 +276,28 @@ from src.freelance_leads_bot.main import (
     telegram_handoff_preview_looks_like_card,
     telegram_handoff_ref_context,
 )
+
+
+def test_fetch_text_rejects_non_http_urls() -> None:
+    with pytest.raises(ValueError, match="http"):
+        sources_module.fetch_text("file:///etc/passwd")
+
+
+def test_fetch_text_rejects_oversized_response(monkeypatch) -> None:
+    class DummyResponse:
+        def __enter__(self) -> "DummyResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int) -> bytes:
+            return b"x" * 6
+
+    monkeypatch.setattr(sources_module.urllib.request, "urlopen", lambda *_args, **_kwargs: DummyResponse())
+
+    with pytest.raises(ValueError, match="too large"):
+        sources_module.fetch_text("https://example.com/feed.xml", max_bytes=5)
 
 
 def test_prepare_avito_outgoing_text_removes_second_greeting_today(tmp_path) -> None:
@@ -5816,10 +5839,12 @@ async def test_telegram_olga_avito_send_teaches_mentor_memory(tmp_path) -> None:
     assert memories[0].metadata["actor"] == "olga"
 
 
-def test_admin_codex_prompt_states_no_separate_parser() -> None:
+def test_admin_codex_prompt_describes_structured_intent_validation() -> None:
     prompt = build_admin_codex_prompt({"message": {"text": "Запиши Анну"}, "available_tools": []}, [])
 
-    assert "Нет отдельного парсера команд" in prompt
+    assert "Выбор tools в основном admin-Codex пути делает Codex" in prompt
+    assert "expert_rag.plan_change" in prompt
+    assert "валидирует структурированный intent" in prompt
     assert "Не копируй её дословно" in prompt
     assert "tool_calls" in prompt
     assert "Работай нелинейно" in prompt

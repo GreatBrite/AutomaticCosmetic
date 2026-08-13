@@ -2,7 +2,7 @@
   <rect width="1600" height="1000" fill="#f7f8fb"/>
   <rect x="88" y="84" width="1424" height="832" rx="36" fill="#ffffff" stroke="#d8dde8" stroke-width="3"/>
   <text x="140" y="170" font-family="Inter, Arial, sans-serif" font-size="44" font-weight="700" fill="#111827">AI Telegram Agents for Client Operations</text>
-  <text x="140" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">Telegram, Avito, YClients, OpenRouter, persistent memory, admin workflows</text>
+  <text x="140" y="225" font-family="Inter, Arial, sans-serif" font-size="24" fill="#64748b">Telegram, Avito, YClients, Codex CLI, persistent memory, admin workflows</text>
   <rect x="140" y="295" width="380" height="455" rx="26" fill="#eef6ff" stroke="#b9d8ff" stroke-width="3"/>
   <text x="180" y="365" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="700" fill="#0f172a">Client Message</text>
   <rect x="180" y="415" width="285" height="54" rx="18" fill="#ffffff"/>
@@ -28,4 +28,3 @@
   <path d="M1000 520 H1060" stroke="#94a3b8" stroke-width="8" stroke-linecap="round"/>
   <text x="140" y="835" font-family="Inter, Arial, sans-serif" font-size="24" fill="#475569">Case study visual: AI-assisted messaging and admin automation</text>
 </svg>
-

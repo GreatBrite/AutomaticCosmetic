@@ -2,6 +2,7 @@ aiogram
 aiosqlite
 apscheduler
 avito-python-sdk
+defusedxml
 fastapi>=0.136.1
 faster-whisper>=1.1,<2
 httpx

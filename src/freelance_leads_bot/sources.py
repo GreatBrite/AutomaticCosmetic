@@ -4,12 +4,15 @@ import hashlib
 import html
 import json
 import re
+import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+
+from defusedxml import ElementTree as ET
 
 
 USER_AGENT = "Mozilla/5.0 freelance-leads-bot/1.0"
+MAX_FETCH_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -23,10 +26,16 @@ class RawLead:
     lead_type: str = "project"
 
 
-def fetch_text(url: str, timeout: int = 20) -> str:
+def fetch_text(url: str, timeout: int = 20, *, max_bytes: int = MAX_FETCH_BYTES) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Only http(s) URLs can be fetched.")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("Fetched response is too large.")
+    return data.decode("utf-8", errors="replace")
 
 
 def clean(value: str) -> str:

@@ -321,11 +321,9 @@ def run_command(command: str, cwd_text: str | None, default_cwd: Path) -> dict[s
 
     started = time.monotonic()
     completed = subprocess.run(
-        command,
+        ["/bin/bash", "-lc", command],
         cwd=str(cwd),
         env={**os.environ, "HOME": os.environ.get("HOME", "/root")},
-        shell=True,
-        executable="/bin/bash",
         text=True,
         capture_output=True,
         timeout=COMMAND_TIMEOUT_SECONDS,
