@@ -98,6 +98,7 @@ from src.freelance_leads_bot.integrations.avito_history_import import import_tel
 from src.freelance_leads_bot.integrations.handoff_notify import (
     PreviewHandoffNotifier,
     TelegramHandoffNotifier,
+    _validate_public_media_url,
     format_handoff_message,
     handoff_followup_keyboard,
     handoff_followup_token,
@@ -185,7 +186,6 @@ from src.freelance_leads_bot.integrations.yclients import (
 from src.freelance_leads_bot.integrations.config import IntegrationSettings
 from src.freelance_leads_bot.integrations.expert_rag import APPROVED, NEEDS_REVIEW, ExpertRagStore
 from src.freelance_leads_bot.integrations.expert_rag_admin import ExpertRagAdminService, parse_rag_admin_callback
-from src.freelance_leads_bot.integrations.openrouter_intent import OpenRouterIntentClient
 from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntentParser
 from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
 import src.freelance_leads_bot.integrations.runtime as runtime_module
@@ -6066,8 +6066,6 @@ def _settings(allow_mutations: bool = False) -> IntegrationSettings:
         telegram_admin_history_enabled=True,
         telegram_admin_history_limit=8,
         telegram_admin_history_db_path=history_db_path,
-        openrouter_api_key="openrouter",
-        default_model="model",
         avito_codex_enabled=False,
         avito_codex_timeout_seconds=180,
         avito_codex_max_steps=6,
@@ -7132,7 +7130,7 @@ def test_rag_admin_intent_parser_uses_llm_json_and_falls_back_on_timeout() -> No
     assert fallback.parser_source == "fallback"
 
 
-def test_runtime_rag_admin_intent_uses_codex_cli_not_openrouter(tmp_path, monkeypatch) -> None:
+def test_runtime_rag_admin_intent_uses_codex_cli(tmp_path, monkeypatch) -> None:
     calls = []
 
     def fake_chat_with_codex(message, history=None, timeout_seconds=None, progress_callback=None, raw_prompt=False):
@@ -7158,7 +7156,7 @@ def test_runtime_rag_admin_intent_uses_codex_cli_not_openrouter(tmp_path, monkey
         )
 
     monkeypatch.setattr(runtime_module, "chat_with_codex", fake_chat_with_codex)
-    settings = replace(_settings(), openrouter_api_key="", default_model="", rag_dynamic_intent_enabled=True)
+    settings = replace(_settings(), rag_dynamic_intent_enabled=True)
 
     parser = rag_admin_intent_parser_from_settings(settings)
     intent = parser.parse("Сделай Avito-напоминания раз в шесть часов")
@@ -7169,37 +7167,6 @@ def test_runtime_rag_admin_intent_uses_codex_cli_not_openrouter(tmp_path, monkey
     assert intent.parser_source == "llm"
     assert calls[0]["raw_prompt"] is True
     assert calls[0]["history"] is None
-
-
-def test_openrouter_intent_client_extracts_message_text() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps({"intent": "policy_update", "confidence": 0.9}, ensure_ascii=False)
-                        }
-                    }
-                ]
-            },
-        )
-
-    client = OpenRouterIntentClient(
-        api_key="key",
-        model="model",
-        client=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://openrouter.test"),
-    )
-
-    raw = client("Команда")
-
-    assert json.loads(raw)["intent"] == "policy_update"
-    assert requests
-    assert json.loads(requests[0].content)["response_format"] == {"type": "json_object"}
 
 
 def test_expert_rag_admin_exact_price_and_service_lifecycle(tmp_path) -> None:
@@ -10446,6 +10413,21 @@ async def test_telegram_handoff_notifier_downloads_and_sends_avito_photo_urls(tm
     ref = find_telegram_handoff_ref("admin-chat", 1, ref_path)
     assert ref is not None
     assert ref["avito_chat_id"] == "chat-photo"
+
+
+def test_handoff_media_url_validation_blocks_private_and_local_targets() -> None:
+    blocked = [
+        "file:///etc/passwd",
+        "http://127.0.0.1/photo.jpg",
+        "http://localhost/photo.jpg",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.1/photo.jpg",
+        "http://[::1]/photo.jpg",
+    ]
+
+    for url in blocked:
+        with pytest.raises(ValueError):
+            _validate_public_media_url(url)
 
 
 @pytest.mark.anyio

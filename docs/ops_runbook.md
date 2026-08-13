@@ -175,7 +175,7 @@ Dry-run миграции существующих approved RAG-знаний к `
 .venv/bin/python scripts/service_catalog_admin.py migration-apply --plan data/service_catalog_migration_plan.json
 ```
 
-LLM-понимание свободных команд Ольги использует `OPENROUTER_API_KEY`, `DEFAULT_MODEL` и `RAG_INTENT_LLM_TIMEOUT_SECONDS`. Если LLM недоступен или вернул невалидный JSON, бот автоматически использует безопасный fallback parser и пишет `parser_source=fallback` в metadata плана.
+Смысловое понимание свободных команд Ольги использует локальный Codex CLI через общий helper `chat_with_codex` и timeout `RAG_INTENT_LLM_TIMEOUT_SECONDS`. Если Codex CLI недоступен, не успел ответить или вернул невалидный JSON, бот автоматически использует безопасный fallback parser и пишет `parser_source=fallback` в metadata плана.
 
 ## Что делать при Avito warning/error
 

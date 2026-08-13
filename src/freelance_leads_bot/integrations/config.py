@@ -54,8 +54,6 @@ class IntegrationSettings:
     telegram_admin_history_enabled: bool
     telegram_admin_history_limit: int
     telegram_admin_history_db_path: Path
-    openrouter_api_key: str
-    default_model: str
     avito_codex_enabled: bool
     avito_codex_timeout_seconds: int
     avito_codex_max_steps: int
@@ -134,8 +132,6 @@ class IntegrationSettings:
             telegram_admin_history_db_path=Path(_env("TELEGRAM_ADMIN_HISTORY_DB_PATH", str(ROOT / "data" / "leads.sqlite3"))),
             telegram_client_topics_enabled=_env_bool("TELEGRAM_CLIENT_TOPICS_ENABLED", True),
             telegram_client_topics_path=Path(_env("TELEGRAM_CLIENT_TOPICS_PATH", str(ROOT / "data" / "telegram_client_topics.json"))),
-            openrouter_api_key=_env("OPENROUTER_API_KEY"),
-            default_model=_env("DEFAULT_MODEL", "anthropic/claude-sonnet-4.5"),
             avito_codex_enabled=True if avito_test_mode else _env_bool("AVITO_CODEX_ENABLED"),
             avito_codex_timeout_seconds=_env_int("AVITO_CODEX_TIMEOUT_SECONDS", 180),
             avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 4),

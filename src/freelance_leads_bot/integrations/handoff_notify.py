@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import re
+import socket
 import time
 import urllib.request
 from dataclasses import asdict
@@ -12,6 +14,7 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from ..telegram import TelegramBot
 from .booking_flow import extract_date, extract_time
@@ -66,6 +69,7 @@ class HandoffNotifier(Protocol):
 
 
 HANDOFF_FOLLOWUP_ACTIONS = {"done", "stale", "later"}
+MAX_HANDOFF_MEDIA_BYTES = 15 * 1024 * 1024
 
 
 def handoff_followup_token(handoff_id: str) -> str:
@@ -1248,16 +1252,45 @@ def _sent_media_url_hashes(ref: dict[str, Any]) -> set[str]:
 
 
 def _download_photo_url(photo_url: str, media_dir: Path) -> Path:
+    _validate_public_media_url(photo_url)
     media_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(photo_url.encode("utf-8")).hexdigest()[:16]
     request = urllib.request.Request(photo_url, headers={"User-Agent": "AutomaticCosmetic/1.0"})
     with urllib.request.urlopen(request, timeout=30) as response:
-        content = response.read()
+        content_length = response.headers.get("Content-Length", "")
+        if content_length:
+            try:
+                too_large = int(content_length) > MAX_HANDOFF_MEDIA_BYTES
+            except ValueError:
+                too_large = False
+            if too_large:
+                raise ValueError("media file is too large")
+        content = response.read(MAX_HANDOFF_MEDIA_BYTES + 1)
+        if len(content) > MAX_HANDOFF_MEDIA_BYTES:
+            raise ValueError("media file is too large")
         content_type = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0].strip()
     suffix = mimetypes.guess_extension(content_type) or ".jpg"
     path = media_dir / f"avito_{digest}{suffix}"
     path.write_bytes(content)
     return path
+
+
+def _validate_public_media_url(photo_url: str) -> None:
+    parsed = urlparse(str(photo_url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("media URL scheme is not allowed")
+    if not parsed.hostname:
+        raise ValueError("media URL host is missing")
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError("media URL host could not be resolved") from exc
+    if not addresses:
+        raise ValueError("media URL host could not be resolved")
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+        if not ip.is_global:
+            raise ValueError("media URL resolves to a non-public address")
 
 
 async def _to_thread_retry(func: Any, *args: Any, attempts: int = 3, delay_seconds: float = 1.0) -> Any:
