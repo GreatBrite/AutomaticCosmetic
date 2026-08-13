@@ -7,13 +7,30 @@ from .care_crm import CareCrmStore
 from .codex_planner import CodexPlannerRunner
 from .config import IntegrationSettings
 from .expert_rag import ExpertRagStore
-from .openrouter_intent import OpenRouterIntentClient
 from .rag_admin_intent import RagAdminIntentParser
 from .rag_retrieval import RagRetrievalService
 from .roles import CodexRole, RoleProfile, role_profile
 from .service_catalog import ServiceCatalogStore
 from .handoff_notify import HandoffNotifier
 from .yclients import DryRunYClientsGateway, LiveReadDryRunYClientsGateway, YClientsGateway, YClientsHttpGateway
+from ..codex_runner import chat_with_codex
+
+
+class CodexIntentClient:
+    """Synchronous structured-intent adapter backed by the project's Codex CLI."""
+
+    def __init__(self, *, timeout_seconds: int = 20) -> None:
+        self.timeout_seconds = max(int(timeout_seconds or 20), 1)
+
+    def __call__(self, prompt: str) -> str:
+        text, _path = chat_with_codex(
+            prompt,
+            None,
+            self.timeout_seconds,
+            None,
+            True,
+        )
+        return text
 
 
 def booking_from_settings(settings: IntegrationSettings) -> YClientsGateway:
@@ -65,10 +82,6 @@ def rag_retrieval_from_settings(settings: IntegrationSettings) -> RagRetrievalSe
 
 def rag_admin_intent_parser_from_settings(settings: IntegrationSettings) -> RagAdminIntentParser:
     llm = None
-    if settings.rag_dynamic_intent_enabled and settings.openrouter_api_key:
-        llm = OpenRouterIntentClient(
-            api_key=settings.openrouter_api_key,
-            model=settings.default_model,
-            timeout_seconds=settings.rag_intent_llm_timeout_seconds,
-        )
+    if settings.rag_dynamic_intent_enabled:
+        llm = CodexIntentClient(timeout_seconds=settings.rag_intent_llm_timeout_seconds)
     return RagAdminIntentParser(llm=llm, enabled=settings.rag_dynamic_intent_enabled)

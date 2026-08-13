@@ -188,6 +188,8 @@ from src.freelance_leads_bot.integrations.expert_rag_admin import ExpertRagAdmin
 from src.freelance_leads_bot.integrations.openrouter_intent import OpenRouterIntentClient
 from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntentParser
 from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
+import src.freelance_leads_bot.integrations.runtime as runtime_module
+from src.freelance_leads_bot.integrations.runtime import CodexIntentClient, rag_admin_intent_parser_from_settings
 from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
 from scripts.avito_unanswered_monitor import (
     UnansweredChat,
@@ -7128,6 +7130,45 @@ def test_rag_admin_intent_parser_uses_llm_json_and_falls_back_on_timeout() -> No
 
     assert fallback.intent == "effect_duration_update"
     assert fallback.parser_source == "fallback"
+
+
+def test_runtime_rag_admin_intent_uses_codex_cli_not_openrouter(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_chat_with_codex(message, history=None, timeout_seconds=None, progress_callback=None, raw_prompt=False):
+        calls.append(
+            {
+                "message": message,
+                "history": history,
+                "timeout_seconds": timeout_seconds,
+                "progress_callback": progress_callback,
+                "raw_prompt": raw_prompt,
+            }
+        )
+        return (
+            json.dumps(
+                {
+                    "intent": "avito_reminder_cadence_update",
+                    "confidence": 0.91,
+                    "operation": {"interval_seconds": 21600},
+                },
+                ensure_ascii=False,
+            ),
+            tmp_path / "codex-intent.txt",
+        )
+
+    monkeypatch.setattr(runtime_module, "chat_with_codex", fake_chat_with_codex)
+    settings = replace(_settings(), openrouter_api_key="", default_model="", rag_dynamic_intent_enabled=True)
+
+    parser = rag_admin_intent_parser_from_settings(settings)
+    intent = parser.parse("Сделай Avito-напоминания раз в шесть часов")
+
+    assert parser.llm is not None
+    assert isinstance(parser.llm, CodexIntentClient)
+    assert intent.intent == "avito_reminder_cadence_update"
+    assert intent.parser_source == "llm"
+    assert calls[0]["raw_prompt"] is True
+    assert calls[0]["history"] is None
 
 
 def test_openrouter_intent_client_extracts_message_text() -> None:
