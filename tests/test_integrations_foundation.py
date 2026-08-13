@@ -3128,6 +3128,27 @@ def test_client_message_router_blocks_risk_address_and_media() -> None:
     assert media_missing_details.route == "ask_consultation_details"
 
 
+def test_client_message_router_handoffs_photo_after_text_clarification() -> None:
+    route = route_client_message(
+        InboundMessage(
+            channel=Channel.AVITO,
+            client_id="client-media-followup",
+            chat_id="chat-media-followup",
+            text="По губам хочу исправить асимметрию, раньше не делала",
+        ),
+        conversation_history=(
+            {"role": "user", "content": "message_id: m-photo\n[photo]"},
+            {
+                "role": "assistant",
+                "content": "Уточните, пожалуйста: какая зона интересует, опишите зону и что хотите получить в результате.",
+            },
+        ),
+    )
+
+    assert route.route == "media_handoff"
+    assert route.handoff_reason == HandoffReason.PHOTO_CONSULTATION.value
+
+
 @pytest.mark.parametrize("city", ["Ейск", "Анапа", "Новороссийск", "Павловская", "Абинск"])
 def test_client_message_router_blocks_unsupported_city_booking(city: str) -> None:
     route = route_client_message(
@@ -11189,6 +11210,32 @@ async def test_avito_handoff_photo_resolver_fills_missing_photo_urls() -> None:
 
     assert enriched.handoff is not None
     assert enriched.handoff.message.metadata["photo_urls"] == ["https://img.example/from-api.jpg"]
+
+
+@pytest.mark.anyio
+async def test_avito_handoff_photo_resolver_uses_recent_chat_photo_after_clarification() -> None:
+    class FakeResolver:
+        async def photo_urls(self, account_id, chat_id, message_id=""):
+            assert account_id == 1
+            assert chat_id == "chat-photo"
+            assert message_id == ""
+            return ["https://img.example/previous-photo.jpg"]
+
+    message = InboundMessage(
+        channel=Channel.AVITO,
+        client_id="client-photo",
+        chat_id="chat-photo",
+        message_id="m-clarify",
+        text="По губам хочу исправить асимметрию, раньше не делала",
+    )
+    handoff = Handoff(reason=HandoffReason.PHOTO_CONSULTATION, message=message, summary="Клиент уточнил детали после фото.")
+    reply = AvitoConsultantReply(action="handoff", reply="Передам фото", handoff=handoff)
+
+    enriched = await enrich_reply_handoff_photos(reply, resolver=FakeResolver(), account_id=1)
+
+    assert enriched.handoff is not None
+    assert enriched.handoff.message.metadata["photo_urls"] == ["https://img.example/previous-photo.jpg"]
+    assert enriched.handoff.message.metadata["photo_source"] == "recent_chat_history"
 
 
 @pytest.mark.anyio

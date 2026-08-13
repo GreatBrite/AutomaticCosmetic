@@ -78,6 +78,8 @@ def route_client_message(
     unsupported_city = explicit_external_city(text, cities=cities)
     service_key = _service_key_from_text(text)
     has_service_hint = bool(_has_service_hint(lowered, service_aliases) or _history_service_hint(conversation_history, service_aliases))
+    has_media = _has_media(message)
+    has_recent_media_context = has_media or _history_has_media(conversation_history)
 
     if RISK_RE.search(lowered):
         return ClientRoute(
@@ -110,7 +112,7 @@ def route_client_message(
         )
 
     if _aesthetic_expectation_question(lowered, conversation_history):
-        if _needs_consultation_details(message, lowered, conversation_history):
+        if _needs_consultation_details(message, lowered, conversation_history, has_media_context=has_recent_media_context):
             return ClientRoute(
                 route="ask_consultation_details",
                 city=city,
@@ -128,7 +130,7 @@ def route_client_message(
             metadata={"guard": "aesthetic_expectation_guard", "reason": "нельзя автообещать результат по мл"},
         )
 
-    if _individual_expert_question(lowered) and not _has_media(message):
+    if _individual_expert_question(lowered) and not has_recent_media_context:
         return ClientRoute(
             route="ask_consultation_details",
             city=city,
@@ -137,8 +139,8 @@ def route_client_message(
             metadata={"reason": "индивидуальную оценку нельзя дать без фото/вводных"},
         )
 
-    if _has_media(message):
-        if _needs_consultation_details(message, lowered, conversation_history):
+    if has_media or (has_recent_media_context and _consultation_details_complete(lowered)):
+        if _needs_consultation_details(message, lowered, conversation_history, has_media_context=has_recent_media_context):
             return ClientRoute(
                 route="ask_consultation_details",
                 city=city,
@@ -209,21 +211,31 @@ def _has_media(message: InboundMessage) -> bool:
     )
 
 
+def _history_has_media(conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
+    recent_user_text = "\n".join(
+        str(item.get("content") or "") for item in conversation_history[-8:] if str(item.get("role") or "") == "user"
+    ).casefold()
+    return bool(re.search(r"(?iu)(?:^|\n)\[(?:photo|media|video|file)\](?:\n|$)", recent_user_text))
+
+
 def _needs_consultation_details(
     message: InboundMessage,
     lowered: str,
     conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    *,
+    has_media_context: bool | None = None,
 ) -> bool:
+    has_media_context = _has_media(message) if has_media_context is None else has_media_context
     if _history_consultation_details(conversation_history):
         return False
     if not str(message.text or "").strip() or str(message.text or "").strip().casefold() in {"[фото]", "фото"}:
         return True
-    if _has_media(message) and not _consultation_details_complete(lowered):
+    if has_media_context and not _consultation_details_complete(lowered):
         return True
-    if _individual_expert_question(lowered) and not _has_media(message) and VISUAL_RE.search(lowered):
+    if _individual_expert_question(lowered) and not has_media_context and VISUAL_RE.search(lowered):
         return True
     if _aesthetic_expectation_question(lowered, conversation_history):
-        return not (_has_media(message) and _consultation_details_complete(lowered))
+        return not (has_media_context and _consultation_details_complete(lowered))
     return False
 
 
