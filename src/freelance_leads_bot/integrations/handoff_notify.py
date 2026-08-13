@@ -691,8 +691,7 @@ async def process_handoff_sla(
                 result["topic"] = topic_result
             notifications.append(result)
             if _notification_delivered(result):
-                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
-                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
+                await _replace_handoff_sla_message(notifier, refs, ref, result)
                 ref["reminder_sent_at"] = now
                 ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
                 ref["updated_at"] = now
@@ -715,8 +714,7 @@ async def process_handoff_sla(
                 result["topic"] = topic_result
             notifications.append(result)
             if _notification_delivered(result):
-                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
-                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
+                await _replace_handoff_sla_message(notifier, refs, ref, result)
                 ref["escalation_sent_at"] = now
                 ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
                 ref["updated_at"] = now
@@ -748,6 +746,53 @@ def _notification_delivered(result: Any) -> bool:
 def _handoff_sla_topic_params(ref: dict[str, Any]) -> dict[str, str]:
     thread_id = str(ref.get("telegram_message_thread_id") or "").strip()
     return {"message_thread_id": thread_id} if thread_id else {}
+
+
+async def _replace_handoff_sla_message(
+    notifier: HandoffNotifier,
+    refs: dict[str, dict],
+    ref: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    telegram_chat_id = str(ref.get("telegram_chat_id") or "").strip()
+    old_message_id = str(ref.get("telegram_message_id") or "").strip()
+    used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
+    thread_id = str((used_topic_params or {}).get("message_thread_id") or ref.get("telegram_message_thread_id") or "").strip()
+    new_message_id = _notification_message_id(result)
+    if thread_id:
+        ref["telegram_message_thread_id"] = thread_id
+    if not telegram_chat_id or not old_message_id or not new_message_id or new_message_id == old_message_id:
+        return
+    delete_result = await _delete_handoff_sla_message(notifier, telegram_chat_id, old_message_id)
+    old_key = f"{telegram_chat_id}:{old_message_id}"
+    new_key = f"{telegram_chat_id}:{new_message_id}"
+    ref["previous_telegram_message_id"] = old_message_id
+    ref["telegram_message_id"] = new_message_id
+    ref["telegram_message_delete_result"] = delete_result
+    refs.pop(old_key, None)
+    refs[new_key] = ref
+
+
+def _notification_message_id(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    telegram = result.get("telegram") if isinstance(result.get("telegram"), dict) else {}
+    return _telegram_message_id(telegram) or _telegram_message_id(result)
+
+
+async def _delete_handoff_sla_message(notifier: HandoffNotifier, telegram_chat_id: str, telegram_message_id: str) -> dict[str, Any]:
+    bot = getattr(notifier, "bot", None)
+    if not bot or not hasattr(bot, "api"):
+        return {"ok": False, "reason": "delete_not_supported"}
+    try:
+        return await _to_thread_retry(
+            bot.api,
+            "deleteMessage",
+            {"chat_id": telegram_chat_id, "message_id": telegram_message_id},
+            8,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": "delete_failed", "error": repr(exc)}
 
 
 async def _handoff_sla_topic_result(notifier: HandoffNotifier, ref: dict[str, Any]) -> dict[str, Any]:

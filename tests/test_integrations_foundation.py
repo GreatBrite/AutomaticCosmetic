@@ -10679,6 +10679,7 @@ async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missin
         def __init__(self) -> None:
             self.messages = []
             self.topics = []
+            self.deleted = []
 
         def send_message(self, chat_id, text, **kwargs):
             self.messages.append((chat_id, text, kwargs))
@@ -10687,6 +10688,10 @@ async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missin
         def create_forum_topic(self, chat_id, name):
             self.topics.append((chat_id, name))
             return {"ok": True, "result": {"message_thread_id": 99}}
+
+        def api(self, method, payload, timeout=30):
+            self.deleted.append((method, payload, timeout))
+            return {"ok": True, "result": True}
 
     ref_path = tmp_path / "handoff_refs.json"
     topics_path = tmp_path / "topics.json"
@@ -10732,7 +10737,11 @@ async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missin
     assert bot.topics == []
     assert bot.messages[0][2]["message_thread_id"] == "55"
     assert bot.messages[0][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("hfu:")
-    assert updated["admin-chat:1"]["telegram_message_thread_id"] == "55"
+    assert "admin-chat:1" not in updated
+    assert updated["admin-chat:11"]["telegram_message_id"] == "11"
+    assert updated["admin-chat:11"]["previous_telegram_message_id"] == "1"
+    assert updated["admin-chat:11"]["telegram_message_thread_id"] == "55"
+    assert bot.deleted == [("deleteMessage", {"chat_id": "admin-chat", "message_id": "1"}, 8)]
 
 
 @pytest.mark.anyio
