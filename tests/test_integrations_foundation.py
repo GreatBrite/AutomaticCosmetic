@@ -3574,7 +3574,7 @@ async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, mo
     assert "можем предложить" not in unsafe_reply_text
     assert all(ref.get("deadline_at") for ref in urgent_refs)
     assert sla["deduped"] >= len(refs) - 1
-    assert sla["reminders"] == 1
+    assert sla["reminders"] == 0
     assert sla["escalations"] == 1
 
 
@@ -10674,11 +10674,12 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
     updated = load_telegram_handoff_refs(ref_path)
 
-    assert result["reminders"] == 2
+    assert result["reminders"] == 1
     assert result["escalations"] == 1
     assert result["expired"] == 1
     assert updated[f"admin-chat:1"]["reminder_sent_at"] == now
     assert updated[f"admin-chat:2"]["escalation_sent_at"] == now
+    assert updated[f"admin-chat:2"].get("reminder_sent_at", 0) == 0
     assert updated[f"admin-chat:3"]["status"] == "expired"
     assert any("Напоминание" in text for text in notifier.texts)
     assert any("Критично" in text for text in notifier.texts)
@@ -10856,7 +10857,7 @@ async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(
     refs = load_telegram_handoff_refs(ref_path)
     refs["admin-chat:1"]["created_at"] = now - 5 * 60 * 60
     refs["admin-chat:1"]["reminder_sent_at"] = now - 7 * 60 * 60
-    refs["admin-chat:1"]["escalation_sent_at"] = now - 3 * 60 * 60
+    refs["admin-chat:1"]["escalation_sent_at"] = now - 7 * 60 * 60
     save_telegram_handoff_refs(refs, ref_path)
     notifier = FakeNotifier()
 
@@ -10871,10 +10872,11 @@ async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(
     )
     updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
 
-    assert result["reminders"] == 1
+    assert result["reminders"] == 0
     assert result["escalations"] == 1
-    assert updated["handoff_id"] == ref["handoff_id"]
-    assert updated["reminder_count"] == 1
+    updated_ref = next(iter(load_telegram_handoff_refs(ref_path).values()))
+    assert updated_ref["handoff_id"] == ref["handoff_id"]
+    assert updated_ref.get("reminder_count", 0) == 0
     assert updated["escalation_count"] == 1
     assert len(load_telegram_handoff_refs(ref_path)) == 1
 
@@ -10956,6 +10958,49 @@ async def test_handoff_sla_does_not_mark_pseudo_ok_notifications_as_sent(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_handoff_sla_uses_shared_cooldown_between_reminder_and_escalation(tmp_path) -> None:
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.texts = []
+
+        async def notify_text(self, text, **kwargs):
+            self.texts.append(text)
+            return {"sent": True, "text": text}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-critical",
+        handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
+        urgency="critical",
+        reason="booking_critical",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 13 * 60 * 60
+    refs["admin-chat:1"]["reminder_sent_at"] = now - 30 * 60
+    refs["admin-chat:1"]["last_sla_notification_at"] = now - 30 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    notifier = FakeNotifier()
+
+    result = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=6 * 60 * 60,
+        escalation_after_seconds=12 * 60 * 60,
+        reminder_repeat_seconds=6 * 60 * 60,
+        escalation_repeat_seconds=6 * 60 * 60,
+    )
+
+    assert result["reminders"] == 0
+    assert result["escalations"] == 0
+    assert notifier.texts == []
+
+
+@pytest.mark.anyio
 async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(tmp_path) -> None:
     class FakeNotifier:
         def __init__(self) -> None:
@@ -10988,10 +11033,10 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
     refs = load_telegram_handoff_refs(ref_path)
     refs["admin-chat:1"]["created_at"] = now - 4 * 60 * 60
     refs["admin-chat:1"]["reminder_sent_at"] = now - 7 * 60 * 60
-    refs["admin-chat:1"]["escalation_sent_at"] = now - 3 * 60 * 60
+    refs["admin-chat:1"]["escalation_sent_at"] = now - 7 * 60 * 60
     refs["admin-chat:2"]["created_at"] = now - 2 * 60 * 60
     refs["admin-chat:2"]["reminder_sent_at"] = now - 7 * 60 * 60
-    refs["admin-chat:2"]["escalation_sent_at"] = now - 3 * 60 * 60
+    refs["admin-chat:2"]["escalation_sent_at"] = now - 7 * 60 * 60
     save_telegram_handoff_refs(refs, ref_path)
 
     notifier = FakeNotifier()
@@ -11007,10 +11052,10 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
     updated = load_telegram_handoff_refs(ref_path)
 
     assert result["deduped"] == 1
-    assert result["reminders"] == 1
+    assert result["reminders"] == 0
     assert result["escalations"] == 1
-    assert len(notifier.texts) == 2
-    assert updated["admin-chat:1"]["reminder_count"] == 1
+    assert len(notifier.texts) == 1
+    assert updated["admin-chat:1"].get("reminder_count", 0) == 0
     assert updated["admin-chat:1"]["escalation_count"] == 1
     assert updated["admin-chat:2"].get("reminder_count", 0) == 0
     assert updated["admin-chat:2"].get("escalation_count", 0) == 0

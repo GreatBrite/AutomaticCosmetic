@@ -677,36 +677,36 @@ async def process_handoff_sla(
             changed = True
             continue
         reminder_sent_at = int(ref.get("reminder_sent_at") or 0)
+        last_sla_notification_at = max(
+            reminder_sent_at,
+            int(ref.get("escalation_sent_at") or 0),
+            int(ref.get("last_sla_notification_at") or 0),
+        )
+        notification_repeat_seconds = max(
+            1,
+            int(reminder_repeat_seconds or 1),
+            int(escalation_repeat_seconds or 1),
+        )
         can_send_reminder = age >= reminder_after_seconds and (
             not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
         )
-        if can_send_reminder:
-            topic_result = await _handoff_sla_topic_result(notifier, ref)
-            result = await notifier.notify_text(
-                _format_handoff_sla_notification(ref, event="reminder"),
-                reply_markup=handoff_followup_keyboard(ref),
-                topic_params=dict(topic_result.get("topic_params") or {}),
-            )
-            if isinstance(result, dict) and "topic" not in result:
-                result["topic"] = topic_result
-            notifications.append(result)
-            if _notification_delivered(result):
-                await _replace_handoff_sla_message(notifier, refs, ref, result)
-                ref["reminder_sent_at"] = now
-                ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
-                ref["updated_at"] = now
-                reminders += 1
-                changed = True
         escalation_sent_at = int(ref.get("escalation_sent_at") or 0)
         can_send_escalation = (
             handoff_ref_is_critical(ref)
             and age >= escalation_after_seconds
             and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
         )
-        if can_send_escalation:
+        event = ""
+        cooldown_passed = not last_sla_notification_at or now - last_sla_notification_at >= notification_repeat_seconds
+        if cooldown_passed:
+            if can_send_escalation:
+                event = "escalation"
+            elif can_send_reminder:
+                event = "reminder"
+        if event:
             topic_result = await _handoff_sla_topic_result(notifier, ref)
             result = await notifier.notify_text(
-                _format_handoff_sla_notification(ref, event="escalation"),
+                _format_handoff_sla_notification(ref, event=event),
                 reply_markup=handoff_followup_keyboard(ref),
                 topic_params=dict(topic_result.get("topic_params") or {}),
             )
@@ -715,10 +715,16 @@ async def process_handoff_sla(
             notifications.append(result)
             if _notification_delivered(result):
                 await _replace_handoff_sla_message(notifier, refs, ref, result)
-                ref["escalation_sent_at"] = now
-                ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
+                if event == "escalation":
+                    ref["escalation_sent_at"] = now
+                    ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
+                    escalations += 1
+                else:
+                    ref["reminder_sent_at"] = now
+                    ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
+                    reminders += 1
+                ref["last_sla_notification_at"] = now
                 ref["updated_at"] = now
-                escalations += 1
                 changed = True
     if changed:
         await asyncio.to_thread(save_telegram_handoff_refs, refs, ref_path)
