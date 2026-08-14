@@ -54,8 +54,6 @@ class IntegrationSettings:
     telegram_admin_history_enabled: bool
     telegram_admin_history_limit: int
     telegram_admin_history_db_path: Path
-    openrouter_api_key: str
-    default_model: str
     avito_codex_enabled: bool
     avito_codex_timeout_seconds: int
     avito_codex_max_steps: int
@@ -67,6 +65,13 @@ class IntegrationSettings:
     avito_unanswered_min_age_seconds: int
     avito_unanswered_interval_seconds: int
     avito_unanswered_lookback_seconds: int
+    avito_unanswered_repeat_alert_seconds: int
+    avito_promise_reminder_seconds: int
+    avito_promise_escalation_seconds: int
+    avito_handoff_reminder_after_seconds: int
+    avito_handoff_escalation_after_seconds: int
+    avito_handoff_reminder_repeat_seconds: int
+    avito_handoff_escalation_repeat_seconds: int
     rag_retrieval_enabled: bool
     rag_autoanswer_threshold: float
     rag_handoff_threshold: float
@@ -95,6 +100,8 @@ class IntegrationSettings:
     vk_send_enabled: bool
     vk_codex_enabled: bool
     telegram_admin_response_wait_seconds: int = 60
+    telegram_client_topics_enabled: bool = True
+    telegram_client_topics_path: Path = ROOT / "data" / "telegram_client_topics.json"
     rag_dynamic_intent_enabled: bool = True
     rag_service_catalog_enabled: bool = True
     rag_shared_retrieval_enabled: bool = True
@@ -123,11 +130,11 @@ class IntegrationSettings:
             telegram_admin_history_enabled=_env_bool("TELEGRAM_ADMIN_HISTORY_ENABLED", True),
             telegram_admin_history_limit=_env_int("TELEGRAM_ADMIN_HISTORY_LIMIT", 0),
             telegram_admin_history_db_path=Path(_env("TELEGRAM_ADMIN_HISTORY_DB_PATH", str(ROOT / "data" / "leads.sqlite3"))),
-            openrouter_api_key=_env("OPENROUTER_API_KEY"),
-            default_model=_env("DEFAULT_MODEL", "anthropic/claude-sonnet-4.5"),
+            telegram_client_topics_enabled=_env_bool("TELEGRAM_CLIENT_TOPICS_ENABLED", True),
+            telegram_client_topics_path=Path(_env("TELEGRAM_CLIENT_TOPICS_PATH", str(ROOT / "data" / "telegram_client_topics.json"))),
             avito_codex_enabled=True if avito_test_mode else _env_bool("AVITO_CODEX_ENABLED"),
             avito_codex_timeout_seconds=_env_int("AVITO_CODEX_TIMEOUT_SECONDS", 180),
-            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 0),
+            avito_codex_max_steps=_env_int("AVITO_CODEX_MAX_STEPS", 4),
             avito_turn_debounce_seconds=_env_int("AVITO_TURN_DEBOUNCE_SECONDS", 60),
             avito_turn_max_wait_seconds=_env_int("AVITO_TURN_MAX_WAIT_SECONDS", 120),
             avito_turn_batch_max_messages=_env_int("AVITO_TURN_BATCH_MAX_MESSAGES", 10),
@@ -136,6 +143,13 @@ class IntegrationSettings:
             avito_unanswered_min_age_seconds=_env_int("AVITO_UNANSWERED_MIN_AGE_SECONDS", 1200),
             avito_unanswered_interval_seconds=_env_int("AVITO_UNANSWERED_INTERVAL_SECONDS", 300),
             avito_unanswered_lookback_seconds=_env_int("AVITO_UNANSWERED_LOOKBACK_SECONDS", 86400),
+            avito_unanswered_repeat_alert_seconds=_env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600),
+            avito_promise_reminder_seconds=_env_int("AVITO_PROMISE_REMINDER_SECONDS", 21600),
+            avito_promise_escalation_seconds=_env_int("AVITO_PROMISE_ESCALATION_SECONDS", 43200),
+            avito_handoff_reminder_after_seconds=_env_int("AVITO_HANDOFF_REMINDER_AFTER_SECONDS", 21600),
+            avito_handoff_escalation_after_seconds=_env_int("AVITO_HANDOFF_ESCALATION_AFTER_SECONDS", 43200),
+            avito_handoff_reminder_repeat_seconds=_env_int("AVITO_HANDOFF_REMINDER_REPEAT_SECONDS", 21600),
+            avito_handoff_escalation_repeat_seconds=_env_int("AVITO_HANDOFF_ESCALATION_REPEAT_SECONDS", 21600),
             rag_retrieval_enabled=_env_bool("RAG_RETRIEVAL_ENABLED", True),
             rag_dynamic_intent_enabled=_env_bool("RAG_DYNAMIC_INTENT_ENABLED", True),
             rag_service_catalog_enabled=_env_bool("RAG_SERVICE_CATALOG_ENABLED", True),

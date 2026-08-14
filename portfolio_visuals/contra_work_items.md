@@ -10,7 +10,7 @@ Built an AI-assisted messaging workflow for client operations: Telegram bot flow
 
 Skills:
 
-Telegram Bot API, Python, AI agents, OpenRouter, automation, CRM workflows, API integration
+Telegram Bot API, Python, AI agents, Codex CLI, automation, CRM workflows, API integration
 
 ## 2. Freelance Lead Desk with Codex Analysis
 
@@ -47,4 +47,3 @@ Built backend tooling for a VPN subscription service: FastAPI endpoints, SQLite 
 Skills:
 
 FastAPI, SQLite, Linux, systemd, deployment automation, backend development, server tooling
-

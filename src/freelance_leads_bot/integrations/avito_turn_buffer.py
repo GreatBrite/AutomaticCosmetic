@@ -82,6 +82,7 @@ def pop_due_avito_turn_batches(
     now: float | None = None,
     path: Path | str = DEFAULT_AVITO_TURN_BUFFER_PATH,
     limit: int = 20,
+    lease_seconds: int = 180,
 ) -> list[dict[str, Any]]:
     now = time.time() if now is None else now
     due: list[dict[str, Any]] = []
@@ -93,12 +94,66 @@ def pop_due_avito_turn_batches(
                 continue
             process_after = float(batch.get("process_after") or 0)
             max_process_after = float(batch.get("max_process_after") or process_after)
+            lease_until = float(batch.get("lease_until") or 0)
+            if lease_until > now:
+                continue
             if now >= process_after or now >= max_process_after:
-                due.append(batch)
-                batches.pop(chat_key, None)
+                batch["lease_until"] = now + max(1, lease_seconds)
+                batch["leased_at"] = now
+                batch["attempts"] = int(batch.get("attempts") or 0)
+                due.append(dict(batch))
                 if len(due) >= limit:
                     break
     return due
+
+
+def mark_avito_turn_batch_processed(
+    batch: dict[str, Any],
+    *,
+    path: Path | str = DEFAULT_AVITO_TURN_BUFFER_PATH,
+) -> None:
+    chat_key = str(batch.get("chat_key") or batch.get("chat_id") or "").strip()
+    if not chat_key:
+        return
+    with _locked_state(path) as state:
+        batches = state.setdefault("batches", {})
+        current = batches.get(chat_key)
+        if isinstance(current, dict) and _same_batch(current, batch):
+            batches.pop(chat_key, None)
+
+
+def mark_avito_turn_batch_failed(
+    batch: dict[str, Any],
+    error: str,
+    *,
+    now: float | None = None,
+    path: Path | str = DEFAULT_AVITO_TURN_BUFFER_PATH,
+    max_backoff_seconds: int = 300,
+) -> None:
+    now = time.time() if now is None else now
+    chat_key = str(batch.get("chat_key") or batch.get("chat_id") or "").strip()
+    if not chat_key:
+        return
+    with _locked_state(path) as state:
+        batches = state.setdefault("batches", {})
+        current = batches.get(chat_key)
+        if not isinstance(current, dict) or not _same_batch(current, batch):
+            return
+        attempts = int(current.get("attempts") or 0) + 1
+        backoff = min(max_backoff_seconds, 30 * (2 ** min(attempts - 1, 4)))
+        current["attempts"] = attempts
+        current["last_error"] = str(error or "")[-500:]
+        current["last_failed_at"] = now
+        current["process_after"] = now + backoff
+        current["max_process_after"] = current["process_after"]
+        current["lease_until"] = 0
+        current["leased_at"] = 0
+
+
+def _same_batch(current: dict[str, Any], batch: dict[str, Any]) -> bool:
+    current_ids = [str(item.get("message_id") or "") for item in current.get("messages", []) if isinstance(item, dict)]
+    batch_ids = [str(item.get("message_id") or "") for item in batch.get("messages", []) if isinstance(item, dict)]
+    return current_ids == batch_ids
 
 
 def batch_to_inbound_message(batch: dict[str, Any]) -> InboundMessage:

@@ -1,0 +1,15 @@
+[Unit]
+Description=AutomaticCosmetic Avito webhook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AutomaticCosmetic
+Environment=PATH=/root/.local/bin:/root/AutomaticCosmetic/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/AutomaticCosmetic/.venv/bin/uvicorn src.freelance_leads_bot.integrations.avito_webhook:app --host 127.0.0.1 --port 8030 --no-access-log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

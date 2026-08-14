@@ -8,28 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from ..config import ROOT
-
-
-CITY_ALIASES = {
-    "москва": "Москва",
-    "москве": "Москва",
-    "москву": "Москва",
-    "мск": "Москва",
-    "ростов": "Ростов-на-Дону",
-    "ростов-на-дону": "Ростов-на-Дону",
-    "ростов на дону": "Ростов-на-Дону",
-    "ростове": "Ростов-на-Дону",
-    "ростове-на-дону": "Ростов-на-Дону",
-    "санкт-петербург": "Санкт-Петербург",
-    "санкт петербург": "Санкт-Петербург",
-    "спб": "Санкт-Петербург",
-    "питер": "Санкт-Петербург",
-    "краснодар": "Краснодар",
-    "краснодаре": "Краснодар",
-    "геленджик": "Геленджик",
-    "геленджике": "Геленджик",
-    "гелик": "Геленджик",
-}
+from .city_utils import city_matches as _city_matches
+from .city_utils import normalize_cities as _normalize_cities
+from .city_utils import normalize_city as _normalize_city
 
 
 class CityScheduleStore:
@@ -39,24 +20,13 @@ class CityScheduleStore:
         self.path = Path(path)
 
     def normalize_city(self, raw: str) -> str:
-        key = re.sub(r"\s+", " ", (raw or "").strip().casefold()).replace("ё", "е")
-        return CITY_ALIASES.get(key) or CITY_ALIASES.get(key.replace(" ", "-")) or raw.strip()
+        return _normalize_city(raw)
 
     def normalize_cities(self, raw: str) -> list[str]:
-        values: list[str] = []
-        seen: set[str] = set()
-        for part in re.split(r"\s*(?:,|;|/|\||\s+и\s+)\s*", raw or ""):
-            normalized = self.normalize_city(part)
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                values.append(normalized)
-        return values
+        return _normalize_cities(raw)
 
     def city_matches(self, schedule_city: str, requested_city: str) -> bool:
-        requested = self.normalize_city(requested_city)
-        if not requested:
-            return False
-        return requested in self.normalize_cities(schedule_city)
+        return _city_matches(schedule_city, requested_city)
 
     def parse_dates(self, text: str, *, base: date | None = None) -> list[str]:
         base = base or date.today()

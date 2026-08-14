@@ -17,7 +17,6 @@
 - YCLIENTS credentials from `/root/YclientsAvitoTg/.env`
 - Avito credentials from `/root/YclientsAvitoTg/.env`
 - VK group credentials from `/root/YclientsAvitoTg/.env`
-- OpenRouter key from `/root/YclientsAvitoTg_fixed/.env`
 - Codex runtime settings from `/root/YclientsAvitoTg/.env`
 
 Some legacy keys were already empty in the source env and remain empty here. Do not put real secrets into `.env.example`.

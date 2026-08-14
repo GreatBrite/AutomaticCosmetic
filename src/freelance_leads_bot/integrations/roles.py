@@ -31,7 +31,21 @@ class RoleProfile:
         return name in self.allowed_tools
 
 
-CLIENT_TOOL_NAMES = frozenset(
+CLIENT_READONLY_TOOLS = frozenset(
+    {
+        "yclients.services.list",
+        "yclients.company.address",
+        "yclients.slots.list",
+        "yclients.appointments.list",
+        "yclients.clients.search",
+        "schedule.city.list",
+        "knowledge.list",
+        "knowledge.get",
+    }
+)
+
+
+CLIENT_MEMORY_SAFE_TOOLS = frozenset(
     {
         "care.crm.clients.search",
         "care.crm.client.memory.get",
@@ -42,24 +56,12 @@ CLIENT_TOOL_NAMES = frozenset(
         "care.learning.lessons.list",
         "care.learning.preference.upsert",
         "care.learning.outcome.record",
-        "yclients.services.list",
-        "yclients.company.address",
-        "yclients.slots.list",
-        "yclients.appointments.create",
-        "yclients.appointments.list",
-        "yclients.appointments.move",
-        "yclients.appointments.cancel",
-        "yclients.clients.search",
-        "yclients.clients.notes.update",
         "care.tasks.plan",
-        "schedule.city.list",
-        "knowledge.create",
-        "knowledge.list",
-        "knowledge.get",
-        "knowledge.update",
-        "knowledge.delete",
     }
 )
+
+
+CLIENT_TOOL_NAMES = CLIENT_READONLY_TOOLS | CLIENT_MEMORY_SAFE_TOOLS
 
 
 INTERNAL_CRM_TOOL_NAMES = frozenset(
@@ -76,14 +78,54 @@ INTERNAL_CRM_TOOL_NAMES = frozenset(
 )
 
 
-AVITO_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES - frozenset(
+ADMIN_MUTATION_TOOLS = frozenset(
     {
         "yclients.appointments.create",
         "yclients.appointments.move",
         "yclients.appointments.cancel",
         "yclients.clients.notes.update",
+        "knowledge.create",
+        "knowledge.update",
+        "knowledge.delete",
+        "schedule.city.set",
+        "schedule.city.delete",
+        "avito.messages.send",
+        "avito.messages.send_phone",
+        "avito.messages.send_image",
+        "avito.messages.send_file",
     }
 )
+
+
+RAG_ADMIN_TOOLS = frozenset(
+    {
+        "expert_rag.search",
+        "expert_rag.plan_change",
+        "expert_rag.apply_plan",
+        "expert_rag.deprecate",
+        "expert_rag.review.list",
+    }
+)
+
+
+WORKSPACE_DEBUG_TOOLS = frozenset(
+    {
+        "workspace.files.list",
+        "workspace.files.read",
+        "workspace.logs.tail",
+    }
+)
+
+
+WORKSPACE_EXECUTION_TOOLS = frozenset(
+    {
+        "workspace.command.run",
+        "workspace.python.run",
+    }
+)
+
+
+AVITO_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 
 
 TELEGRAM_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
@@ -92,45 +134,18 @@ TELEGRAM_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 VK_CLIENT_TOOL_NAMES = CLIENT_TOOL_NAMES
 
 
-ADMIN_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
+ADMIN_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | frozenset(
     {
         "avito.chats.list",
         "avito.messages.list",
-        "avito.messages.send",
-        "avito.messages.send_phone",
-        "avito.messages.send_image",
-        "avito.messages.send_file",
-        "schedule.city.set",
-        "schedule.city.delete",
-        "workspace.files.list",
-        "workspace.files.read",
-        "workspace.logs.tail",
-        "workspace.command.run",
-        "workspace.python.run",
-        "expert_rag.search",
-        "expert_rag.plan_change",
-        "expert_rag.apply_plan",
-        "expert_rag.deprecate",
-        "expert_rag.review.list",
     }
 )
 
 
-OLGA_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | frozenset(
+OLGA_TOOL_NAMES = CLIENT_TOOL_NAMES | INTERNAL_CRM_TOOL_NAMES | ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | frozenset(
     {
         "avito.chats.list",
         "avito.messages.list",
-        "avito.messages.send",
-        "avito.messages.send_phone",
-        "avito.messages.send_image",
-        "avito.messages.send_file",
-        "schedule.city.set",
-        "schedule.city.delete",
-        "expert_rag.search",
-        "expert_rag.plan_change",
-        "expert_rag.apply_plan",
-        "expert_rag.deprecate",
-        "expert_rag.review.list",
     }
 )
 
@@ -229,8 +244,10 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Проверяй message.metadata.author_role/direction: если это own_account или direction='out', это сообщение самого бота/аккаунта, не продолжай клиентский ответ.",
                 "Не объясняй клиенту, из какого внутреннего источника взят ответ: listing_context, YCLIENTS, knowledge и история — это твоя опора, а не часть клиентской формулировки.",
                 "Ольгу упоминай клиенту только когда действительно нужна её личная экспертная оценка; для обычной проверки времени, адреса, цены или детали говори от лица сервиса: уточню, проверю, посмотрю.",
-                "Когда просишь данные для записи, объясняй зачем они нужны: имя нужно для оформления записи, телефон — для связи и подтверждения.",
+                "Когда просишь данные для записи, объясняй зачем они нужны: имя нужно для оформления записи, а контакт для связи может быть номером или аккаунтом удобного мессенджера/соцсети.",
                 "Цену клиенту называй только из объявления Avito, подтверждённой knowledge или YCLIENTS-цены со статусом known; price_status=placeholder/unknown означает, что нужно спокойно уточнить стоимость.",
+                "Прайс единый для всех городов: не придумывай разные цены по городам и не спрашивай город только ради цены.",
+                "Города приёма фиксированные из BUSINESS_CITIES; не обещай новые города и не уточняй, будет ли приём в других городах.",
                 "Город из объявления Avito — это контекст карточки, а не подтверждённый город клиента. Для записи, адреса, слотов и city-dependent tools используй город только из явного сообщения клиента или conversation_history; если город не назван, спроси его.",
                 "Если график на дату неизвестен, скажи что проверишь эту дату; не говори, что мест нет.",
                 "Если график на дату известен и YCLIENTS вернул пустые слоты, можно сказать, что на этот день мест нет, и предложить другой день в том же городе.",
@@ -244,8 +261,8 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Если клиент хочет записаться, сначала должна быть понятна конкретная процедура/услуга. Не превращай слова 'встреча', 'приём', 'лично', 'на следующей неделе' или присланный телефон в запись сами по себе.",
                 "Если клиент оставил телефон/имя и просит 'встречу' или 'на следующей неделе', но процедура не названа и не ясна из истории, не смотри слоты и не делай handoff Ольге; коротко спроси, какая процедура интересует.",
                 "Клиентский Avito-агент не создаёт, не переносит и не отменяет YCLIENTS-записи live. Он может читать услуги/слоты/адрес и подготовить клиенту следующий шаг; мутации делает админ/Ольга после явного подтверждения.",
-                "Если клиент прислал фото, Ольга должна посмотреть индивидуально, но не превращай каждый фотоответ в приглашение на консультацию.",
-                "Не склоняй клиента к очной консультации и не пиши, что итоговый подбор будет на очной консультации. Если для оценки реально не хватает данных, можно один раз предложить онлайн-разбор с Ольгой и собрать только недостающие данные: зона/процедура, цель или проблема, когда началось, что уже делали, фото при хорошем освещении и удобный способ связи.",
+                "Если клиент прислал фото или просит экспертную оценку, сначала уточни цель/зону/ожидаемый результат/объём/прошлые процедуры; не передавай Ольге пустой вопрос без этих вводных, кроме жалоб и критичных записей.",
+                "Не склоняй клиента к очной консультации и не пиши, что итоговый подбор будет на очной консультации. Если для оценки реально не хватает данных, можно один раз предложить онлайн-разбор с Ольгой и собрать только недостающие данные: зона/процедура, цель или проблема, когда началось, что уже делали, фото при хорошем освещении и контакт для онлайн-связи — номер или аккаунт удобного мессенджера/соцсети. Не обещай телефонный звонок: консультация идёт в переписке.",
                 "Не спамь онлайн-консультацией: не добавляй её к обычным ответам про цену, адрес, запись или к уже разобранной экспертной оценке.",
                 "При жалобе или проблеме задай короткий пакет вопросов для онлайн-оценки: какая процедура и когда была, что беспокоит, когда началось/усиливается, есть ли боль/температура/затруднение дыхания, приложены ли фото. Опасные симптомы требуют срочной медицинской помощи.",
                 "После успешной отмены записи используй client_message из tool_result и сообщи клиенту, какая запись отменена.",
@@ -268,12 +285,15 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Перед ответом по повторным клиентам проверь care.learning.lessons.list и учитывай сохранённые уроки Ольги.",
                 "Если клиент сообщает предпочтение, важный факт или интерес к услуге, сохрани это через care.learning.preference.upsert или care.crm.interactions.create.",
                 "Если клиент пишет впервые, спокойно помоги как консультант: услуга, город, запись, подготовка, уход, противопоказания в безопасных рамках.",
+                "Прайс единый для всех городов: не придумывай разные цены по городам и не спрашивай город только ради цены.",
+                "Города приёма фиксированные из BUSINESS_CITIES; не обещай новые города и не уточняй, будет ли приём в других городах.",
                 "Если клиент уже был у Ольги, сначала используй подтверждённые CRM-факты визитов и interactions; не проси заново то, что уже известно.",
                 "Отдел заботы сначала заботится: спрашивает самочувствие/результат/удобство, а допродажу предлагает только мягко и по делу.",
                 "Не дави на повторную покупку и не обещай медицинский результат; при жалобах, риске или индивидуальной оценке делай handoff.",
-                "Если клиент просит записаться, проверь город, услугу, слоты и создай запись при наличии подтверждения и контакта.",
+                "Если клиент просит записаться, проверь город, услугу и слоты; клиентская роль не создаёт live-запись, а готовит следующий шаг для подтверждения админом/Ольгой.",
                 "Если нет телефона/имени для записи, попроси только недостающие рабочие данные и объясни зачем.",
-                "Не склоняй клиента к очной консультации. Если для индивидуальной оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери только недостающее: процедура/зона, цель или проблема, даты, симптомы, фото и телефон для связи.",
+                "Если клиент прислал фото или просит экспертную оценку, сначала уточни цель/зону/ожидаемый результат/объём/прошлые процедуры; не передавай Ольге пустой вопрос без этих вводных, кроме жалоб и критичных записей.",
+                "Не склоняй клиента к очной консультации. Если для индивидуальной оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери только недостающее: процедура/зона, цель или проблема, даты, симптомы, фото и контакт для онлайн-связи — номер или аккаунт удобного мессенджера/соцсети. Не обещай телефонный звонок: консультация идёт в переписке.",
                 "Если оценка Ольги или подтверждённое решение уже есть в CRM/истории/trace, дай клиенту итог без нового предложения консультации.",
                 "После успешной отмены записи используй client_message из tool_result и сообщи клиенту, какая запись отменена.",
                 "Не показывай клиенту внутренние данные CRM, trace, tool names, статусы визита или пометки Ольги.",
@@ -296,10 +316,12 @@ def role_profile(role: CodexRole | str) -> RoleProfile:
                 "Не объясняй клиенту, из какого внутреннего источника взят ответ; tools и knowledge — это твоя опора, а не часть клиентской формулировки.",
                 "Ольгу упоминай клиенту только когда действительно нужна её личная экспертная оценка; для обычной проверки говори от лица сервиса.",
                 "Цену клиенту называй только из подтверждённой knowledge или YCLIENTS-цены со статусом known; price_status=placeholder/unknown означает, что нужно спокойно уточнить стоимость.",
+                "Прайс единый для всех городов: не придумывай разные цены по городам и не спрашивай город только ради цены.",
+                "Города приёма фиксированные из BUSINESS_CITIES; не обещай новые города и не уточняй, будет ли приём в других городах.",
                 "Если график на дату неизвестен, скажи что проверишь эту дату; не говори, что мест нет.",
                 "Если график на дату известен и YCLIENTS вернул пустые слоты, можно сказать, что на этот день мест нет, и предложить другой день в том же городе.",
-                "Если клиент хочет записаться, проверь услуги/слоты и создай запись при наличии подтверждения и контакта.",
-                "Если клиент прислал фото, Ольга должна посмотреть индивидуально, но не превращай каждый фотоответ в приглашение на консультацию.",
+                "Если клиент хочет записаться, проверь услуги/слоты; клиентская роль не создаёт live-запись, а готовит следующий шаг для подтверждения админом/Ольгой.",
+                "Если клиент прислал фото или просит экспертную оценку, сначала уточни цель/зону/ожидаемый результат/объём/прошлые процедуры; не передавай Ольге пустой вопрос без этих вводных, кроме жалоб и критичных записей.",
                 "Не склоняй клиента к очной консультации. Если для индивидуальной оценки реально не хватает данных, один раз предложи онлайн-разбор с Ольгой и собери только недостающее: зона/процедура, цель или проблема, даты, симптомы, фото и контакт.",
                 "Если оценка Ольги или подтверждённое решение уже есть в истории/trace, дай клиенту итог без нового предложения консультации.",
                 "После успешной отмены записи используй client_message из tool_result и сообщи клиенту, какая запись отменена.",
@@ -328,6 +350,51 @@ def telegram_role_for_user(user_id: int, *, admin_user_id: int, cosmetologist_us
     if user_id and user_id == cosmetologist_user_id:
         return CodexRole.OLGA_BOSS
     return CodexRole.ADMIN
+
+
+def role_safety_report() -> dict[str, Any]:
+    """Return a non-mutating audit of tool permissions for all Codex roles."""
+
+    rows: dict[str, Any] = {}
+    errors: list[str] = []
+    client_roles = {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}
+    dangerous_client_tools = ADMIN_MUTATION_TOOLS | INTERNAL_CRM_TOOL_NAMES | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS
+    for role in CodexRole:
+        profile = role_profile(role)
+        tools = set(profile.allowed_tools or ())
+        workspace_tools = sorted(tool for tool in tools if tool.startswith("workspace."))
+        mutating_tools = sorted(tools & ADMIN_MUTATION_TOOLS)
+        row = {
+            "role": role.value,
+            "allow_workspace_tools": profile.allow_workspace_tools,
+            "live_actions_enabled": profile.live_actions_enabled,
+            "tool_count": len(tools),
+            "workspace_tools": workspace_tools,
+            "workspace_execution_tools": sorted(tools & WORKSPACE_EXECUTION_TOOLS),
+            "admin_mutation_tools": mutating_tools,
+        }
+        if role in client_roles:
+            forbidden = sorted(tools & dangerous_client_tools)
+            row["forbidden_client_tools"] = forbidden
+            if forbidden:
+                errors.append(f"{role.value} exposes forbidden client tools: {', '.join(forbidden)}")
+        if role == CodexRole.OLGA_BOSS:
+            forbidden = sorted(tools & (WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS))
+            row["forbidden_olga_workspace_tools"] = forbidden
+            if forbidden or profile.allow_workspace_tools:
+                errors.append(f"{role.value} exposes workspace tools")
+        if role == CodexRole.ADMIN:
+            forbidden = sorted(tools & WORKSPACE_EXECUTION_TOOLS)
+            row["forbidden_admin_workspace_execution_tools"] = forbidden
+            if forbidden:
+                errors.append(f"{role.value} exposes workspace execution tools: {', '.join(forbidden)}")
+        if role == CodexRole.YCLIENTS_UPSELL_STUB:
+            forbidden = sorted(tools & (ADMIN_MUTATION_TOOLS | RAG_ADMIN_TOOLS | WORKSPACE_DEBUG_TOOLS | WORKSPACE_EXECUTION_TOOLS))
+            row["forbidden_upsell_tools"] = forbidden
+            if forbidden or profile.live_actions_enabled:
+                errors.append(f"{role.value} is not read-only/stub safe")
+        rows[role.value] = row
+    return {"ok": not errors, "roles": rows, "errors": errors}
 
 
 def conversation_key(channel: str, role: CodexRole | str, identifier: str, *, thread: dict[str, Any] | None = None) -> str:

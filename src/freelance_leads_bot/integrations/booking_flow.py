@@ -3,24 +3,36 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Any, Awaitable, Callable
 
 from .models import Appointment, ClientProfile, Handoff, HandoffReason, InboundMessage, Service, Slot
 from .avito import avito_photo_handoff
+from .city_utils import cities_text, explicit_supported_city
 from .config import DEFAULT_CITIES
 from .yclients import YClientsGateway
 
 
 PHONE_RE = re.compile(r"(?:\+7|8)?[\s(.-]*(\d{3})[\s).-]*(\d{3})[\s.-]*(\d{2})[\s.-]*(\d{2})")
+MESSENGER_CONTACT_RE = re.compile(
+    r"(?iu)(?:"
+    r"(?P<handle>@[a-zа-яё0-9_.-]{3,32})|"
+    r"(?P<url>(?:https?://)?(?:t\.me|telegram\.me|vk\.com|wa\.me|"
+    r"api\.whatsapp\.com|instagram\.com|ig\.me|m\.me)/[^\s,;]+)|"
+    r"(?P<label>(?:telegram|телеграм|тг|whatsapp|ватсап|вацап|вотсап|vk|вк|"
+    r"instagram|инстаграм|max|мах)\s*[:\-]?\s*[a-zа-яё0-9_.@+-]{3,64})"
+    r")"
+)
 DATE_ISO_RE = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 DATE_DMY_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?\b")
+DATE_RU_MONTH_RE = re.compile(
+    r"(?iu)\b(\d{1,2})(?:[-\s]*(?:го|ого|е))?\s+"
+    r"(январ[яье]|феврал[яье]|март[ае]?|апрел[яье]|ма[йяе]|июн[яье]|июл[яье]|"
+    r"август[ае]?|сентябр[яье]|октябр[яье]|ноябр[яье]|декабр[яье])\b"
+)
+DATE_ORDINAL_DAY_RE = re.compile(r"(?iu)\b(\d{1,2})(?:[-\s]*(?:го|ого|е))\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.](\d{2})\b|\b(?:в\s*)?([01]?\d|2[0-3])\s*(?:час(?:а|ов)?|ч)\b")
-CITY_ALIASES = {
-    "Москва": ("москва", "москве", "москву", "москвы", "мск"),
-    "Ростов-на-Дону": ("ростов", "ростове", "ростова", "ростову"),
-    "Санкт-Петербург": ("санкт-петербург", "петербург", "петербурге", "питер", "питере", "спб"),
-    "Краснодар": ("краснодар", "краснодаре", "краснодара", "краснодару"),
-    "Геленджик": ("геленджик", "геленджике", "гелик"),
-}
+def _cities_text(cities: tuple[str, ...]) -> str:
+    return cities_text(cities)
 
 
 @dataclass(frozen=True)
@@ -32,6 +44,7 @@ class BookingRequest:
     preferred_time: str = ""
     client_name: str = ""
     phone: str = ""
+    contact: str = ""
     notes: str = ""
 
 
@@ -39,6 +52,7 @@ class BookingRequest:
 class BookingDecision:
     action: str
     reply: str
+    state: str = ""
     handoff: Handoff | None = None
     slots: list[Slot] = field(default_factory=list)
     appointment_id: int | None = None
@@ -46,25 +60,37 @@ class BookingDecision:
 
 
 class AvitoBookingFlow:
-    def __init__(self, booking: YClientsGateway, cities: tuple[str, ...] = DEFAULT_CITIES, *, allow_create: bool = True) -> None:
+    def __init__(
+        self,
+        booking: YClientsGateway,
+        cities: tuple[str, ...] = DEFAULT_CITIES,
+        *,
+        allow_create: bool = True,
+        slot_lookup: Callable[[str, int, str], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
         self.booking = booking
         self.cities = cities
         self.allow_create = allow_create
+        self.slot_lookup = slot_lookup
 
     async def process(self, request: BookingRequest) -> BookingDecision:
         handoff = avito_photo_handoff(request.message)
         if handoff:
             return BookingDecision(
-                action="handoff",
-                reply="Спасибо, фото передадим на оценку и вернёмся с ответом.",
-                handoff=handoff,
+                action="ask_consultation_details",
+                reply=(
+                    "Уточните, пожалуйста: какая зона интересует, опишите зону и что хотите получить в результате. "
+                    "Так Ольга сможет оценить фото точнее."
+                ),
+                state="requested_details",
             )
 
         city = request.city or self.extract_city(request.message.text)
         if not city:
             return BookingDecision(
                 action="ask_city",
-                reply="Подскажите, пожалуйста, в каком городе вам удобно записаться?",
+                reply=f"Приём ведём в фиксированных городах: {_cities_text(self.cities)}. В каком из них вам удобно записаться?",
+                state="requested_slot",
             )
 
         services = await self.booking.get_services(city)
@@ -74,27 +100,70 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_service",
                 reply=f"Какая процедура вас интересует? Сейчас доступны: {available}.",
+                state="requested_slot",
             )
 
         if not request.preferred_date:
             return BookingDecision(
                 action="ask_date",
                 reply=f"На какую дату посмотреть свободное время в городе {city}?",
+                state="requested_slot",
                 service=service,
             )
 
-        slots = await self.booking.get_free_slots(city, service.id, request.preferred_date)
+        slot_result = await self._lookup_slots(city, service.id, request.preferred_date)
+        schedule_status = str(slot_result.get("schedule_status") or "known")
+        slots = _slots_from_lookup(slot_result)
+        if schedule_status == "unknown":
+            return BookingDecision(
+                action="booking_schedule_unknown",
+                reply="Проверю эту дату и вернусь с подтверждением.",
+                state="awaiting_olga",
+                handoff=Handoff(
+                    reason=HandoffReason.BOOKING_AMBIGUOUS,
+                    message=request.message,
+                    summary=(
+                        f"Клиент хочет записаться: {service.title}, {city}, {request.preferred_date}. "
+                        "График Ольги на дату не задан; нельзя говорить, что мест нет. Нужно проверить дату и дать клиенту финальный ответ."
+                    ),
+                ),
+                service=service,
+            )
+        if schedule_status != "known":
+            schedule_city = str(slot_result.get("schedule_city") or "").strip()
+            requested_city = str(slot_result.get("requested_city") or city).strip()
+            if schedule_status == "known_wrong_city" and schedule_city:
+                reply = f"На эту дату Ольга принимает в городе {schedule_city}, а не {requested_city}. Проверю варианты и вернусь с подтверждением."
+                summary = (
+                    f"Клиент хочет записаться: {service.title}, {requested_city}, {request.preferred_date}. "
+                    f"График на дату задан для другого города: {schedule_city}. Нужно предложить корректный следующий шаг."
+                )
+            else:
+                reply = "Проверю эту дату и вернусь с подтверждением."
+                summary = (
+                    f"Клиент хочет записаться: {service.title}, {city}, {request.preferred_date}. "
+                    f"Статус графика: {schedule_status}; нельзя говорить, что мест нет без проверки."
+                )
+            return BookingDecision(
+                action="booking_schedule_check_required",
+                reply=reply,
+                state="awaiting_olga",
+                handoff=Handoff(reason=HandoffReason.BOOKING_AMBIGUOUS, message=request.message, summary=summary),
+                service=service,
+            )
         if not request.preferred_time:
             if not slots:
                 return BookingDecision(
                     action="no_slots",
                     reply=f"На {request.preferred_date} свободного времени по услуге {service.title} не нашла. Предложить другой день?",
+                    state="failed",
                     service=service,
                 )
             times = ", ".join(slot.starts_at.strftime("%H:%M") for slot in slots[:6])
             return BookingDecision(
                 action="offer_slots",
                 reply=f"В городе {city} на {request.preferred_date} есть время: {times}. Какое удобно?",
+                state="offered_slot",
                 slots=slots,
                 service=service,
             )
@@ -105,15 +174,27 @@ class AvitoBookingFlow:
             return BookingDecision(
                 action="ask_time",
                 reply=f"Не вижу свободного времени {request.preferred_time}. Доступно: {times}.",
+                state="requested_slot",
                 slots=slots,
                 service=service,
             )
 
         phone = request.phone or self.extract_phone(request.message.text)
-        if not phone:
+        contact = request.contact or phone or self.extract_contact(request.message.text)
+        if not contact:
             return BookingDecision(
                 action="ask_contact",
-                reply="Пришлите, пожалуйста, имя для записи и номер телефона для связи.",
+                reply="Пришлите, пожалуйста, имя для записи и контакт для связи: номер или аккаунт удобного мессенджера/соцсети.",
+                state="offered_slot",
+                slots=slots,
+                service=service,
+            )
+
+        if self.allow_create and not phone:
+            return BookingDecision(
+                action="ask_phone_for_booking",
+                reply="Для оформления записи нужен номер телефона. Пришлите, пожалуйста, номер, а удобный мессенджер я тоже передам.",
+                state="offered_slot",
                 slots=slots,
                 service=service,
             )
@@ -126,12 +207,13 @@ class AvitoBookingFlow:
                     f"{selected_slot.starts_at.strftime('%d.%m %H:%M')}. "
                     "Сейчас проверю оформление записи и вернусь с подтверждением."
                 ),
+                state="awaiting_olga",
                 handoff=Handoff(
                     reason=HandoffReason.BOOKING_AMBIGUOUS,
                     message=request.message,
                     summary=(
                         f"Клиент хочет записаться: {service.title}, {city}, "
-                        f"{selected_slot.starts_at.strftime('%d.%m.%Y %H:%M')}, телефон {phone}. "
+                        f"{selected_slot.starts_at.strftime('%d.%m.%Y %H:%M')}, контакт для связи: {contact}. "
                         "Fallback Avito не создаёт live-запись автоматически; нужно подтвердить оформление."
                     ),
                 ),
@@ -155,20 +237,13 @@ class AvitoBookingFlow:
                 f"{selected_slot.starts_at.strftime('%d.%m %H:%M')}. "
                 "Если что-то изменится, напишем."
             ),
+            state="confirmed",
             appointment_id=appointment_id,
             service=service,
         )
 
     def extract_city(self, text: str) -> str:
-        lowered = text.casefold()
-        for city in self.cities:
-            if city.casefold() in lowered:
-                return city
-        configured = set(self.cities)
-        for city, aliases in CITY_ALIASES.items():
-            if city in configured and any(alias in lowered for alias in aliases):
-                return city
-        return ""
+        return explicit_supported_city(text, cities=self.cities)
 
     def match_service(self, text: str, services: list[Service]) -> Service | None:
         lowered = text.casefold()
@@ -176,9 +251,10 @@ class AvitoBookingFlow:
             if service.title.casefold() in lowered:
                 return service
         for service in services:
-            if any(part and part in lowered for part in service.title.casefold().split()):
+            parts = [part for part in re.findall(r"[а-яёa-z0-9]{4,}", service.title.casefold()) if part not in {"лица", "услуга", "процедура"}]
+            if parts and any(part in lowered for part in parts):
                 return service
-        return services[0] if len(services) == 1 else None
+        return None
 
     def match_slot(self, preferred_time: str, slots: list[Slot]) -> Slot | None:
         target = preferred_time.strip()
@@ -193,6 +269,55 @@ class AvitoBookingFlow:
             return ""
         return "+7" + "".join(match.groups())
 
+    def extract_contact(self, text: str) -> str:
+        phone = self.extract_phone(text)
+        if phone:
+            return phone
+        match = MESSENGER_CONTACT_RE.search(text)
+        if not match:
+            return ""
+        contact = next((value.strip() for value in match.groupdict().values() if value), "")
+        handle = re.search(r"@[a-zа-яё0-9_.-]{3,32}", contact, re.IGNORECASE)
+        return handle.group(0) if handle else contact
+
+    async def _lookup_slots(self, city: str, service_id: int, preferred_date: str) -> dict[str, Any]:
+        if self.slot_lookup:
+            return await self.slot_lookup(city, service_id, preferred_date)
+        slots = await self.booking.get_free_slots(city, service_id, preferred_date)
+        return {"schedule_status": "known", "slots": slots}
+
+
+def _slots_from_lookup(result: dict[str, Any]) -> list[Slot]:
+    raw_slots = result.get("slots") if isinstance(result, dict) else []
+    slots: list[Slot] = []
+    for item in raw_slots or []:
+        if isinstance(item, Slot):
+            slots.append(item)
+        elif isinstance(item, dict):
+            starts_at = _parse_slot_datetime(item.get("starts_at"))
+            if starts_at:
+                slots.append(
+                    Slot(
+                        city=str(item.get("city") or ""),
+                        starts_at=starts_at,
+                        service_id=int(item.get("service_id") or 0),
+                        staff_id=int(item.get("staff_id") or 0),
+                    )
+                )
+    return slots
+
+
+def _parse_slot_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
 
 def booking_request_from_message(message: InboundMessage, cities: tuple[str, ...] = DEFAULT_CITIES) -> BookingRequest:
     flow = AvitoBookingFlow(booking=_NoopBookingGateway(), cities=cities)
@@ -203,6 +328,7 @@ def booking_request_from_message(message: InboundMessage, cities: tuple[str, ...
         preferred_date=extract_date(message.text),
         preferred_time=extract_time(message.text),
         phone=flow.extract_phone(message.text),
+        contact=flow.extract_contact(message.text),
     )
 
 
@@ -215,15 +341,59 @@ def extract_date(text: str, today: date | None = None) -> str:
         return (current + timedelta(days=1)).isoformat()
     match = DATE_ISO_RE.search(text)
     if match:
-        return match.group(1)
+        try:
+            return date.fromisoformat(match.group(1)).isoformat()
+        except ValueError:
+            return ""
     match = DATE_DMY_RE.search(text)
     if match:
         day = int(match.group(1))
         month = int(match.group(2))
         year = int(match.group(3) or current.year)
-        candidate = date(year, month, day)
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return ""
         if not match.group(3) and candidate < current:
-            candidate = date(year + 1, month, day)
+            try:
+                candidate = date(year + 1, month, day)
+            except ValueError:
+                return ""
+        return candidate.isoformat()
+    match = DATE_RU_MONTH_RE.search(text)
+    if match:
+        day = int(match.group(1))
+        month = _ru_month_number(match.group(2))
+        if not month:
+            return ""
+        try:
+            candidate = date(current.year, month, day)
+        except ValueError:
+            return ""
+        if candidate < current:
+            try:
+                candidate = date(current.year + 1, month, day)
+            except ValueError:
+                return ""
+        return candidate.isoformat()
+    match = DATE_ORDINAL_DAY_RE.search(text)
+    if match:
+        day = int(match.group(1))
+        year = current.year
+        month = current.month
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            return ""
+        if candidate < current:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                return ""
         return candidate.isoformat()
     return ""
 
@@ -235,6 +405,30 @@ def extract_time(text: str) -> str:
     hour = match.group(1) or match.group(3)
     minute = match.group(2) or "00"
     return f"{int(hour):02d}:{int(minute):02d}"
+
+
+def _ru_month_number(value: str) -> int:
+    normalized = str(value or "").casefold().replace("ё", "е")
+    for index, prefixes in enumerate(
+        (
+            ("январ",),
+            ("феврал",),
+            ("март",),
+            ("апрел",),
+            ("май", "мая", "мае"),
+            ("июн",),
+            ("июл",),
+            ("август",),
+            ("сентябр",),
+            ("октябр",),
+            ("ноябр",),
+            ("декабр",),
+        ),
+        start=1,
+    ):
+        if any(normalized.startswith(prefix) for prefix in prefixes):
+            return index
+    return 0
 
 
 class _NoopBookingGateway:

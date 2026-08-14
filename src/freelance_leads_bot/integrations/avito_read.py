@@ -13,6 +13,9 @@ class AvitoReadGateway(Protocol):
     async def get_chat_messages(self, account_id: int, chat_id: str, *, limit: int = 30, offset: int = 0) -> dict[str, Any]:
         ...
 
+    async def mark_chat_read(self, account_id: int, chat_id: str) -> dict[str, Any]:
+        ...
+
 
 class AvitoReadClient:
     def __init__(self, settings: IntegrationSettings | None = None, client: Any | None = None) -> None:
@@ -50,6 +53,17 @@ class AvitoReadClient:
                 headers=headers,
             )
 
+    async def mark_chat_read(self, account_id: int, chat_id: str) -> dict[str, Any]:
+        async with self.client as client:
+            headers = await client.auth.auth_header()
+            payload = await client._transport.request(
+                method="POST",
+                path_template="/messenger/v1/accounts/{user_id}/chats/{chat_id}/read",
+                path_params={"user_id": account_id, "chat_id": chat_id},
+                headers=headers,
+            )
+            return payload if isinstance(payload, dict) else {"ok": True}
+
 
 @dataclass(frozen=True)
 class NullAvitoReadClient:
@@ -60,6 +74,9 @@ class NullAvitoReadClient:
 
     async def get_chat_messages(self, account_id: int, chat_id: str, *, limit: int = 30, offset: int = 0) -> dict[str, Any]:
         return {"ok": False, "reason": self.reason, "messages": []}
+
+    async def mark_chat_read(self, account_id: int, chat_id: str) -> dict[str, Any]:
+        return {"ok": False, "reason": self.reason, "account_id": account_id, "chat_id": chat_id}
 
 
 def avito_read_client_from_settings(settings: IntegrationSettings) -> AvitoReadGateway:

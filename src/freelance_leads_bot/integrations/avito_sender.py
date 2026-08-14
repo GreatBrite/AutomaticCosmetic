@@ -155,6 +155,8 @@ class AvitoSdkSender:
             result = await self.send_image(account_id, chat_id, path)
             if caption.strip() and result.get("sent"):
                 caption_result = await self.send_message(account_id, chat_id, caption)
+                if not caption_result.get("sent"):
+                    return {**result, "sent": False, "reason": "caption_send_failed", "caption_result": caption_result}
                 return {**result, "caption_result": caption_result}
             return result
         return {

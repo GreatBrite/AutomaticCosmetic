@@ -39,7 +39,7 @@ GitNexus подтверждает живой Codex-chat путь как `src/fre
 | Сервис | Рабочая директория | Что запускает |
 |---|---|---|
 | `freelance-leads-bot.service` | `/root/AutomaticCosmetic` | `/root/AutomaticCosmetic/.venv/bin/python -m src.freelance_leads_bot.main serve` |
-| `yclients-avito-webhook.service` | `/root/AutomaticCosmetic` | `uvicorn src.freelance_leads_bot.integrations.avito_webhook:app --host 127.0.0.1 --port 8030` |
+| `yclients-avito-webhook.service` | `/root/AutomaticCosmetic` | `uvicorn src.freelance_leads_bot.integrations.avito_webhook:app --host 127.0.0.1 --port 8030 --no-access-log` |
 | `yclients-yclients-integration.service` | `/root/AutomaticCosmetic` | `/root/AutomaticCosmetic/run_yclients_integration.sh` |
 
 `yclients-tg-client.service` is masked and inactive because it used the old non-Codex Telegram client runtime.

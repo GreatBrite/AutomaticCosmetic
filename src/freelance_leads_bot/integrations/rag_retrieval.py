@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .expert_rag import APPROVED, ExpertRagStore, infer_metadata
 from .models import InboundMessage
 from .service_catalog import ACTIVE, HIDDEN, ServiceCatalogStore, service_catalog_from_rag_metadata
+
+TEMPORAL_FACT_RE = re.compile(
+    r"(?iu)(?:\b(?:сегодня|завтра|послезавтра)\b|"
+    r"\b(?:понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[еия])\b|"
+    r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|"
+    r"\b\d{1,2}\s*(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b|"
+    r"\b\d{1,2}:\d{2}\b|есть\s+окн|свободн|можно\s+запис|адрес)"
+)
+AESTHETIC_PROMISE_RE = re.compile(
+    r"(?iu)(?=.*(?:\b\d{2,5}\s*(?:мл|милли?литр\w*)\b|(?:^|[^\d])(?:300|400|1200)(?:[^\d]|$)|объ[её]м))"
+    r"(?=.*(?:груд|ягод|поп|тесоро|tesoro))"
+    r"(?=.*(?:размер|\+\s*1|плюс\s+один|заметн\w+|ярк\w+|выраженн\w+|результат|увелич\w+|хватит|достаточн\w+|до\s*/?\s*после))"
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +59,9 @@ class RagRetrievalService:
         self.service_catalog = service_catalog or ServiceCatalogStore()
 
     def retrieve(self, request: RagRetrievalRequest) -> RagRetrievalResult:
-        query = " ".join(part for part in (request.text, request.service_hint, request.service_key) if part)
+        text = _strip_batch_system_text(request.text)
+        request = replace(request, text=text)
+        query = " ".join(part for part in (text, request.service_hint, request.service_key) if part)
         service_filter = self._service_filter(request)
         request_blocker = _request_autoanswer_blocker(request, service_filter)
         matches = self.store.search(
@@ -54,7 +69,7 @@ class RagRetrievalService:
             status=APPROVED,
             limit=max(request.limit * 3, request.limit),
             min_score=request.min_score,
-            city=request.city,
+            city="" if _price_request(query) else request.city,
             service=service_filter,
             exclude_risk_levels=("high",),
         )
@@ -135,7 +150,34 @@ class RagRetrievalService:
 
 def _autoanswer_allowed(answer: dict[str, Any]) -> bool:
     metadata = answer.get("metadata") if isinstance(answer.get("metadata"), dict) else {}
-    return answer.get("status") == APPROVED and metadata.get("autoanswer_allowed") is not False
+    if answer.get("status") != APPROVED or metadata.get("autoanswer_allowed") is False:
+        return False
+    text = "\n".join(str(answer.get(key) or "") for key in ("question_canonical", "answer_client", "answer_internal", "topic"))
+    if metadata.get("olga_approved_aesthetic_formula") is not True and AESTHETIC_PROMISE_RE.search(text):
+        return False
+    if _price_like_answer(text) and not _current_price_metadata(answer, metadata):
+        return False
+    if answer.get("expires_at") or metadata.get("valid_until") or metadata.get("expires_at"):
+        return True
+    return not TEMPORAL_FACT_RE.search(text)
+
+
+def _price_like_answer(text: str) -> bool:
+    return bool(re.search(r"(?iu)(?:\d[\d\s]{2,}\s*(?:₽|руб|р\b)?|стоимост|стоит|стоить|цена|прайс|как\s+модель|как\s+пациент)", str(text or "")))
+
+
+def _current_price_metadata(answer: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    if metadata.get("current_global_price") is not True:
+        return False
+    if not str(metadata.get("service_key") or "").strip():
+        return False
+    if not (metadata.get("valid_until") or metadata.get("expires_at") or answer.get("expires_at") or metadata.get("stable_price") is True):
+        return False
+    return bool(metadata.get("price_applies_to") or metadata.get("applicability") or metadata.get("model_policy"))
+
+
+def _strip_batch_system_text(text: str) -> str:
+    return re.sub(r"(?iu)\bклиент прислал несколько сообщений подряд:?\s*", " ", str(text or "")).strip()
 
 
 def _price_conflict(answers: list[dict[str, Any]]) -> bool:
@@ -146,6 +188,10 @@ def _price_conflict(answers: list[dict[str, Any]]) -> bool:
         if found:
             prices.add("|".join(found))
     return len(prices) > 1
+
+
+def _price_request(text: str) -> bool:
+    return bool(re.search(r"(?iu)\b(цен|стоим|прайс|сколько|руб|₽)\b", str(text or "")))
 
 
 def _request_autoanswer_blocker(request: RagRetrievalRequest, service_filter: str) -> str:

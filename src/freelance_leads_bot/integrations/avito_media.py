@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from .avito_consultant import AvitoConsultantReply
 from .config import IntegrationSettings
-from .models import Handoff, InboundMessage
+from .models import Handoff, HandoffReason, InboundMessage
 
 
 class AvitoPhotoResolver(Protocol):
@@ -57,10 +57,13 @@ async def enrich_reply_handoff_photos(
     if not reply.handoff or not resolver:
         return reply
     message = reply.handoff.message
-    if not message.has_photo or message.metadata.get("photo_urls"):
+    if message.metadata.get("photo_urls"):
+        return reply
+    is_visual_handoff = reply.handoff.reason in {HandoffReason.PHOTO_CONSULTATION, HandoffReason.EXPERT_EXPECTATION}
+    if not message.has_photo and not is_visual_handoff:
         return reply
     try:
-        photo_urls = await resolver.photo_urls(account_id, message.chat_id, message.message_id)
+        photo_urls = await resolver.photo_urls(account_id, message.chat_id, message.message_id if message.has_photo else "")
     except Exception as exc:
         photo_urls = []
         error = type(exc).__name__
@@ -69,6 +72,8 @@ async def enrich_reply_handoff_photos(
     metadata = {**message.metadata}
     if photo_urls:
         metadata["photo_urls"] = photo_urls
+        if not message.has_photo:
+            metadata["photo_source"] = "recent_chat_history"
     if error:
         metadata["photo_resolve_error"] = error
     enriched_message = replace(message, metadata=metadata)
