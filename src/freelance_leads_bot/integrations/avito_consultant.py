@@ -17,6 +17,7 @@ from .config import DEFAULT_CITIES
 from .expert_rag import ExpertRagStore
 from .rag_retrieval import RagRetrievalService
 from .service_catalog import ACTIVE, ServiceCatalogStore
+from .service_intake import ServiceIntakeEngine
 from .models import Handoff, HandoffReason, InboundMessage, Service, Slot
 from .roles import CodexRole, RoleProfile, conversation_key, role_profile
 
@@ -217,6 +218,7 @@ class AvitoConsultant:
         profile: RoleProfile | None = None,
         expert_rag: ExpertRagStore | None = None,
         rag_retrieval: RagRetrievalService | None = None,
+        intake_engine: ServiceIntakeEngine | None = None,
         rag_autoanswer_threshold: float = 0.82,
         rag_handoff_threshold: float = 0.65,
     ) -> None:
@@ -230,6 +232,7 @@ class AvitoConsultant:
         self.rag_handoff_threshold = rag_handoff_threshold
         self.rag_answer_service = RagAnswerService(autoanswer_threshold=rag_autoanswer_threshold)
         self.handoff_composer = HandoffComposer()
+        self.intake_engine = intake_engine or ServiceIntakeEngine()
         self.booking_flow = AvitoBookingFlow(
             toolbox.booking,
             cities=cities,
@@ -297,6 +300,9 @@ class AvitoConsultant:
                 reply=f"Приём ведём в фиксированных городах: {_cities_text(self.cities)}. В каком из них вам удобно?",
                 metadata={"planner": "client_router", "route": route.to_dict()},
             )
+        intake = self._intake_reply(context, route)
+        if intake:
+            return intake
         if route.route == "ask_consultation_details":
             return AvitoConsultantReply(
                 action="ask_consultation_details",
@@ -347,6 +353,38 @@ class AvitoConsultant:
             )
         if route.route in {"booking_read", "address"}:
             return await self._fallback_response(context)
+        return None
+
+    def _intake_reply(self, context: AvitoAgentContext, route: ClientRoute) -> AvitoConsultantReply | None:
+        decision = self.intake_engine.evaluate(
+            context.message,
+            route=route.route,
+            conversation_history=context.conversation_history,
+            cities=self.cities,
+        )
+        if decision.action == "ask_intake_details":
+            return AvitoConsultantReply(
+                action="ask_intake_details",
+                reply=decision.reply,
+                metadata={"planner": "service_intake", "route": route.to_dict(), **decision.metadata},
+            )
+        if decision.action == "handoff":
+            return AvitoConsultantReply(
+                action="handoff",
+                reply=decision.reply,
+                handoff=Handoff(
+                    reason=decision.reason,
+                    message=context.message,
+                    summary=decision.summary,
+                ),
+                metadata={
+                    "planner": "service_intake",
+                    "route": route.to_dict(),
+                    "intake_fields": decision.fields,
+                    "missing_fields": list(decision.missing_fields),
+                    **decision.metadata,
+                },
+            )
         return None
 
     def _route_handoff_reply(

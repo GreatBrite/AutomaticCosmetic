@@ -1,0 +1,74 @@
+[
+  {
+    "service_key": "guby",
+    "title": "Губы",
+    "aliases": ["губы", "губ", "увеличение губ", "контурная пластика губ"],
+    "required_fields": ["zone", "goal"],
+    "visual_photo_required": true
+  },
+  {
+    "service_key": "grud",
+    "title": "Грудь",
+    "aliases": ["грудь", "груди", "увеличение груди", "контурная пластика груди"],
+    "required_fields": ["goal"],
+    "immediate_expectation_handoff": true
+  },
+  {
+    "service_key": "yagodicy",
+    "title": "Ягодицы",
+    "aliases": ["ягодицы", "ягодиц", "попа", "попу", "увеличение ягодиц", "tesoro", "тесоро"],
+    "required_fields": ["goal"],
+    "immediate_expectation_handoff": true
+  },
+  {
+    "service_key": "face_contour",
+    "title": "Контурная пластика лица",
+    "aliases": ["контурная пластика лица", "лицо", "скулы", "углы", "подбородок", "носогубные складки", "носослезная борозда", "профиль джоли", "морщины"],
+    "required_fields": ["zone", "goal"],
+    "visual_photo_required": true
+  },
+  {
+    "service_key": "botoks",
+    "title": "Ботокс / ботулинотерапия",
+    "aliases": ["ботокс", "ботулинотерапия", "диспорт", "лоб", "межбровье", "глаза", "нефертити", "гипергидроз"],
+    "required_fields": ["zone", "goal"]
+  },
+  {
+    "service_key": "skin_quality",
+    "title": "Биоревитализация / мезотерапия / качество кожи",
+    "aliases": ["биоревитализация", "мезотерапия", "качество кожи", "пилинг", "купероз", "восстановление кожи", "колост", "новакутан", "белотеро гидро"],
+    "required_fields": ["zone", "goal"]
+  },
+  {
+    "service_key": "threads",
+    "title": "Нити",
+    "aliases": ["нити", "нитевой лифтинг", "мезонити", "мононити", "коги", "cog"],
+    "required_fields": ["zone", "goal"],
+    "visual_photo_required": true
+  },
+  {
+    "service_key": "lipolytics_body",
+    "title": "Липолитики тело",
+    "aliases": ["липолитик", "липолитики", "тело", "живот", "бока", "бедра", "бедер"],
+    "required_fields": ["zone", "goal"]
+  },
+  {
+    "service_key": "scalp",
+    "title": "Кожа головы / волосы",
+    "aliases": ["кожа головы", "волосы", "выпадение волос", "рост волос", "ломкость волос"],
+    "required_fields": ["goal"]
+  },
+  {
+    "service_key": "filler_removal",
+    "title": "Выведение филлера",
+    "aliases": ["выведение филлера", "убрать филлер", "растворить филлер", "лонгидаза"],
+    "required_fields": ["zone", "goal"],
+    "visual_photo_required": true
+  },
+  {
+    "service_key": "consultation",
+    "title": "Консультация в мессенджере/соцсети",
+    "aliases": ["консультация", "проконсультироваться", "онлайн консультация", "онлайн-консультация"],
+    "required_fields": ["contact"]
+  }
+]

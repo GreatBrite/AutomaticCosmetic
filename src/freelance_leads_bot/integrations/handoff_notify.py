@@ -542,6 +542,15 @@ class TelegramHandoffNotifier:
     async def notify_avito_followup(self, row: dict[str, Any], text: str, *, reply_markup: dict | None = None) -> dict[str, Any]:
         topic_result = await self._topic_for_avito_followup(row)
         topic_params = dict(topic_result.get("topic_params") or {})
+        if not topic_params:
+            return {
+                "sent": False,
+                "reason": "missing_valid_topic",
+                "text": text,
+                "reply_markup": reply_markup or {},
+                "topic": topic_result,
+                "topic_params": {},
+            }
         result = await self.notify_text(text, reply_markup=reply_markup, topic_params=topic_params)
         result["topic"] = topic_result
         return result

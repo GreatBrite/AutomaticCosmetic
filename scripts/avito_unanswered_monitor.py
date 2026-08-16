@@ -621,6 +621,17 @@ def remember_unanswered_alert_ref(state: dict[str, Any], item: UnansweredChat) -
     return ref
 
 
+def unanswered_followup_row(item: UnansweredChat) -> dict[str, Any]:
+    return {
+        "account_id": item.account_id,
+        "chat_id": item.chat_id,
+        "message_id": item.message_id,
+        "client_name": item.client_name,
+        "listing_title": item.listing_title,
+        "listing_city": item.listing_city,
+    }
+
+
 def unanswered_card_text(item: UnansweredChat) -> str:
     age_min = int(item.age_seconds / 60)
     lines = [
@@ -748,6 +759,19 @@ def _format_followup_alert(rows: list[dict[str, Any]], *, max_items: int) -> str
     if len(rows) > max_items:
         lines.append(f"…и ещё {len(rows) - max_items}")
     return "\n".join(lines)
+
+
+def _telegram_notify_delivered(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("sent") is True:
+        return True
+    telegram = result.get("telegram")
+    if isinstance(telegram, dict) and telegram.get("ok") is True and isinstance(telegram.get("result"), dict):
+        return bool(telegram["result"].get("message_id"))
+    if result.get("ok") is True and isinstance(result.get("result"), dict):
+        return bool(result["result"].get("message_id"))
+    return False
 
 
 def _inbound_from_unanswered(item: UnansweredChat) -> InboundMessage:
@@ -1098,12 +1122,18 @@ async def main() -> None:
                     previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
                     if now - previous >= repeat_alert_seconds:
                         fresh.append(item)
-                        alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
                 if fresh:
                     for item in fresh[:max_alert_items]:
                         ref = remember_unanswered_alert_ref(state, item)
-                        await notifier.notify_text(unanswered_card_text(item), reply_markup=unanswered_keyboard(str(ref.get("key") or "")))
-                    notified = min(len(fresh), max_alert_items)
+                        notify_result = await notifier.notify_avito_followup(
+                            unanswered_followup_row(item),
+                            unanswered_card_text(item),
+                            reply_markup=unanswered_keyboard(str(ref.get("key") or "")),
+                        )
+                        if _telegram_notify_delivered(notify_result):
+                            key = _state_key(item)
+                            alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
+                            notified += 1
 
             followup_alert_rows = [row for row in followups if row.get("overdue") or row.get("severity") == "critical"]
             followup_alert_rows = [row for row in followup_alert_rows if int(row.get("snoozed_until") or 0) <= now]
@@ -1117,7 +1147,6 @@ async def main() -> None:
                     previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
                     if now - previous >= repeat_alert_seconds:
                         fresh_rows.append(row)
-                        alerts[key] = {"last_alerted_at": now, "chat_id": row.get("chat_id"), "message_id": row.get("message_id")}
                 if fresh_rows:
                     for row in fresh_rows[:max_alert_items]:
                         key = str(row.get("key") or "")
@@ -1127,13 +1156,16 @@ async def main() -> None:
                             reply_markup=pending_followup_keyboard(key),
                         )
                         topic_params = followup_result.get("topic_params") or (followup_result.get("topic") or {}).get("topic_params") or {}
+                        if not _telegram_notify_delivered(followup_result) or not topic_params:
+                            continue
+                        alerts[key] = {"last_alerted_at": now, "chat_id": row.get("chat_id"), "message_id": row.get("message_id")}
+                        followup_notified += 1
                         for index, url in enumerate(_followup_media_urls(row)[:5], start=1):
                             await notifier.notify_photo_url(
                                 url,
                                 caption=f"Фото клиента из Avito для зависшего обещания ({index})",
                                 topic_params=topic_params,
                             )
-                    followup_notified = min(len(fresh_rows), max_alert_items)
 
             if autoreply_enabled and settings.avito_unanswered_autoreply_enabled:
                 avito_reader = AvitoReadClient(settings) if settings.avito_ready and settings.avito_send_enabled else None

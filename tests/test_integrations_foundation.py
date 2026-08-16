@@ -188,6 +188,7 @@ from src.freelance_leads_bot.integrations.openrouter_intent import OpenRouterInt
 from src.freelance_leads_bot.integrations.rag_admin_intent import RagAdminIntentParser
 from src.freelance_leads_bot.integrations.rag_retrieval import RagRetrievalRequest, RagRetrievalService
 from src.freelance_leads_bot.integrations.service_catalog import ACTIVE, DELETED, HIDDEN, ServiceCatalogStore
+from src.freelance_leads_bot.integrations.service_intake import ServiceIntakeEngine
 from scripts.avito_unanswered_monitor import (
     UnansweredChat,
     apply_unanswered_action,
@@ -3137,7 +3138,7 @@ async def test_avito_consultant_creates_booking_critical_handoff(tmp_path) -> No
 
 
 @pytest.mark.anyio
-async def test_avito_consultant_asks_details_before_aesthetic_volume_handoff(tmp_path) -> None:
+async def test_avito_consultant_handoffs_body_volume_expectation_without_intake(tmp_path) -> None:
     consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json")))
     message = avito_inbound_message(
         {
@@ -3149,10 +3150,12 @@ async def test_avito_consultant_asks_details_before_aesthetic_volume_handoff(tmp
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "ask_consultation_details"
-    assert reply.handoff is None
-    assert "какая зона" in reply.reply.casefold()
-    assert "фото" in reply.reply.casefold()
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
+    assert "112" not in reply.reply
+    assert "103" not in reply.reply
+    assert "нельзя автообещать результат по мл" in reply.handoff.summary
 
 
 @pytest.mark.anyio
@@ -4341,6 +4344,202 @@ async def test_avito_consultant_does_not_turn_phone_and_week_into_personal_meeti
     assert "какая процедура" in reply.reply.lower()
     assert "встреч" not in reply.reply.lower()
     assert "приём" not in reply.reply.lower()
+
+
+def test_service_intake_engine_asks_missing_face_fields(tmp_path) -> None:
+    engine = ServiceIntakeEngine(tmp_path / "missing_specs.json")
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-engine-face",
+            "content": {
+                "text": "Мне подойдет контурная пластика лица?",
+                "item": {"id": 10, "title": "Контурная пластика лица"},
+            },
+        }
+    )
+
+    decision = engine.evaluate(message, route="ask_consultation_details")
+
+    assert decision.action == "ask_intake_details"
+    assert decision.missing_fields == ("zone", "goal")
+    assert decision.metadata["service_key"] == "face_contour"
+
+
+def test_service_intake_engine_handoffs_body_volume_expectation(tmp_path) -> None:
+    engine = ServiceIntakeEngine(tmp_path / "missing_specs.json")
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-engine-body",
+            "content": {"text": "400 мл хватит для груди? Какой будет размер?"},
+        }
+    )
+
+    decision = engine.evaluate(message, route="ask_consultation_details")
+
+    assert decision.action == "handoff"
+    assert decision.reason == HandoffReason.EXPERT_EXPECTATION
+    assert "нельзя автообещать результат по мл" in decision.summary
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_asks_face_details_before_handoff(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-face-intake",
+            "content": {
+                "text": "Мне подойдет контурная пластика лица?",
+                "item": {"id": 10, "title": "Контурная пластика лица", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_intake_details"
+    assert reply.handoff is None
+    assert "какая зона" in reply.reply.casefold()
+    assert "результат" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_asks_what_to_evaluate_for_photo_without_text(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-photo-intake",
+            "content": {
+                "text": "",
+                "photo": {"url": "https://example.invalid/photo.jpg"},
+                "item": {"id": 10, "title": "Увеличение губ", "city": "Ростов-на-Дону"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_intake_details"
+    assert reply.handoff is None
+    assert "что именно хотите оценить" in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_sends_compact_card_when_details_and_photo_are_present(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-face-card",
+            "content": {
+                "text": "Хочу оценить скулы, сделать лицо более выраженным",
+                "photo": {"url": "https://example.invalid/photo.jpg"},
+                "item": {"id": 10, "title": "Контурная пластика лица", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.PHOTO_CONSULTATION
+    assert "Нужна консультация Ольги" in reply.handoff.summary
+    assert "Контурная пластика лица" in reply.handoff.summary
+    assert "скулы" in reply.handoff.summary
+    assert "ягод" not in reply.handoff.summary.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_handoffs_breast_volume_without_112_or_promise(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-breast-volume",
+            "content": {
+                "text": "Хватит ли мне 400 мл для увеличения груди, какой будет размер?",
+                "item": {"id": 10, "title": "Увеличение груди", "city": "Санкт-Петербург"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
+    assert "112" not in reply.reply
+    assert "103" not in reply.reply
+    assert "достаточно" not in reply.reply.casefold()
+    assert "хватит" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_keeps_risk_as_immediate_handoff(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-risk-not-intake",
+            "content": {
+                "text": "После процедуры сильный отек и температура",
+                "item": {"id": 10, "title": "Увеличение губ", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.COMPLAINT_OR_RISK
+    assert reply.metadata["planner"] == "client_router"
+    assert reply.action != "ask_intake_details"
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_consultation_asks_messenger_contact_not_phone_call(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-consult-contact", "content": {"text": "Нужна консультация по губам"}})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_intake_details"
+    assert reply.handoff is None
+    assert "мессенджера" in reply.reply.casefold()
+    assert "соцсети" in reply.reply.casefold()
+    assert "звон" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_consultation_forwards_messenger_contact(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-consult-ready",
+            "content": {"text": "Нужна консультация по губам, телеграм @anna_lips"},
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert "@anna_lips" in reply.handoff.summary
+    assert "переписке" in reply.reply.casefold()
+    assert "звон" not in reply.reply.casefold()
 
 
 @pytest.mark.anyio
@@ -10280,6 +10479,64 @@ async def test_telegram_handoff_notifier_requires_message_id_for_sent_status(tmp
     assert result["sent"] is False
     assert result["error"] == "telegram_message_not_delivered"
     assert load_telegram_handoff_refs(ref_path) == {}
+
+
+@pytest.mark.anyio
+async def test_telegram_handoff_notifier_does_not_send_avito_followup_without_valid_topic(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": 1}}
+
+    notifier = TelegramHandoffNotifier(FakeTelegramBot(), "admin-chat", topics_enabled=False, topics_path=tmp_path / "topics.json")
+
+    result = await notifier.notify_avito_followup(
+        {"account_id": 1, "chat_id": "chat-no-topic", "client_name": "Анна"},
+        "Avito: зависшее обещание бота",
+        reply_markup={"inline_keyboard": [[{"text": "Закрыто", "callback_data": "x"}]]},
+    )
+
+    assert result["sent"] is False
+    assert result["reason"] == "missing_valid_topic"
+    assert notifier.bot.messages == []
+
+
+@pytest.mark.anyio
+async def test_telegram_handoff_notifier_sends_avito_followup_to_topic_with_buttons(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+
+    class FakeTelegramBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.topics = []
+
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": 77}}
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            return {"ok": True, "result": {"message_id": 1}}
+
+    bot = FakeTelegramBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", topics_path=tmp_path / "topics.json")
+    keyboard = {"inline_keyboard": [[{"text": "Закрыто", "callback_data": "avfu:token:done"}]]}
+
+    result = await notifier.notify_avito_followup(
+        {"account_id": 1, "chat_id": "chat-topic", "client_name": "Анна", "listing_title": "Губы", "listing_city": "Москва"},
+        "Avito: зависшее обещание бота",
+        reply_markup=keyboard,
+    )
+
+    assert result["sent"] is True
+    assert bot.topics == [("admin-chat", "Анна | Avito / Москва | Губы")]
+    assert bot.messages[0][2]["message_thread_id"] == "77"
+    assert bot.messages[0][2]["reply_markup"] == keyboard
 
 
 @pytest.mark.anyio
