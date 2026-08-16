@@ -593,10 +593,17 @@ class TelegramHandoffNotifier:
         )
 
     async def topic_for_handoff_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
+        invalid_thread_ids = _invalid_handoff_thread_ids(ref)
         topic_params = _handoff_sla_topic_params(ref)
         if topic_params:
             return {"ok": True, "created": False, "reason": "handoff_ref_thread", "topic_params": topic_params}
-        existing = await asyncio.to_thread(_find_client_topic_for_handoff_ref, ref, self.chat_id, self.topics_path)
+        existing = await asyncio.to_thread(
+            _find_client_topic_for_handoff_ref,
+            ref,
+            self.chat_id,
+            self.topics_path,
+            invalid_thread_ids,
+        )
         if existing:
             return {
                 "ok": True,
@@ -614,6 +621,7 @@ class TelegramHandoffNotifier:
             self.chat_id,
             enabled=self.topics_enabled,
             path=self.topics_path,
+            invalid_thread_ids=invalid_thread_ids,
             **request,
         )
 
@@ -623,11 +631,11 @@ async def process_handoff_sla(
     *,
     ref_path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
     now: int | None = None,
-    reminder_after_seconds: int = 60 * 60,
-    escalation_after_seconds: int = 3 * 60 * 60,
+    reminder_after_seconds: int = 6 * 60 * 60,
+    escalation_after_seconds: int = 12 * 60 * 60,
     expire_after_seconds: int = 7 * 24 * 60 * 60,
     reminder_repeat_seconds: int = 6 * 60 * 60,
-    escalation_repeat_seconds: int = 2 * 60 * 60,
+    escalation_repeat_seconds: int = 6 * 60 * 60,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else int(now)
     refs = await asyncio.to_thread(load_telegram_handoff_refs, ref_path)
@@ -664,15 +672,9 @@ async def process_handoff_sla(
             not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
         )
         if can_send_reminder:
-            topic_result = await _handoff_sla_topic_result(notifier, ref)
-            result = await notifier.notify_text(
-                _format_handoff_sla_notification(ref, event="reminder"),
-                reply_markup=handoff_followup_keyboard(ref),
-                topic_params=dict(topic_result.get("topic_params") or {}),
-            )
-            if isinstance(result, dict) and "topic" not in result:
-                result["topic"] = topic_result
+            result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="reminder", now=now)
             notifications.append(result)
+            changed = changed or invalidated
             if _notification_delivered(result):
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
                 ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
@@ -688,15 +690,9 @@ async def process_handoff_sla(
             and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
         )
         if can_send_escalation:
-            topic_result = await _handoff_sla_topic_result(notifier, ref)
-            result = await notifier.notify_text(
-                _format_handoff_sla_notification(ref, event="escalation"),
-                reply_markup=handoff_followup_keyboard(ref),
-                topic_params=dict(topic_result.get("topic_params") or {}),
-            )
-            if isinstance(result, dict) and "topic" not in result:
-                result["topic"] = topic_result
+            result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="escalation", now=now)
             notifications.append(result)
+            changed = changed or invalidated
             if _notification_delivered(result):
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
                 ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
@@ -728,8 +724,66 @@ def _notification_delivered(result: Any) -> bool:
     return result.get("reason") == "preview_only" and bool(result.get("outbox") or result.get("outbox_path"))
 
 
+async def _send_handoff_sla_notification(
+    notifier: HandoffNotifier,
+    ref: dict[str, Any],
+    *,
+    event: str,
+    now: int,
+) -> tuple[dict[str, Any], bool]:
+    text = _format_handoff_sla_notification(ref, event=event)
+    reply_markup = handoff_followup_keyboard(ref)
+    topic_result = await _handoff_sla_topic_result(notifier, ref)
+    topic_params = dict(topic_result.get("topic_params") or {})
+    if not topic_params:
+        return (
+            {
+                "sent": False,
+                "reason": "missing_valid_topic",
+                "text": text,
+                "reply_markup": reply_markup,
+                "topic": topic_result,
+                "topic_params": {},
+            },
+            False,
+        )
+    result = await notifier.notify_text(text, reply_markup=reply_markup, topic_params=topic_params)
+    if isinstance(result, dict) and "topic" not in result:
+        result["topic"] = topic_result
+    if not _notification_thread_not_found(result):
+        return result if isinstance(result, dict) else {"sent": False, "telegram": result}, False
+
+    invalidated = _remember_invalid_handoff_thread(ref, str(topic_params.get("message_thread_id") or ""), now=now)
+    retry_topic_result = await _handoff_sla_topic_result(notifier, ref)
+    retry_topic_params = dict(retry_topic_result.get("topic_params") or {})
+    if not retry_topic_params or retry_topic_params == topic_params:
+        if isinstance(result, dict):
+            result["topic_retry"] = retry_topic_result
+        return result if isinstance(result, dict) else {"sent": False, "telegram": result}, invalidated
+
+    retry_result = await notifier.notify_text(text, reply_markup=reply_markup, topic_params=retry_topic_params)
+    if isinstance(retry_result, dict):
+        retry_result["topic"] = retry_topic_result
+        retry_result["topic_retry_from"] = topic_result
+    return retry_result if isinstance(retry_result, dict) else {"sent": False, "telegram": retry_result}, invalidated
+
+
+def _notification_thread_not_found(result: Any) -> bool:
+    if _message_thread_not_found(result):
+        return True
+    if isinstance(result, dict):
+        if _message_thread_not_found(result.get("telegram")):
+            return True
+        fallback = result.get("topic_fallback")
+        if isinstance(fallback, dict) and _message_thread_not_found(fallback.get("original")):
+            return True
+    return False
+
+
 def _handoff_sla_topic_params(ref: dict[str, Any]) -> dict[str, str]:
     thread_id = str(ref.get("telegram_message_thread_id") or "").strip()
+    if thread_id and thread_id in _invalid_handoff_thread_ids(ref):
+        return {}
     return {"message_thread_id": thread_id} if thread_id else {}
 
 
@@ -749,11 +803,13 @@ def _find_client_topic_for_handoff_ref(
     ref: dict[str, Any],
     telegram_chat_id: str,
     topics_path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+    invalid_thread_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
     external_chat_id = str(ref.get("avito_chat_id") or "").strip()
     if not external_chat_id:
         return None
     account_id = str(ref.get("account_id") or "").strip()
+    invalid_thread_ids = invalid_thread_ids or set()
     candidates = [
         row
         for row in load_client_topics(topics_path).values()
@@ -762,6 +818,7 @@ def _find_client_topic_for_handoff_ref(
         and str(row.get("channel") or "").casefold() == "avito"
         and str(row.get("external_chat_id") or "").strip() == external_chat_id
         and str(row.get("message_thread_id") or "").strip()
+        and str(row.get("message_thread_id") or "").strip() not in invalid_thread_ids
     ]
     if not candidates:
         return None
@@ -773,6 +830,28 @@ def _find_client_topic_for_handoff_ref(
         reverse=True,
     )
     return candidates[0]
+
+
+def _invalid_handoff_thread_ids(ref: dict[str, Any]) -> set[str]:
+    raw = ref.get("invalid_telegram_message_thread_ids") if isinstance(ref, dict) else []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return set()
+    return {str(item).strip() for item in raw if str(item).strip()}
+
+
+def _remember_invalid_handoff_thread(ref: dict[str, Any], thread_id: str, *, now: int) -> bool:
+    thread_id = str(thread_id or "").strip()
+    if not thread_id:
+        return False
+    invalid = sorted(_invalid_handoff_thread_ids(ref) | {thread_id})
+    ref["invalid_telegram_message_thread_ids"] = invalid
+    if str(ref.get("telegram_message_thread_id") or "").strip() == thread_id:
+        ref["telegram_message_thread_id"] = ""
+    ref["topic_invalidated_at"] = now
+    ref["updated_at"] = now
+    return True
 
 
 def _topic_request_from_handoff_ref(ref: dict[str, Any]) -> dict[str, Any]:
@@ -1177,12 +1256,12 @@ async def _send_message_with_topic_fallback(
         result = {"ok": False, "error": repr(exc)}
     if _telegram_delivery_ok(result) or not topic_params or not _message_thread_not_found(result):
         return result, topic_params, {}
-    fallback_kwargs = {"reply_markup": reply_markup} if reply_markup else {}
-    try:
-        fallback_result = await _to_thread_retry(lambda: bot.send_message(chat_id, text, **fallback_kwargs))
-    except Exception as exc:
-        fallback_result = {"ok": False, "error": repr(exc)}
-    return fallback_result, {}, {"reason": "message_thread_not_found", "original": result, "topic_params": topic_params}
+    return result, topic_params, {
+        "reason": "message_thread_not_found",
+        "original": result,
+        "topic_params": topic_params,
+        "general_fallback_sent": False,
+    }
 
 
 def _message_thread_not_found(send_response: Any) -> bool:

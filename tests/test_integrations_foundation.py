@@ -3263,7 +3263,7 @@ async def test_aesthetic_expectation_handoff_ref_is_critical_for_sla(tmp_path) -
 
 
 @pytest.mark.anyio
-async def test_handoff_notifier_falls_back_when_saved_topic_is_missing(tmp_path, monkeypatch) -> None:
+async def test_handoff_notifier_does_not_fall_back_when_saved_topic_is_missing(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
     from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
@@ -3306,13 +3306,13 @@ async def test_handoff_notifier_falls_back_when_saved_topic_is_missing(tmp_path,
 
     result = await notifier.notify(handoff)
 
-    assert result["sent"] is True
+    assert result["sent"] is False
     assert result["topic_fallback"]["reason"] == "message_thread_not_found"
+    assert result["topic_fallback"]["general_fallback_sent"] is False
     assert bot.messages[0][2]["message_thread_id"] == "missing-thread"
-    assert bot.messages[1][2] == {}
+    assert len(bot.messages) == 1
     refs = load_telegram_handoff_refs(tmp_path / "refs.json")
-    ref = next(iter(refs.values()))
-    assert ref["telegram_message_thread_id"] == ""
+    assert refs == {}
 
 
 @pytest.mark.anyio
@@ -3338,6 +3338,9 @@ async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, mo
         def send_photo(self, chat_id, path, caption=None, **kwargs):
             self.photos.append((chat_id, str(path), caption, kwargs))
             return {"ok": True, "result": {"message_id": 100 + len(self.photos)}}
+
+        def create_forum_topic(self, chat_id, name):
+            return {"ok": True, "result": {"message_thread_id": 900 + len(self.messages)}}
 
     async def direct_retry(func, *args, **kwargs):
         return func(*args)
@@ -3394,7 +3397,13 @@ async def test_elena_acceptance_flow_keeps_booking_critical_control(tmp_path, mo
     for ref in refs.values():
         ref["created_at"] = now - 4 * 60 * 60
     save_telegram_handoff_refs(refs, ref_path)
-    sla = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    sla = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=30 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+    )
 
     assert len(urgent_refs) >= 4
     assert len(bot.edits) <= 1
@@ -4848,6 +4857,26 @@ def test_integration_settings_default_avito_codex_max_steps_is_four(monkeypatch)
     settings = IntegrationSettings.from_env()
 
     assert settings.avito_codex_max_steps == 4
+
+
+def test_integration_settings_loads_spb_company_and_staff_ids(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("AVITO_TEST_MODE", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "YCLIENTS_COMPANY_ID=999",
+                "YCLIENTS_SPB_COMPANY_ID=111",
+                "YCLIENTS_SPB_STAFF_ID=222",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = IntegrationSettings.from_env(env_path)
+
+    assert settings.yclients_city_company_ids["Санкт-Петербург"] == 111
+    assert settings.yclients_city_staff_ids["Санкт-Петербург"] == 222
 
 
 @pytest.mark.anyio
@@ -6947,6 +6976,13 @@ def test_rag_admin_intent_parser_understands_freeform_price_language() -> None:
     assert intent.intent == "price_percent_change"
     assert intent.scope["service"] == "ягодицы"
     assert intent.operation["value"] == 10
+    assert intent.parser_source == "fallback"
+
+
+def test_rag_admin_intent_parser_ignores_time_and_date_lines() -> None:
+    intent = RagAdminIntentParser().parse("Напомни про запись на 18:00\n16 августа")
+
+    assert intent.intent == "unknown"
     assert intent.parser_source == "fallback"
 
 
@@ -10418,7 +10454,13 @@ async def test_handoff_sla_sends_reminders_escalates_and_expires_old_refs(tmp_pa
     save_telegram_handoff_refs(refs, ref_path)
     notifier = FakeNotifier()
 
-    result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    result = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=30 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+    )
     updated = load_telegram_handoff_refs(ref_path)
 
     assert result["reminders"] == 2
@@ -10504,6 +10546,78 @@ async def test_handoff_sla_restores_existing_client_topic_when_ref_thread_missin
 
 
 @pytest.mark.anyio
+async def test_handoff_sla_retries_valid_client_topic_when_ref_thread_is_missing(tmp_path) -> None:
+    from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
+
+    class FakeBot:
+        def __init__(self) -> None:
+            self.messages = []
+            self.topics = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.messages.append((chat_id, text, kwargs))
+            if kwargs.get("message_thread_id") == "missing-thread":
+                raise RuntimeError('Telegram API sendMessage failed: HTTP 400: {"description":"Bad Request: message thread not found"}')
+            return {"ok": True, "result": {"message_id": 10 + len(self.messages)}}
+
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": 99}}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    topics_path = tmp_path / "topics.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-reminder",
+        account_id="355539652",
+        client_name="Татьяна",
+        handoff_text=(
+            "СРОЧНО: Нужна ручная проверка\n"
+            "Причина: booking_ambiguous\n"
+            "Канал: avito\n"
+            "Клиент: Татьяна\n"
+            "Объявление: Модель на ботокс | Санкт-Петербург\n"
+            "Сообщение: Да"
+        ),
+        reason="booking_ambiguous",
+        urgency="critical",
+        telegram_message_thread_id="missing-thread",
+        path=ref_path,
+    )
+    remember_client_topic(
+        key="avito:355539652:chat-reminder",
+        telegram_chat_id="admin-chat",
+        message_thread_id="55",
+        title="Татьяна | Avito / Санкт-Петербург",
+        channel="avito",
+        external_chat_id="chat-reminder",
+        account_id="355539652",
+        client_name="Татьяна",
+        city="Санкт-Петербург",
+        path=topics_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 61 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    bot = FakeBot()
+    notifier = TelegramHandoffNotifier(bot, "admin-chat", ref_path=ref_path, topics_path=topics_path)
+
+    result = await process_handoff_sla(notifier, ref_path=ref_path, now=now, reminder_after_seconds=30 * 60)
+    updated = load_telegram_handoff_refs(ref_path)["admin-chat:1"]
+
+    assert result["reminders"] == 1
+    assert bot.topics == []
+    assert bot.messages[0][2]["message_thread_id"] == "missing-thread"
+    assert bot.messages[-1][2]["message_thread_id"] == "55"
+    assert all(call[2].get("message_thread_id") for call in bot.messages)
+    assert bot.messages[-1][2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"].startswith("hfu:")
+    assert updated["telegram_message_thread_id"] == "55"
+    assert updated["invalid_telegram_message_thread_ids"] == ["missing-thread"]
+
+
+@pytest.mark.anyio
 async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(tmp_path) -> None:
     class FakeNotifier:
         def __init__(self) -> None:
@@ -10522,6 +10636,7 @@ async def test_handoff_sla_repeats_reminders_after_cooldown_without_new_handoff(
         handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
         urgency="critical",
         reason="booking_critical",
+        telegram_message_thread_id="77",
         path=ref_path,
     )
     refs = load_telegram_handoff_refs(ref_path)
@@ -10569,6 +10684,7 @@ async def test_handoff_sla_does_not_mark_failed_notifications_as_sent(tmp_path) 
         handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
         urgency="critical",
         reason="booking_critical",
+        telegram_message_thread_id="77",
         path=ref_path,
     )
     refs = load_telegram_handoff_refs(ref_path)
@@ -10605,6 +10721,7 @@ async def test_handoff_sla_does_not_mark_pseudo_ok_notifications_as_sent(tmp_pat
         handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
         urgency="critical",
         reason="booking_critical",
+        telegram_message_thread_id="77",
         path=ref_path,
     )
     refs = load_telegram_handoff_refs(ref_path)
@@ -10645,6 +10762,7 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
         handoff_text="Причина: booking_critical\nСообщение: запись на 28 июля в силе?",
         urgency="critical",
         reason="booking_critical",
+        telegram_message_thread_id="77",
         path=ref_path,
     )
     second = remember_telegram_handoff_ref(
@@ -10654,6 +10772,7 @@ async def test_handoff_sla_deduplicates_repeated_open_cards_for_same_avito_chat(
         handoff_text="Причина: booking_critical\nСообщение: адрес напишите",
         urgency="critical",
         reason="booking_critical",
+        telegram_message_thread_id="88",
         path=ref_path,
     )
     refs = load_telegram_handoff_refs(ref_path)
@@ -10982,6 +11101,65 @@ def test_codex_review_guard_handoffs_aesthetic_volume_promise() -> None:
     assert reviewed.metadata["aesthetic_expectation_guard"]["reason"] == "aesthetic_expectation_guard"
 
 
+def test_codex_review_guard_removes_body_answer_from_face_listing() -> None:
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-face-scope",
+            "text": "модель",
+            "content": {
+                "listing": {
+                    "id": 8353479902,
+                    "title": "Модель на контурную пластику лица Москва",
+                    "price_string": "Бесплатно",
+                    "city": "Москва",
+                }
+            },
+        }
+    )
+    decision = AvitoConsultantReply(
+        action="codex_reply",
+        reply="Для увеличения ягодиц используем Tesoro Body, это филлер для контурной пластики тела.",
+    )
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "ok"})
+
+    assert reviewed.action == "codex_reply"
+    assert "зона лица" in reviewed.reply
+    assert "ягод" not in reviewed.reply.casefold()
+    assert reviewed.metadata["service_scope_guard"]["reason"] == "face_body_scope_mismatch"
+
+
+def test_codex_review_guard_blocks_emergency_reply_without_acute_symptoms() -> None:
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-breast-volume", "text": "Достаточно ли мне будет 400 мл для увеличения груди?"})
+    decision = AvitoConsultantReply(
+        action="codex_reply",
+        reply="Если вам не подходит 400 мл, срочно вызывайте 112 или 103.",
+    )
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "ok"})
+
+    assert reviewed.action == "handoff"
+    assert reviewed.handoff is not None
+    assert reviewed.handoff.reason == HandoffReason.MISSING_DATA
+    assert "112" not in reviewed.reply
+    assert "103" not in reviewed.reply
+    assert reviewed.metadata["emergency_guard"]["reason"] == "emergency_without_acute_symptoms"
+
+
+def test_codex_review_guard_allows_emergency_reply_for_acute_symptoms() -> None:
+    message = avito_inbound_message(
+        {"type": "message", "chat_id": "chat-acute-risk", "text": "После процедуры сильный отёк лица и трудно дышать"}
+    )
+    decision = AvitoConsultantReply(action="codex_reply", reply="При затруднённом дыхании срочно звоните 112 или 103.")
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "ok"})
+
+    assert reviewed.action == "codex_reply"
+    assert "112" in reviewed.reply
+    assert "emergency_guard" not in reviewed.metadata
+
+
 def test_codex_review_guard_allows_explicit_olga_aesthetic_formula() -> None:
     message = avito_inbound_message({"type": "message", "chat_id": "chat-review", "text": "Что даст 300 мл?"})
     decision = AvitoConsultantReply(
@@ -10995,6 +11173,45 @@ def test_codex_review_guard_allows_explicit_olga_aesthetic_formula() -> None:
     assert reviewed.action == "codex_reply"
     assert "минимальный объём" in reviewed.reply
     assert "aesthetic_expectation_guard" not in reviewed.metadata
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_filters_body_knowledge_for_face_listing(tmp_path) -> None:
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    body_item = knowledge.create(
+        kind="price",
+        title="Цены по объёмам для грудь/ягодицы",
+        content="Как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽. Tesoro Body для контурной пластики тела.",
+        tags=("model", "body_contouring", "увеличение ягодиц"),
+    )
+    face_item = knowledge.create(
+        kind="service_note",
+        title="Модель на контурную пластику лица",
+        content="По лицу сначала уточняем зону: скулы, подбородок, носогубка или углы нижней челюсти.",
+        tags=("model", "face"),
+    )
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), knowledge))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-face-knowledge",
+            "text": "модель",
+            "content": {
+                "listing": {
+                    "id": 8353479902,
+                    "title": "Модель на контурную пластику лица Москва",
+                    "price_string": "Бесплатно",
+                    "city": "Москва",
+                }
+            },
+        }
+    )
+
+    context = await consultant.build_context(message)
+    ids = {str(item.get("id") or "") for item in context.knowledge_items}
+
+    assert face_item.id in ids
+    assert body_item.id not in ids
 
 
 def test_consultation_guard_removes_offline_and_final_hedge() -> None:

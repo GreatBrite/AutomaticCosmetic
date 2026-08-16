@@ -992,7 +992,9 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description="Audit Avito chats where the latest client message has no outgoing reply.")
     parser.add_argument("--once", action="store_true", help="Run one audit and exit.")
     parser.add_argument("--notify", action="store_true", help="Send Telegram notification for newly detected unanswered chats.")
+    parser.add_argument("--no-notify", action="store_true", help="Disable Telegram notifications even when enabled in .env.")
     parser.add_argument("--autoreply", action="store_true", help="Run delayed Avito autoreply for new unanswered chats.")
+    parser.add_argument("--no-autoreply", action="store_true", help="Disable Avito autoreplies even when enabled in .env.")
     parser.add_argument("--chat-limit", type=int, default=None)
     parser.add_argument("--messages-per-chat", type=int, default=None)
     parser.add_argument("--min-age-seconds", type=int, default=None)
@@ -1018,8 +1020,8 @@ async def main() -> None:
     interval_seconds = args.interval_seconds if args.interval_seconds is not None else settings.avito_unanswered_interval_seconds
     repeat_alert_seconds = args.repeat_alert_seconds if args.repeat_alert_seconds is not None else _env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600)
     max_alert_items = args.max_alert_items if args.max_alert_items is not None else _env_int("AVITO_UNANSWERED_MAX_ALERT_ITEMS", 10)
-    notify_enabled = args.notify or _env_bool("AVITO_UNANSWERED_NOTIFY_ENABLED")
-    autoreply_enabled = args.autoreply or _env_bool("AVITO_UNANSWERED_AUTOREPLY_ENABLED")
+    notify_enabled = False if args.no_notify else args.notify or _env_bool("AVITO_UNANSWERED_NOTIFY_ENABLED")
+    autoreply_enabled = False if args.no_autoreply else args.autoreply or _env_bool("AVITO_UNANSWERED_AUTOREPLY_ENABLED")
     notifier = handoff_notifier_from_settings(settings) if notify_enabled else None
     if args.followup_token:
         token = pending_followup_token(args.followup_token) if ":" in args.followup_token else args.followup_token

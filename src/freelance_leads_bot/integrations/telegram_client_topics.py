@@ -149,14 +149,17 @@ def get_or_create_client_topic(
     city: str = "",
     enabled: bool = True,
     path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+    invalid_thread_ids: set[str] | tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     if not enabled:
         return {"ok": False, "reason": "disabled", "topic_params": {}}
     telegram_chat_id = str(telegram_chat_id or "").strip()
     if not telegram_chat_id or not key:
         return {"ok": False, "reason": "missing_key_or_chat", "topic_params": {}}
+    invalid_threads = {str(item).strip() for item in (invalid_thread_ids or ()) if str(item).strip()}
     existing = find_client_topic(key, telegram_chat_id=telegram_chat_id, path=path)
-    if existing:
+    existing_thread_id = str((existing or {}).get("message_thread_id") or "").strip()
+    if existing and existing_thread_id not in invalid_threads:
         return {"ok": True, "created": False, "topic": existing, "topic_params": topic_params_from_row(existing)}
     try:
         created = bot.create_forum_topic(telegram_chat_id, title)

@@ -496,6 +496,8 @@ class AvitoConsultant:
                     continue
                 if _unsafe_knowledge_item(item):
                     continue
+                if not _knowledge_item_matches_message_scope(item, message):
+                    continue
                 seen.add(item_id)
                 items.append({**item, "_query": query})
         return items
@@ -789,6 +791,41 @@ def _unsafe_knowledge_item(item: dict[str, Any]) -> bool:
         "ну вот цены в боте",
     )
     return any(marker in text for marker in blocked)
+
+
+FACE_SCOPE_RE = re.compile(
+    r"(?iu)(контурн\w*\s+пластик\w*\s+лиц|лиц[аоеу]?|скул|угл[ыо]?\s+нижн\w+\s+челюст|"
+    r"челюст|подбород|нососл[её]з|носогуб|нефертити|овал|брыл|морщ)"
+)
+BODY_SCOPE_RE = re.compile(r"(?iu)(груд|ягод|поп|тело|body|tesoro|тесоро|бедр|б[её]др|милли?литр|\b\d{2,5}\s*мл\b)")
+
+
+def _knowledge_item_matches_message_scope(item: dict[str, Any], message: InboundMessage) -> bool:
+    scope_source = " ".join(
+        part
+        for part in (
+            message.text,
+            message.listing.title if message.listing else "",
+        )
+        if part
+    ).casefold().replace("ё", "е")
+    item_source = " ".join(
+        str(part or "")
+        for part in (
+            item.get("title"),
+            item.get("content"),
+            " ".join(str(tag or "") for tag in item.get("tags") or []),
+        )
+    ).casefold().replace("ё", "е")
+    scope_is_face = bool(FACE_SCOPE_RE.search(scope_source))
+    scope_is_body = bool(BODY_SCOPE_RE.search(scope_source))
+    item_is_body = bool(BODY_SCOPE_RE.search(item_source))
+    item_is_face = bool(FACE_SCOPE_RE.search(item_source))
+    if scope_is_face and not scope_is_body and item_is_body:
+        return False
+    if scope_is_body and not scope_is_face and item_is_face:
+        return False
+    return True
 
 
 def _booking_critical_client_reply(message: InboundMessage) -> str:

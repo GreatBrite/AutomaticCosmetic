@@ -42,6 +42,17 @@ AESTHETIC_PROMISE_RESULT_RE = re.compile(
     r"(?iu)(размер|\+\s*1|плюс\s+один|заметн\w+|ярк\w+|выраженн\w+|результат|"
     r"увелич\w+|хватит|достаточн\w+|как\s+будет|до\s*/?\s*после)"
 )
+EMERGENCY_REPLY_RE = re.compile(r"(?iu)(?:\b112\b|\b103\b|скор\w+\s+помощ|вызыва\w+\s+скор|звон\w+\s+(?:112|103)|неотложн\w+\s+помощ)")
+ACUTE_RISK_CONTEXT_RE = re.compile(
+    r"(?iu)(?:сильн\w+\s+от[её]к|от[её]к\s+(?:лица|губ|язык|горл)|затрудн\w+\s+дых|трудно\s+дыш|"
+    r"задых|резк\w+\s+ухудш|температур|гной|инфекц|сильн\w+\s+аллерг|анафилак|"
+    r"головокруж|потер[яю]\s+созн|сильн\w+\s+боль|кровотеч)"
+)
+FACE_SCOPE_RE = re.compile(
+    r"(?iu)(контурн\w*\s+пластик\w*\s+лиц|лиц[аоеу]?|скул|угл[ыо]?\s+нижн\w+\s+челюст|"
+    r"челюст|подбород|нососл[её]з|носогуб|нефертити|овал|брыл|морщ)"
+)
+BODY_REPLY_RE = re.compile(r"(?iu)(груд|ягод|поп|контурн\w+\s+(?:коррекц\w+|пластик\w+)\s+тел|тело|body|tesoro|тесоро)")
 
 
 class AvitoDraftReviewer(Protocol):
@@ -71,13 +82,15 @@ class CodexDraftReviewer:
         prompt = build_codex_review_prompt(message, decision, conversation_history)
         text, _path = await asyncio.to_thread(chat_with_codex, prompt, None, self.timeout_seconds, None, True)
         outcome = parse_codex_step(text)
-        return apply_review_outcome(message, decision, outcome)
+        return apply_review_outcome(message, decision, outcome, conversation_history=conversation_history)
 
 
 def apply_review_outcome(
     message: InboundMessage,
     decision: AvitoConsultantReply,
     outcome: dict[str, Any] | None,
+    *,
+    conversation_history: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
 ) -> AvitoConsultantReply:
     metadata = dict(decision.metadata or {})
     if not outcome:
@@ -85,6 +98,9 @@ def apply_review_outcome(
         reply, changed = sanitize_consultation_language(decision.reply)
         if changed:
             metadata["consultation_guard"] = {"changed": True, "reason": "review_unavailable"}
+        guard = deterministic_review_guard(reply, message=message, decision=decision, conversation_history=conversation_history, metadata=metadata)
+        if guard:
+            return guard
         return replace(decision, reply=reply, metadata=metadata)
 
     action = str(outcome.get("action") or "approve").strip().casefold()
@@ -97,6 +113,9 @@ def apply_review_outcome(
         reply, changed = sanitize_consultation_language(decision.reply)
         if changed:
             metadata["consultation_guard"] = {"changed": True, "reason": "approved_draft"}
+        guard = deterministic_review_guard(reply, message=message, decision=decision, conversation_history=conversation_history, metadata=metadata)
+        if guard:
+            return guard
         guard = aesthetic_expectation_guard(reply, message=message, decision=decision)
         if guard:
             metadata["aesthetic_expectation_guard"] = guard
@@ -113,6 +132,9 @@ def apply_review_outcome(
     reply, changed = sanitize_consultation_language(reply)
     if changed:
         metadata["consultation_guard"] = {"changed": True, "reason": action}
+    guard = deterministic_review_guard(reply, message=message, decision=decision, conversation_history=conversation_history, metadata=metadata)
+    if guard:
+        return guard
     guard = aesthetic_expectation_guard(reply, message=message, decision=decision)
     if guard:
         metadata["aesthetic_expectation_guard"] = guard
@@ -156,10 +178,11 @@ def build_codex_review_prompt(
         "Проверь только клиентский текст: он должен быть полезным, коротким и честным.\n"
         "Особенно ищи ошибки из живых карточек: неподтверждённая цена, выдуманный адрес/метро, уверенный ответ без опоры, "
         "перепутанная дата/город, медицинская самоуверенность, раскрытие внутренних слов вроде Codex/tool/handoff, "
-        "ответ на оффтопик или попытку узнать устройство бота.\n"
+        "ответ на оффтопик или попытку узнать устройство бота, подмешивание услуг тела в объявление про лицо.\n"
         "Если всё хорошо — approve. Если можно исправить без специалиста — revise и дай готовый reply.\n"
         "Прайс единый для всех городов: городовые различия цен запрещены, город не нужен только ради цены. Города приёма фиксированы; новые города не обещай.\n"
         "Если нужна личная экспертная оценка/фото/точная цена/адрес/медицинский риск — handoff и дай безопасный короткий reply клиенту без объяснения внутреннего маршрута.\n"
+        "112/103/скорую можно упоминать только при явных острых симптомах: затруднённое дыхание, сильный отёк лица/горла, резкое ухудшение, высокая температура, гной, кровотечение, потеря сознания. Вопросы про объём, цену, модель или грудь без таких симптомов не являются поводом писать про скорую.\n"
         "Не склоняй клиента к консультации. Если нужна индивидуальная оценка Ольги, не додумывай за неё: handoff, а клиенту попроси контакт для онлайн-связи — номер или аккаунт удобного мессенджера/соцсети — либо недостающие фото/данные без обещаний результата. Не обещай телефонный звонок: консультация идёт в переписке мессенджера/соцсети.\n"
         "Если в истории/trace/draft уже есть оценка Ольги или подтверждённое решение специалиста, не добавляй новый призыв к консультации и убирай шаблонные хвосты вроде 'окончательно подбирается индивидуально/на консультации'.\n"
         "Не спамь консультацией: обычный ответ про цену, адрес, запись или уже разобранное фото должен завершаться по сути вопроса, без консультационного CTA.\n"
@@ -201,6 +224,75 @@ def aesthetic_expectation_guard(reply: str, *, message: InboundMessage | None = 
         "safe_reply": "По объёму и ожидаемому результату лучше не обещать вслепую. Передам Ольге, она посмотрит и сориентирует точнее.",
         "handoff_summary": "Нельзя автообещать результат по мл. Проверьте вопрос клиента и ответьте формулировкой Ольги.",
         "message_text": str(message.text or "")[:500] if message else "",
+    }
+
+
+def deterministic_review_guard(
+    reply: str,
+    *,
+    message: InboundMessage,
+    decision: AvitoConsultantReply,
+    conversation_history: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+    metadata: dict[str, Any] | None = None,
+) -> AvitoConsultantReply | None:
+    metadata = metadata if metadata is not None else dict(decision.metadata or {})
+    scope_guard = face_body_scope_guard(reply, message=message)
+    if scope_guard:
+        metadata["service_scope_guard"] = scope_guard
+        return replace(decision, reply=scope_guard["safe_reply"], metadata=metadata)
+
+    emergency_guard = emergency_misfire_guard(reply, message=message, conversation_history=conversation_history)
+    if emergency_guard:
+        metadata["emergency_guard"] = emergency_guard
+        return replace(
+            decision,
+            action="handoff",
+            reply=emergency_guard["safe_reply"],
+            handoff=Handoff(reason=HandoffReason.MISSING_DATA, message=message, summary=emergency_guard["handoff_summary"]),
+            metadata=metadata,
+        )
+    return None
+
+
+def face_body_scope_guard(reply: str, *, message: InboundMessage) -> dict[str, str]:
+    listing_title = str(message.listing.title if message.listing else "")
+    scope_text = f"{listing_title}\n{message.text or ''}".casefold().replace("ё", "е")
+    reply_text = str(reply or "").casefold().replace("ё", "е")
+    if not (FACE_SCOPE_RE.search(scope_text) and BODY_REPLY_RE.search(reply_text)):
+        return {}
+    return {
+        "reason": "face_body_scope_mismatch",
+        "safe_reply": (
+            "Да, можно как модель. Подскажите, пожалуйста, какая зона лица интересует: "
+            "скулы, углы нижней челюсти, подбородок, носослёзка или носогубка?"
+        ),
+        "message_text": str(message.text or "")[:500],
+        "listing_title": listing_title[:300],
+    }
+
+
+def emergency_misfire_guard(
+    reply: str,
+    *,
+    message: InboundMessage,
+    conversation_history: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+) -> dict[str, str]:
+    if not EMERGENCY_REPLY_RE.search(str(reply or "")):
+        return {}
+    context = " ".join(
+        str(part or "")
+        for part in (
+            message.text,
+            " ".join(str(item.get("content") or "") for item in list(conversation_history)[-6:] if str(item.get("role") or "") == "user"),
+        )
+    ).casefold().replace("ё", "е")
+    if ACUTE_RISK_CONTEXT_RE.search(context):
+        return {}
+    return {
+        "reason": "emergency_without_acute_symptoms",
+        "safe_reply": "Сейчас уточню этот вопрос у Ольги и вернусь с корректным ответом.",
+        "handoff_summary": "Бот попытался упомянуть 112/скорую без явных острых симптомов. Проверьте вопрос клиента и дайте безопасную формулировку.",
+        "message_text": str(message.text or "")[:500],
     }
 
 

@@ -261,7 +261,7 @@ def _duration_from_text(text: str) -> str:
 
 def _price_exact_from_text(text: str) -> dict[str, Any]:
     price_match = None
-    for match in re.finditer(r"(?<!\d)(\d[\d\s]{2,})(?:\s*(?:₽|руб|р\b))?", text):
+    for match in re.finditer(r"(?<!\d)(\d[\d \u00a0]{2,})(?:[ \t]*(?:₽|руб|р\b))?", text):
         if re.match(r"\s*мл\b", text[match.end() : match.end() + 8]):
             continue
         value = int(match.group(1).replace(" ", ""))

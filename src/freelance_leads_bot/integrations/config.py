@@ -210,6 +210,7 @@ def _yclients_city_company_ids() -> dict[str, int]:
 def _yclients_city_staff_ids() -> dict[str, int]:
     rows = {
         "Ростов-на-Дону": _env_int("YCLIENTS_ROSTOV_STAFF_ID"),
+        "Санкт-Петербург": _env_int("YCLIENTS_SPB_STAFF_ID") or _env_int("YCLIENTS_SAINT_PETERSBURG_STAFF_ID"),
         "Москва": _env_int("YCLIENTS_MOSCOW_STAFF_ID"),
         "Краснодар": _env_int("YCLIENTS_KRASNODAR_STAFF_ID"),
         "Геленджик": _env_int("YCLIENTS_GELENDZHIK_STAFF_ID") or _env_int("YCLIENTS_GELENDJIK_STAFF_ID"),
