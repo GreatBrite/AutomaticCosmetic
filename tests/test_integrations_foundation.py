@@ -4383,6 +4383,24 @@ def test_service_intake_engine_handoffs_body_volume_expectation(tmp_path) -> Non
     assert "нельзя автообещать результат по мл" in decision.summary
 
 
+def test_service_intake_engine_handoffs_before_after_assets_without_promise(tmp_path) -> None:
+    engine = ServiceIntakeEngine(tmp_path / "missing_specs.json")
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-engine-before-after",
+            "content": {"text": "А можно потом будет посмотреть до/плсле, когда смонтируют?"},
+        }
+    )
+
+    decision = engine.evaluate(message, route="")
+
+    assert decision.action == "handoff"
+    assert decision.reason == HandoffReason.EXPERT_EXPECTATION
+    assert "не должен обещать" in decision.summary.casefold()
+    assert "покажем" not in decision.reply.casefold()
+
+
 @pytest.mark.anyio
 async def test_avito_service_intake_asks_face_details_before_handoff(tmp_path) -> None:
     toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
@@ -4480,6 +4498,34 @@ async def test_avito_service_intake_handoffs_breast_volume_without_112_or_promis
     assert "103" not in reply.reply
     assert "достаточно" not in reply.reply.casefold()
     assert "хватит" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_service_intake_handoffs_before_after_assets_without_codex_promise(tmp_path) -> None:
+    async def fail_codex_loop(payload, trace):
+        raise AssertionError("before/after result asset questions must be blocked before Codex planner")
+
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fail_codex_loop))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-before-after-live-regression",
+            "content": {
+                "text": "А можно потом будет посмотреть до/плсле, когда смонтируют?",
+                "item": {"id": 10, "title": "Модель на контурную пластику лица Москва", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
+    assert reply.metadata["planner"] == "service_intake"
+    assert "покажем" not in reply.reply.casefold()
+    assert "не должен обещать" in reply.handoff.summary.casefold()
 
 
 @pytest.mark.anyio
@@ -4925,14 +4971,7 @@ async def test_avito_consultant_asks_photo_goal_before_codex_handoff() -> None:
 @pytest.mark.anyio
 async def test_codex_tool_loop_allows_silent_handoff_for_before_after_assets() -> None:
     async def fake_codex_loop(payload, trace):
-        assert trace == []
-        assert "фото до/после" in str(payload).casefold()
-        return {
-            "action": "handoff",
-            "handoff_reason": "missing_data",
-            "handoff_summary": "Клиенту пока ничего не писали. Нужно у Ольги: фото до/после на 300 мл или решение, что фото не будет.",
-            "reply": "",
-        }
+        raise AssertionError("before/after result asset questions must be blocked before Codex planner")
 
     consultant = AvitoConsultant(
         AutomationToolbox(DryRunYClientsGateway()),
@@ -4948,10 +4987,11 @@ async def test_codex_tool_loop_allows_silent_handoff_for_before_after_assets() -
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "ask_consultation_details"
-    assert reply.handoff is None
-    assert "какая зона" in reply.reply.casefold()
-    assert "что хотите" in reply.reply.casefold()
+    assert reply.action == "handoff"
+    assert reply.handoff is not None
+    assert reply.handoff.reason == HandoffReason.EXPERT_EXPECTATION
+    assert "фото до/после" in reply.handoff.summary.casefold()
+    assert "покажем" not in reply.reply.casefold()
 
 
 @pytest.mark.anyio

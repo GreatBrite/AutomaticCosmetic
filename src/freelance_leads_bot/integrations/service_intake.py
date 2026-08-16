@@ -26,6 +26,9 @@ PRICE_RE = re.compile(r"(?iu)(\bцен[ауые]?\b|ценник|стоим|пр
 ADDRESS_RE = re.compile(r"(?iu)(адрес|метро|территориально|где|локац|как пройти|вход)")
 BOOKING_RE = re.compile(r"(?iu)(запис|свобод|окош|время|слот|следующ|недел|при[её]м)")
 VISUAL_RE = re.compile(r"(?iu)(фото|сним|визуальн|посмотрит|посмотрите|оценит|оцените|асимметр|форма|как\s+будет)")
+RESULT_ASSET_RE = re.compile(
+    r"(?iu)(до\s*(?:/|-|и)?\s*п(?:о?сл|лсл)[её]|фото\s+(?:результат|до)|посмотр(?:еть|им|ю|ите)?\s+результат)"
+)
 GOAL_RE = re.compile(
     r"(?iu)(хочу|цель|эффект|результат|исправ|убрать|увелич|подтян|омолод|беспоко|асимметр|"
     r"морщин|объ[её]м|мл|форма|как\s+будет|достаточн|хватит|размер)"
@@ -124,6 +127,12 @@ class ServiceIntakeSpec:
     immediate_expectation_handoff: bool = False
 
 
+GENERIC_RESULT_ASSET_SPEC = ServiceIntakeSpec(
+    service_key="result_assets",
+    title="Фото до/после / результат",
+)
+
+
 @dataclass(frozen=True)
 class ServiceIntakeDecision:
     action: str
@@ -163,6 +172,23 @@ class ServiceIntakeEngine:
         is_expert_or_visual = route in INTAKE_ROUTES or has_media or bool(VISUAL_RE.search(current))
         if is_consultation and (not spec or spec.service_key != "consultation"):
             spec = self.spec_by_key("consultation")
+        if _result_asset_requires_handoff(current):
+            asset_spec = spec or GENERIC_RESULT_ASSET_SPEC
+            fields = _extract_fields(message, conversation_history, spec=asset_spec, cities=cities)
+            return ServiceIntakeDecision(
+                action="handoff",
+                reply="Фото до/после и материалы с результатом лучше не обещать от себя. Передам Ольге, она сориентирует, что можно показать и когда.",
+                reason=HandoffReason.EXPERT_EXPECTATION,
+                summary=_compose_card(
+                    message,
+                    spec=asset_spec,
+                    fields=fields,
+                    missing_fields=(),
+                    forced_reason="Запрос фото до/после или материалов с результатом; бот не должен обещать показ результата сам.",
+                ),
+                fields=fields,
+                metadata={"service_key": asset_spec.service_key, "intake": "result_asset_handoff"},
+            )
         if not spec or not (is_consultation or is_expert_or_visual):
             return ServiceIntakeDecision(action="continue")
 
@@ -387,6 +413,10 @@ def _body_expectation_requires_handoff(spec: ServiceIntakeSpec, current: str, so
         return False
     body_service = spec.service_key in {"grud", "yagodicy"}
     return body_service and bool(BODY_EXPECTATION_RE.search(current) or BODY_EXPECTATION_RE.search(source))
+
+
+def _result_asset_requires_handoff(current: str) -> bool:
+    return bool(RESULT_ASSET_RE.search(current))
 
 
 def _history_has_intake_question(conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
