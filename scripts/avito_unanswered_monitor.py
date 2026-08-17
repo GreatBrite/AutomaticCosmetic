@@ -46,7 +46,7 @@ from src.freelance_leads_bot.storage import LeadStore
 DEFAULT_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
 DEFAULT_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_LOG_PATH = Path("data/avito_unanswered_monitor.log")
-DEFAULT_NOTIFY_QUIET_HOURS = "22:00-10:00"
+DEFAULT_NOTIFY_QUIET_HOURS = "off"
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 FINAL_ACK_RE = re.compile(
     r"(?iu)^\s*(хорошо|ок|окей|спасибо|спасибо большое|спасибо[, ]+не надо.*|не надо.*|не нужно.*|"
@@ -146,6 +146,47 @@ def _parse_hhmm_minutes(value: str) -> int | None:
     if hour > 23 or minute > 59:
         return None
     return hour * 60 + minute
+
+
+def notification_dialog_key(account_id: Any = "", chat_id: Any = "") -> str:
+    chat = str(chat_id or "").strip()
+    if not chat:
+        return ""
+    return f"avito:{chat}"
+
+
+def notification_dialog_key_for_unanswered(item: UnansweredChat) -> str:
+    return notification_dialog_key(item.account_id, item.chat_id)
+
+
+def notification_dialog_key_for_row(row: dict[str, Any]) -> str:
+    return notification_dialog_key(row.get("account_id"), row.get("chat_id"))
+
+
+def notification_dialog_key_for_handoff_ref(ref: dict[str, Any]) -> str:
+    return notification_dialog_key(ref.get("account_id"), ref.get("avito_chat_id"))
+
+
+def notification_cooldown_allows(state: dict[str, Any], key: str, *, now: int, cooldown_seconds: int) -> bool:
+    if not key:
+        return True
+    cooldowns = state.setdefault("notification_cooldowns", {})
+    previous = int((cooldowns.get(key) or {}).get("last_notified_at") or 0) if isinstance(cooldowns.get(key), dict) else 0
+    return not previous or now - previous >= max(1, int(cooldown_seconds or 1))
+
+
+def record_notification_cooldown(
+    state: dict[str, Any],
+    key: str,
+    *,
+    now: int,
+    source: str,
+    event: str = "",
+) -> None:
+    if not key:
+        return
+    cooldowns = state.setdefault("notification_cooldowns", {})
+    cooldowns[key] = {"last_notified_at": now, "source": source, "event": event}
 
 
 def _items(payload: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
@@ -1156,8 +1197,14 @@ async def main() -> None:
                 fresh: list[UnansweredChat] = []
                 for item in actionable_items:
                     key = _state_key(item)
+                    dialog_key = notification_dialog_key_for_unanswered(item)
                     previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
-                    if now - previous >= repeat_alert_seconds:
+                    if now - previous >= repeat_alert_seconds and notification_cooldown_allows(
+                        state,
+                        dialog_key,
+                        now=now,
+                        cooldown_seconds=repeat_alert_seconds,
+                    ):
                         fresh.append(item)
                 if fresh:
                     for item in fresh[:notification_budget]:
@@ -1170,6 +1217,13 @@ async def main() -> None:
                         if _telegram_notify_delivered(notify_result):
                             key = _state_key(item)
                             alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
+                            record_notification_cooldown(
+                                state,
+                                notification_dialog_key_for_unanswered(item),
+                                now=now,
+                                source="unanswered",
+                                event="alert",
+                            )
                             notified += 1
                             notification_budget -= 1
 
@@ -1182,8 +1236,14 @@ async def main() -> None:
                     key = str(row.get("key") or "")
                     if not key:
                         continue
+                    dialog_key = notification_dialog_key_for_row(row)
                     previous = int((alerts.get(key) or {}).get("last_alerted_at") or 0) if isinstance(alerts.get(key), dict) else 0
-                    if now - previous >= repeat_alert_seconds:
+                    if now - previous >= repeat_alert_seconds and notification_cooldown_allows(
+                        state,
+                        dialog_key,
+                        now=now,
+                        cooldown_seconds=repeat_alert_seconds,
+                    ):
                         fresh_rows.append(row)
                 if fresh_rows:
                     for row in fresh_rows[:notification_budget]:
@@ -1197,6 +1257,13 @@ async def main() -> None:
                         if not _telegram_notify_delivered(followup_result) or not topic_params:
                             continue
                         alerts[key] = {"last_alerted_at": now, "chat_id": row.get("chat_id"), "message_id": row.get("message_id")}
+                        record_notification_cooldown(
+                            state,
+                            notification_dialog_key_for_row(row),
+                            now=now,
+                            source="pending_followup",
+                            event="alert",
+                        )
                         followup_notified += 1
                         notification_budget -= 1
                         for index, url in enumerate(_followup_media_urls(row)[:5], start=1):
@@ -1220,7 +1287,32 @@ async def main() -> None:
 
             handoff_sla = {}
             if notify_enabled and notifier and settings.handoff_notify_enabled and notification_budget > 0:
-                handoff_sla = await process_handoff_sla(notifier, max_notifications=notification_budget)
+                def sla_notification_allowed(ref: dict[str, Any], event: str) -> bool:
+                    return notification_cooldown_allows(
+                        state,
+                        notification_dialog_key_for_handoff_ref(ref),
+                        now=now,
+                        cooldown_seconds=repeat_alert_seconds,
+                    )
+
+                def sla_notification_recorded(ref: dict[str, Any], event: str) -> None:
+                    record_notification_cooldown(
+                        state,
+                        notification_dialog_key_for_handoff_ref(ref),
+                        now=now,
+                        source="handoff_sla",
+                        event=event,
+                    )
+
+                handoff_sla = await process_handoff_sla(
+                    notifier,
+                    max_notifications=notification_budget,
+                    notification_allowed=sla_notification_allowed,
+                    notification_recorded=sla_notification_recorded,
+                )
+                delivered_sla = int((handoff_sla or {}).get("reminders") or 0) + int((handoff_sla or {}).get("escalations") or 0)
+                notification_budget = max(0, notification_budget - delivered_sla)
+                _save_state(args.state_path, state)
 
             summary = {
                 "ok": True,

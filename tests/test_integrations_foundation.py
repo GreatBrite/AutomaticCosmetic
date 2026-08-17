@@ -199,8 +199,11 @@ from scripts.avito_unanswered_monitor import (
     remember_unanswered_alert_ref,
     audit_once as audit_unanswered_once,
     autoreply_once as autoreply_unanswered_once,
+    notification_cooldown_allows,
+    notification_dialog_key,
     notify_quiet_now,
     pending_followup_rows,
+    record_notification_cooldown,
     parse_unanswered_callback,
     sync_pending_followups,
     unanswered_keyboard,
@@ -11011,7 +11014,98 @@ def test_unanswered_monitor_notify_quiet_hours_cross_midnight() -> None:
     assert notify_quiet_now(int(datetime(2026, 8, 16, 23, 32).timestamp()), "22:00-10:00") is True
     assert notify_quiet_now(int(datetime(2026, 8, 17, 9, 59).timestamp()), "22:00-10:00") is True
     assert notify_quiet_now(int(datetime(2026, 8, 17, 10, 0).timestamp()), "22:00-10:00") is False
+    assert notify_quiet_now(int(datetime(2026, 8, 17, 23, 32).timestamp())) is False
     assert notify_quiet_now(int(datetime(2026, 8, 17, 12, 0).timestamp()), "off") is False
+
+
+def test_unanswered_monitor_notification_cooldown_is_dialog_wide() -> None:
+    state: dict[str, Any] = {}
+    key = notification_dialog_key(355539652, "chat-1")
+    record_notification_cooldown(state, key, now=10_000, source="unanswered", event="alert")
+
+    assert notification_cooldown_allows(state, key, now=10_000 + 6 * 60 * 60 - 1, cooldown_seconds=6 * 60 * 60) is False
+    assert notification_cooldown_allows(state, key, now=10_000 + 6 * 60 * 60, cooldown_seconds=6 * 60 * 60) is True
+
+
+@pytest.mark.anyio
+async def test_handoff_sla_uses_dialog_wide_cooldown(tmp_path) -> None:
+    class FakeNotifier:
+        def __init__(self) -> None:
+            self.texts = []
+
+        async def notify_text(self, text, **kwargs):
+            self.texts.append(text)
+            return {"sent": True, "text": text, "reply_markup": kwargs.get("reply_markup") or {}, "topic_params": kwargs.get("topic_params") or {}}
+
+    ref_path = tmp_path / "handoff_refs.json"
+    now = 1780000000
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id=1,
+        avito_chat_id="chat-shared-cooldown",
+        handoff_text="Причина: booking_critical\nСообщение: вы забыли?",
+        urgency="critical",
+        reason="booking_critical",
+        telegram_message_thread_id="77",
+        path=ref_path,
+    )
+    refs = load_telegram_handoff_refs(ref_path)
+    refs["admin-chat:1"]["created_at"] = now - 13 * 60 * 60
+    save_telegram_handoff_refs(refs, ref_path)
+    state: dict[str, Any] = {}
+    key = notification_dialog_key("", "chat-shared-cooldown")
+    record_notification_cooldown(state, key, now=now - 60, source="pending_followup", event="alert")
+
+    notifier = FakeNotifier()
+    blocked = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now,
+        reminder_after_seconds=60 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+        notification_allowed=lambda ref, event: notification_cooldown_allows(
+            state,
+            notification_dialog_key("", ref.get("avito_chat_id")),
+            now=now,
+            cooldown_seconds=6 * 60 * 60,
+        ),
+        notification_recorded=lambda ref, event: record_notification_cooldown(
+            state,
+            notification_dialog_key("", ref.get("avito_chat_id")),
+            now=now,
+            source="handoff_sla",
+            event=event,
+        ),
+    )
+
+    assert blocked["reminders"] == 0
+    assert blocked["escalations"] == 0
+    assert notifier.texts == []
+
+    allowed = await process_handoff_sla(
+        notifier,
+        ref_path=ref_path,
+        now=now + 6 * 60 * 60,
+        reminder_after_seconds=60 * 60,
+        escalation_after_seconds=3 * 60 * 60,
+        notification_allowed=lambda ref, event: notification_cooldown_allows(
+            state,
+            notification_dialog_key("", ref.get("avito_chat_id")),
+            now=now + 6 * 60 * 60,
+            cooldown_seconds=6 * 60 * 60,
+        ),
+        notification_recorded=lambda ref, event: record_notification_cooldown(
+            state,
+            notification_dialog_key("", ref.get("avito_chat_id")),
+            now=now + 6 * 60 * 60,
+            source="handoff_sla",
+            event=event,
+        ),
+    )
+
+    assert allowed["reminders"] == 0
+    assert allowed["escalations"] == 1
+    assert len(notifier.texts) == 1
 
 
 @pytest.mark.anyio

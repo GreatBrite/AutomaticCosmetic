@@ -11,7 +11,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from ..telegram import TelegramBot
 from .booking_flow import extract_date, extract_time
@@ -646,6 +646,8 @@ async def process_handoff_sla(
     reminder_repeat_seconds: int = 6 * 60 * 60,
     escalation_repeat_seconds: int = 6 * 60 * 60,
     max_notifications: int | None = None,
+    notification_allowed: Callable[[dict[str, Any], str], bool] | None = None,
+    notification_recorded: Callable[[dict[str, Any], str], None] | None = None,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else int(now)
     refs = await asyncio.to_thread(load_telegram_handoff_refs, ref_path)
@@ -687,11 +689,15 @@ async def process_handoff_sla(
             and (not escalation_sent_at or now - escalation_sent_at >= max(1, int(escalation_repeat_seconds or 1)))
         )
         if can_send_escalation:
+            if notification_allowed is not None and not notification_allowed(ref, "escalation"):
+                continue
             result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="escalation", now=now)
             notifications.append(result)
             changed = changed or invalidated
             if _notification_delivered(result):
                 delivered_notifications += 1
+                if notification_recorded is not None:
+                    notification_recorded(ref, "escalation")
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
                 ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
                 ref["escalation_sent_at"] = now
@@ -705,11 +711,15 @@ async def process_handoff_sla(
             not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
         )
         if can_send_reminder:
+            if notification_allowed is not None and not notification_allowed(ref, "reminder"):
+                continue
             result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="reminder", now=now)
             notifications.append(result)
             changed = changed or invalidated
             if _notification_delivered(result):
                 delivered_notifications += 1
+                if notification_recorded is not None:
+                    notification_recorded(ref, "reminder")
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
                 ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
                 ref["reminder_sent_at"] = now
