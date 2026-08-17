@@ -46,6 +46,7 @@ from src.freelance_leads_bot.storage import LeadStore
 DEFAULT_STATE_PATH = Path("data/avito_unanswered_monitor_state.json")
 DEFAULT_REPORT_PATH = Path("data/avito_unanswered_report.json")
 DEFAULT_LOG_PATH = Path("data/avito_unanswered_monitor.log")
+DEFAULT_NOTIFY_QUIET_HOURS = "22:00-10:00"
 DELETED_MESSAGE_TEXTS = {"сообщение удалено", "message deleted"}
 FINAL_ACK_RE = re.compile(
     r"(?iu)^\s*(хорошо|ок|окей|спасибо|спасибо большое|спасибо[, ]+не надо.*|не надо.*|не нужно.*|"
@@ -117,6 +118,34 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name, "").strip()
     return int(value) if value else default
+
+
+def notify_quiet_now(now: int, quiet_hours: str = DEFAULT_NOTIFY_QUIET_HOURS) -> bool:
+    quiet_hours = str(quiet_hours or "").strip()
+    if not quiet_hours or quiet_hours.lower() in {"0", "false", "off", "none", "no"}:
+        return False
+    if "-" not in quiet_hours:
+        return False
+    start_raw, end_raw = (part.strip() for part in quiet_hours.split("-", 1))
+    start = _parse_hhmm_minutes(start_raw)
+    end = _parse_hhmm_minutes(end_raw)
+    if start is None or end is None or start == end:
+        return False
+    current = datetime.fromtimestamp(now).hour * 60 + datetime.fromtimestamp(now).minute
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def _parse_hhmm_minutes(value: str) -> int | None:
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", str(value or "").strip())
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
 
 
 def _items(payload: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
@@ -1026,6 +1055,7 @@ async def main() -> None:
     parser.add_argument("--interval-seconds", type=int, default=None)
     parser.add_argument("--repeat-alert-seconds", type=int, default=None)
     parser.add_argument("--max-alert-items", type=int, default=None)
+    parser.add_argument("--notify-quiet-hours", default=None, help="Local quiet window for Telegram notifications, e.g. 22:00-10:00. Use off to disable.")
     parser.add_argument("--followup-token", default="", help="Apply an admin action to a pending followup by token, or pass the full state key.")
     parser.add_argument("--followup-action", choices=("done", "stale", "urgent", "later"), default="done")
     parser.add_argument("--unanswered-token", default="", help="Apply an admin action to an unanswered Avito alert by token.")
@@ -1043,7 +1073,12 @@ async def main() -> None:
     lookback_seconds = args.lookback_seconds if args.lookback_seconds is not None else settings.avito_unanswered_lookback_seconds
     interval_seconds = args.interval_seconds if args.interval_seconds is not None else settings.avito_unanswered_interval_seconds
     repeat_alert_seconds = args.repeat_alert_seconds if args.repeat_alert_seconds is not None else _env_int("AVITO_UNANSWERED_REPEAT_ALERT_SECONDS", 21600)
-    max_alert_items = args.max_alert_items if args.max_alert_items is not None else _env_int("AVITO_UNANSWERED_MAX_ALERT_ITEMS", 10)
+    max_alert_items = args.max_alert_items if args.max_alert_items is not None else _env_int("AVITO_UNANSWERED_MAX_ALERT_ITEMS", 1)
+    notify_quiet_hours = (
+        args.notify_quiet_hours
+        if args.notify_quiet_hours is not None
+        else os.getenv("AVITO_UNANSWERED_NOTIFY_QUIET_HOURS", DEFAULT_NOTIFY_QUIET_HOURS)
+    )
     notify_enabled = False if args.no_notify else args.notify or _env_bool("AVITO_UNANSWERED_NOTIFY_ENABLED")
     autoreply_enabled = False if args.no_autoreply else args.autoreply or _env_bool("AVITO_UNANSWERED_AUTOREPLY_ENABLED")
     notifier = handoff_notifier_from_settings(settings) if notify_enabled else None
@@ -1113,8 +1148,10 @@ async def main() -> None:
             notified = 0
             followup_notified = 0
             autoreply = {}
+            notify_quiet = notify_quiet_now(now, notify_quiet_hours)
+            notification_budget = 0 if notify_quiet else max(0, int(max_alert_items))
             actionable_items = [item for item in items if item.needs_action and not _unanswered_item_suppressed_by_state(item, state)]
-            if notifier and actionable_items:
+            if notifier and actionable_items and notification_budget > 0:
                 alerts = state.setdefault("alerts", {})
                 fresh: list[UnansweredChat] = []
                 for item in actionable_items:
@@ -1123,7 +1160,7 @@ async def main() -> None:
                     if now - previous >= repeat_alert_seconds:
                         fresh.append(item)
                 if fresh:
-                    for item in fresh[:max_alert_items]:
+                    for item in fresh[:notification_budget]:
                         ref = remember_unanswered_alert_ref(state, item)
                         notify_result = await notifier.notify_avito_followup(
                             unanswered_followup_row(item),
@@ -1134,10 +1171,11 @@ async def main() -> None:
                             key = _state_key(item)
                             alerts[key] = {"last_alerted_at": now, "chat_id": item.chat_id, "message_id": item.message_id}
                             notified += 1
+                            notification_budget -= 1
 
             followup_alert_rows = [row for row in followups if row.get("overdue") or row.get("severity") == "critical"]
             followup_alert_rows = [row for row in followup_alert_rows if int(row.get("snoozed_until") or 0) <= now]
-            if notifier and followup_alert_rows:
+            if notifier and followup_alert_rows and notification_budget > 0:
                 alerts = state.setdefault("followup_alerts", {})
                 fresh_rows: list[dict[str, Any]] = []
                 for row in followup_alert_rows:
@@ -1148,7 +1186,7 @@ async def main() -> None:
                     if now - previous >= repeat_alert_seconds:
                         fresh_rows.append(row)
                 if fresh_rows:
-                    for row in fresh_rows[:max_alert_items]:
+                    for row in fresh_rows[:notification_budget]:
                         key = str(row.get("key") or "")
                         followup_result = await notifier.notify_avito_followup(
                             row,
@@ -1160,6 +1198,7 @@ async def main() -> None:
                             continue
                         alerts[key] = {"last_alerted_at": now, "chat_id": row.get("chat_id"), "message_id": row.get("message_id")}
                         followup_notified += 1
+                        notification_budget -= 1
                         for index, url in enumerate(_followup_media_urls(row)[:5], start=1):
                             await notifier.notify_photo_url(
                                 url,
@@ -1180,8 +1219,8 @@ async def main() -> None:
                 _save_state(args.state_path, state)
 
             handoff_sla = {}
-            if notify_enabled and notifier and settings.handoff_notify_enabled:
-                handoff_sla = await process_handoff_sla(notifier)
+            if notify_enabled and notifier and settings.handoff_notify_enabled and notification_budget > 0:
+                handoff_sla = await process_handoff_sla(notifier, max_notifications=notification_budget)
 
             summary = {
                 "ok": True,
@@ -1195,6 +1234,8 @@ async def main() -> None:
                 "followup_notified": followup_notified,
                 "autoreply": autoreply,
                 "handoff_sla": handoff_sla,
+                "notify_quiet": notify_quiet,
+                "notification_budget_remaining": notification_budget,
                 "report_path": str(args.report_path),
             }
             _append_log(args.log_path, {"event": "summary", **summary})

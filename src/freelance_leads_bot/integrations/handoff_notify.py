@@ -645,6 +645,7 @@ async def process_handoff_sla(
     expire_after_seconds: int = 7 * 24 * 60 * 60,
     reminder_repeat_seconds: int = 6 * 60 * 60,
     escalation_repeat_seconds: int = 6 * 60 * 60,
+    max_notifications: int | None = None,
 ) -> dict[str, Any]:
     now = int(time.time()) if now is None else int(now)
     refs = await asyncio.to_thread(load_telegram_handoff_refs, ref_path)
@@ -655,8 +656,11 @@ async def process_handoff_sla(
     deduped = 0
     notifications: list[dict[str, Any]] = []
     changed = False
+    delivered_notifications = 0
     candidates, deduped = _canonical_handoff_sla_refs(refs, now=now)
     for ref in candidates:
+        if max_notifications is not None and delivered_notifications >= max(0, int(max_notifications)):
+            break
         if not isinstance(ref, dict):
             continue
         status = str(ref.get("status") or "open")
@@ -676,22 +680,6 @@ async def process_handoff_sla(
             ref["updated_at"] = now
             changed = True
             continue
-        reminder_sent_at = int(ref.get("reminder_sent_at") or 0)
-        can_send_reminder = age >= reminder_after_seconds and (
-            not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
-        )
-        if can_send_reminder:
-            result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="reminder", now=now)
-            notifications.append(result)
-            changed = changed or invalidated
-            if _notification_delivered(result):
-                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
-                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
-                ref["reminder_sent_at"] = now
-                ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
-                ref["updated_at"] = now
-                reminders += 1
-                changed = True
         escalation_sent_at = int(ref.get("escalation_sent_at") or 0)
         can_send_escalation = (
             handoff_ref_is_critical(ref)
@@ -703,12 +691,31 @@ async def process_handoff_sla(
             notifications.append(result)
             changed = changed or invalidated
             if _notification_delivered(result):
+                delivered_notifications += 1
                 used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
                 ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
                 ref["escalation_sent_at"] = now
                 ref["escalation_count"] = int(ref.get("escalation_count") or 0) + 1
                 ref["updated_at"] = now
                 escalations += 1
+                changed = True
+            continue
+        reminder_sent_at = int(ref.get("reminder_sent_at") or 0)
+        can_send_reminder = age >= reminder_after_seconds and (
+            not reminder_sent_at or now - reminder_sent_at >= max(1, int(reminder_repeat_seconds or 1))
+        )
+        if can_send_reminder:
+            result, invalidated = await _send_handoff_sla_notification(notifier, ref, event="reminder", now=now)
+            notifications.append(result)
+            changed = changed or invalidated
+            if _notification_delivered(result):
+                delivered_notifications += 1
+                used_topic_params = result.get("topic_params") if isinstance(result, dict) else {}
+                ref["telegram_message_thread_id"] = str((used_topic_params or {}).get("message_thread_id") or "")
+                ref["reminder_sent_at"] = now
+                ref["reminder_count"] = int(ref.get("reminder_count") or 0) + 1
+                ref["updated_at"] = now
+                reminders += 1
                 changed = True
     if changed:
         await asyncio.to_thread(save_telegram_handoff_refs, refs, ref_path)
