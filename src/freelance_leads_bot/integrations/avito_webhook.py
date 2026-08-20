@@ -33,7 +33,7 @@ from .config import IntegrationSettings
 from .codex_planner import CodexPlannerRunner
 from .codex_review import AvitoDraftReviewer, CodexDraftReviewer
 from .handoff_notify import HandoffNotifier, handoff_notifier_from_settings
-from .handoff_refs import update_latest_handoff_for_chat
+from .handoff_refs import DEFAULT_HANDOFF_REFS_PATH, latest_unresolved_handoff_ref_for_chat, update_latest_handoff_for_chat
 from .mentor_memory import MentorMemoryService
 from .expert_rag import ExpertRagStore
 from .models import Handoff, HandoffReason
@@ -853,6 +853,34 @@ async def process_avito_message(
     if reviewer:
         decision = await reviewer.review(message=message, decision=decision, conversation_history=conversation_history)
     outgoing_reply = prepare_avito_outgoing_text(history_store, message.chat_id, decision.reply)
+    open_handoff_ref = _latest_open_handoff_ref_for_message(message) if not force_unanswered_autoreply else None
+    open_promise_key = _open_pending_promise_key_for_message(message, account_id) if not force_unanswered_autoreply else ""
+    if open_handoff_ref or open_promise_key:
+        handoff_result = await handoff_notifier.notify(decision.handoff) if decision.handoff else {"sent": False, "reason": "open_manual_item_already_exists"}
+        if history_store:
+            history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
+        mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id)
+        return {
+            "ok": True,
+            "processing_status": "processed",
+            "reason": "open_handoff_suppressed_avito_reply",
+            "action": "suppressed_open_handoff",
+            "reply": "",
+            "suppressed_reply": outgoing_reply,
+            "appointment_id": decision.appointment_id,
+            "handoff": decision.handoff.reason.value if decision.handoff else str((open_handoff_ref or {}).get("reason") or ""),
+            "open_handoff_id": str((open_handoff_ref or {}).get("handoff_id") or ""),
+            "open_promise_key": open_promise_key,
+            "slots": [slot.starts_at.isoformat() for slot in decision.slots],
+            "dry_run": not settings.yclients_allow_mutations,
+            "send": {"sent": False, "reason": "open_handoff_suppressed"},
+            "handoff_notify": handoff_result,
+            "mentor_memory": {},
+            "planner": decision.metadata.get("planner"),
+            "draft_review": decision.metadata.get("draft_review"),
+            "conversation_key": decision.metadata.get("conversation_key") or conversation_key,
+            "mark_read": mark_read,
+        }
     send_result = await sender.send_message(account_id, message.chat_id, outgoing_reply) if outgoing_reply else {"sent": False, "reason": "empty_reply"}
     handoff_result = await handoff_notifier.notify(decision.handoff) if decision.handoff else None
     send_ok = _delivery_ok(send_result) if outgoing_reply else False
@@ -906,6 +934,22 @@ async def _mark_avito_chat_read(avito_reader: AvitoReadGateway | None, account_i
     except Exception as exc:
         return {"ok": False, "error": repr(exc)}
     return result if isinstance(result, dict) else {"ok": True}
+
+
+def _latest_open_handoff_ref_for_message(message: Any) -> dict[str, Any] | None:
+    chat_id = str(getattr(message, "chat_id", "") or "").strip()
+    if not chat_id:
+        return None
+    return latest_unresolved_handoff_ref_for_chat(chat_id, path=DEFAULT_HANDOFF_REFS_PATH)
+
+
+def _open_pending_promise_key_for_message(message: Any, account_id: int) -> str:
+    chat_id = str(getattr(message, "chat_id", "") or "").strip()
+    if not chat_id:
+        return ""
+    state = _read_json_file(AVITO_PROMISE_STATE_PATH)
+    pending = state.get("pending_followups") if isinstance(state.get("pending_followups"), dict) else {}
+    return _open_promise_key_for_chat(pending, account_id=account_id, chat_id=chat_id)
 
 
 def _history_user_content(message: Any) -> str:

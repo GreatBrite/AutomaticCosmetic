@@ -13288,6 +13288,117 @@ async def test_process_avito_message_successful_handoff_counts_processed(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_process_avito_message_suppresses_client_reply_when_handoff_is_open(tmp_path, monkeypatch) -> None:
+    ref_path = tmp_path / "handoff_refs.json"
+    monkeypatch.setattr(avito_webhook_module, "DEFAULT_HANDOFF_REFS_PATH", ref_path)
+    remember_telegram_handoff_ref(
+        telegram_chat_id="admin-chat",
+        telegram_message_id="1",
+        avito_chat_id="chat-open",
+        handoff_text="Нужна ручная проверка",
+        reason="booking_ambiguous",
+        status="open",
+        path=ref_path,
+    )
+
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(
+                action="handoff",
+                reply="Проверю и напишу вам.",
+                handoff=Handoff(reason=HandoffReason.BOOKING_AMBIGUOUS, message=context.message, summary="Клиент уточнил время."),
+                metadata={"planner": "test"},
+            )
+
+    class Sender:
+        async def send_message(self, account_id, chat_id, text):
+            raise AssertionError("open handoff must suppress another Avito reply")
+
+    class Notifier:
+        def __init__(self) -> None:
+            self.handoffs: list[Handoff] = []
+
+        async def notify(self, handoff):
+            self.handoffs.append(handoff)
+            return {"sent": False, "merged": True, "reason": "merged_existing_handoff"}
+
+    notifier = Notifier()
+    message = avito_inbound_message({"type": "message", "id": "m2", "chat_id": "chat-open", "content": {"text": "Дополню вопрос по препарату"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=Sender(),
+        handoff_notifier=notifier,
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is True
+    assert result["processing_status"] == "processed"
+    assert result["reason"] == "open_handoff_suppressed_avito_reply"
+    assert result["send"] == {"sent": False, "reason": "open_handoff_suppressed"}
+    assert result["suppressed_reply"] == "Проверю и напишу вам."
+    assert result["handoff_notify"]["merged"] is True
+    assert len(notifier.handoffs) == 1
+
+
+@pytest.mark.anyio
+async def test_process_avito_message_suppresses_client_reply_when_promise_is_open(tmp_path, monkeypatch) -> None:
+    state_path = tmp_path / "avito_unanswered_monitor_state.json"
+    monkeypatch.setattr(avito_webhook_module, "AVITO_PROMISE_STATE_PATH", state_path)
+    state_path.write_text(
+        json.dumps(
+            {
+                "pending_followups": {
+                    "1:chat-promise:webhook-promise": {
+                        "account_id": 1,
+                        "chat_id": "chat-promise",
+                        "business_status": "awaiting_olga",
+                        "business_resolved": False,
+                        "bot_promise": "Проверю и напишу.",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class Planner:
+        async def respond(self, context, toolbox):
+            return AvitoConsultantReply(action="codex_reply", reply="Да, проверю ещё раз.", metadata={"planner": "test"})
+
+    class Sender:
+        async def send_message(self, account_id, chat_id, text):
+            raise AssertionError("open promise must suppress another Avito reply")
+
+    class Notifier:
+        async def notify(self, handoff):
+            raise AssertionError("no handoff expected")
+
+    message = avito_inbound_message({"type": "message", "id": "m3", "chat_id": "chat-promise", "content": {"text": "Хорошо, жду"}})
+
+    result = await process_avito_message(
+        message=message,
+        settings=_settings(),
+        toolbox=AutomationToolbox(DryRunYClientsGateway()),
+        planner=Planner(),
+        sender=Sender(),
+        handoff_notifier=Notifier(),
+        photo_resolver=None,
+        history_store=LeadStore(tmp_path / "history.sqlite3"),
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "open_handoff_suppressed_avito_reply"
+    assert result["send"] == {"sent": False, "reason": "open_handoff_suppressed"}
+    assert result["open_promise_key"] == "1:chat-promise:webhook-promise"
+
+
+@pytest.mark.anyio
 async def test_avito_sdk_sender_uses_messenger_endpoint() -> None:
     class FakeAuth:
         async def auth_header(self):
