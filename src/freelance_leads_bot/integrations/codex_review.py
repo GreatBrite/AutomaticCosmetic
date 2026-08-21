@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 from ..codex_runner import chat_with_codex
+from .body_pricing import body_price_guard_reply, canonical_body_price_table_text
 from .avito_consultant import AvitoConsultantReply
 from .codex_planner import parse_codex_step
 from .models import Handoff, HandoffReason, InboundMessage
@@ -182,6 +183,7 @@ def build_codex_review_prompt(
         "Если всё хорошо — approve. Если можно исправить без специалиста — revise и дай готовый reply.\n"
         "Прайс единый для всех городов: городовые различия цен запрещены, город не нужен только ради цены. Города приёма фиксированы; новые города не обещай.\n"
         "Если нужна личная экспертная оценка/фото/точная цена/адрес/медицинский риск — handoff и дай безопасный короткий reply клиенту без объяснения внутреннего маршрута.\n"
+        f"{canonical_body_price_table_text()} Эти цены фиксированные для модели и не модели; не заменяй их ценами из старой истории/RAG/YCLIENTS.\n"
         "112/103/скорую можно упоминать только при явных острых симптомах: затруднённое дыхание, сильный отёк лица/горла, резкое ухудшение, высокая температура, гной, кровотечение, потеря сознания. Вопросы про объём, цену, модель или грудь без таких симптомов не являются поводом писать про скорую.\n"
         "Не склоняй клиента к консультации. Если нужна индивидуальная оценка Ольги, не додумывай за неё: handoff, а клиенту попроси контакт для онлайн-связи — номер или аккаунт удобного мессенджера/соцсети — либо недостающие фото/данные без обещаний результата. Не обещай телефонный звонок: консультация идёт в переписке мессенджера/соцсети.\n"
         "Если в истории/trace/draft уже есть оценка Ольги или подтверждённое решение специалиста, не добавляй новый призыв к консультации и убирай шаблонные хвосты вроде 'окончательно подбирается индивидуально/на консультации'.\n"
@@ -236,6 +238,11 @@ def deterministic_review_guard(
     metadata: dict[str, Any] | None = None,
 ) -> AvitoConsultantReply | None:
     metadata = metadata if metadata is not None else dict(decision.metadata or {})
+    body_price_reply = body_price_guard_reply(reply, message, conversation_history=conversation_history)
+    if body_price_reply:
+        metadata["body_price_guard"] = {"reason": "canonical_body_price_table"}
+        return replace(decision, action="body_price_answer", reply=body_price_reply, metadata=metadata)
+
     scope_guard = face_body_scope_guard(reply, message=message)
     if scope_guard:
         metadata["service_scope_guard"] = scope_guard

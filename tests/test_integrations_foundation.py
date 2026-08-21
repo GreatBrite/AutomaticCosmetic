@@ -4200,9 +4200,10 @@ async def test_avito_consultant_does_not_trust_listing_price_without_canonical_m
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "price_unknown"
+    assert reply.action == "body_price_answer"
     assert reply.handoff is None
-    assert "сверить" in reply.reply.casefold()
+    assert "как модель: 300 мл — 50 000 ₽" in reply.reply
+    assert "не как модель: 200 мл — 55 000 ₽" in reply.reply
     assert "передам" not in reply.reply.lower()
 
 
@@ -4224,9 +4225,10 @@ async def test_avito_consultant_answers_listing_price_only_when_canonical_matche
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "service_price_answer"
-    assert "18000" in reply.reply
-    assert "единая для всех городов" in reply.reply.casefold()
+    assert reply.action == "body_price_answer"
+    assert "18 000" not in reply.reply
+    assert "как модель: 300 мл — 50 000 ₽" in reply.reply
+    assert "не как модель: 200 мл — 55 000 ₽" in reply.reply
 
 
 @pytest.mark.anyio
@@ -4247,8 +4249,9 @@ async def test_avito_consultant_blocks_conflicting_listing_price(tmp_path) -> No
 
     reply = await consultant.respond(message)
 
-    assert reply.action == "price_conflict_needs_check"
-    assert "сверить" in reply.reply.casefold()
+    assert reply.action == "body_price_answer"
+    assert "как модель: 300 мл — 50 000 ₽" in reply.reply
+    assert "не как модель: 200 мл — 55 000 ₽" in reply.reply
     assert "18 000" not in reply.reply
 
 
@@ -4502,6 +4505,128 @@ async def test_avito_service_intake_handoffs_breast_volume_without_112_or_promis
     assert "103" not in reply.reply
     assert "достаточно" not in reply.reply.casefold()
     assert "хватит" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_canonical_body_price_for_volume(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-price-300",
+            "content": {
+                "text": "Сколько стоит увеличение груди 300 мл?",
+                "item": {"id": 10, "title": "Увеличение груди", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "300 мл: как модель — 50 000 ₽, не как модель — 80 000 ₽" in reply.reply
+    assert reply.handoff is None
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_model_body_price_only_when_requested(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-price-model",
+            "content": {
+                "text": "400 мл как модель цена?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "city": "Краснодар"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "400 мл как модель — 70 000 ₽" in reply.reply
+    assert "110 000" not in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_standard_body_price_only_when_requested(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-price-standard",
+            "content": {
+                "text": "500 мл не для моделей сколько стоит?",
+                "item": {"id": 10, "title": "Увеличение груди", "city": "Санкт-Петербург"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "500 мл не как модель — 130 000 ₽" in reply.reply
+    assert "85 000" not in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_full_body_price_table_without_volume(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-price-table",
+            "content": {
+                "text": "Сколько стоит увеличение груди?",
+                "item": {"id": 10, "title": "Увеличение груди", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽, 500 мл — 85 000 ₽, 600 мл — 100 000 ₽" in reply.reply
+    assert "не как модель: 200 мл — 55 000 ₽, 300 мл — 80 000 ₽, 400 мл — 110 000 ₽, 500 мл — 130 000 ₽, 600 мл — 145 000 ₽" in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_answers_model_table_for_model_listing_without_volume(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-price-model-table",
+            "content": {
+                "text": "Какая цена?",
+                "item": {"id": 10, "title": "Модель на увеличение груди", "city": "Москва"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽, 500 мл — 85 000 ₽, 600 мл — 100 000 ₽" in reply.reply
+    assert "не как модель" not in reply.reply
+
+
+def test_codex_review_guard_replaces_wrong_body_price_with_canonical_table() -> None:
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-body-wrong-price", "text": "Сколько стоит увеличение ягодиц 300 мл?"})
+    decision = AvitoConsultantReply(action="codex_reply", reply="300 мл Tesoro Body стоит 75 000.")
+
+    reviewed = apply_review_outcome(message, decision, {"action": "approve", "notes": "ok"})
+
+    assert reviewed.action == "body_price_answer"
+    assert "300 мл: как модель — 50 000 ₽, не как модель — 80 000 ₽" in reviewed.reply
+    assert "75 000" not in reviewed.reply
+    assert reviewed.metadata["body_price_guard"]["reason"] == "canonical_body_price_table"
 
 
 @pytest.mark.anyio
@@ -4935,12 +5060,13 @@ async def test_avito_consultant_filters_unverified_imported_price_tables(tmp_pat
     consultant = AvitoConsultant(toolbox, planner=CodexAvitoPlanner(fake_codex_runner))
     message = avito_inbound_message({"type": "message", "chat_id": "chat-body-price", "content": {"text": "Сколько стоит грудь?"}})
 
-    await consultant.respond(message)
+    reply = await consultant.respond(message)
 
-    payload_text = str(seen_payload["knowledge_items"]).casefold()
-    assert "120 мл" not in payload_text
-    assert "30000" not in payload_text
-    assert "рассчитывает ольга" in payload_text
+    assert reply.action == "body_price_answer"
+    assert "120 мл" not in reply.reply
+    assert "30000" not in reply.reply
+    assert "как модель: 300 мл — 50 000 ₽" in reply.reply
+    assert seen_payload == {}
 
 
 @pytest.mark.anyio

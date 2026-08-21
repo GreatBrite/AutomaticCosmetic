@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from .agent_tools import AutomationToolbox
 from .agent_trace import JsonlAgentTraceLogger
 from .avito import avito_photo_handoff
+from .body_pricing import body_price_reply_for_message
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
 from .city_utils import fixed_cities_reply
 from .client_handlers import HandoffComposer, RagAnswerService
@@ -271,6 +272,13 @@ class AvitoConsultant:
     async def _router_reply(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
         if context.role_profile.role not in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}:
             return None
+        body_price_reply = body_price_reply_for_message(context.message, conversation_history=context.conversation_history)
+        if body_price_reply:
+            return AvitoConsultantReply(
+                action="body_price_answer",
+                reply=body_price_reply,
+                metadata={"planner": "body_price_preflight", "same_price_all_cities": True},
+            )
         route = route_client_message(
             context.message,
             retrieved_expert_answers=context.retrieved_expert_answers,
