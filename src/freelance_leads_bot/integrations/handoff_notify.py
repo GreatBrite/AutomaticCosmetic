@@ -32,6 +32,7 @@ from .telegram_client_topics import (
     DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
     client_topic_key,
     get_or_create_client_topic,
+    invalidate_client_topic_thread,
     load_client_topics,
     topic_params_from_row,
     topic_request_from_avito_followup,
@@ -66,6 +67,9 @@ class HandoffNotifier(Protocol):
 
 
 HANDOFF_FOLLOWUP_ACTIONS = {"done", "stale", "later"}
+HANDOFF_DELIVERY_FAILURES_PATH = Path("data/handoff_delivery_failures.jsonl")
+HANDOFF_ERROR_TOPIC_KEY = "system:avito_handoff_delivery_errors"
+HANDOFF_ERROR_TOPIC_TITLE = "Ошибки Avito / недоставленные handoff"
 
 
 def handoff_followup_token(handoff_id: str) -> str:
@@ -238,6 +242,7 @@ class TelegramHandoffNotifier:
         ref_path: Path | str = DEFAULT_HANDOFF_REFS_PATH,
         topics_enabled: bool = True,
         topics_path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+        delivery_failures_path: Path | str = HANDOFF_DELIVERY_FAILURES_PATH,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -245,6 +250,7 @@ class TelegramHandoffNotifier:
         self.ref_path = Path(ref_path)
         self.topics_enabled = topics_enabled
         self.topics_path = Path(topics_path)
+        self.delivery_failures_path = Path(delivery_failures_path)
 
     async def notify(self, handoff: Handoff) -> dict[str, Any]:
         handoff_text = format_handoff_message(handoff)
@@ -264,10 +270,10 @@ class TelegramHandoffNotifier:
                 if merged.get("merged"):
                     return merged
 
-        result, topic_params, topic_fallback = await _send_message_with_topic_fallback(
-            self.bot,
-            self.chat_id,
+        result, topic_params, topic_fallback, topic_result = await self._send_handoff_text_with_rescue(
+            handoff,
             text,
+            topic_result=topic_result,
             topic_params=topic_params,
         )
         notify_error = "" if _telegram_delivery_ok(result) else _telegram_send_error(result, "telegram_message_not_delivered")
@@ -302,13 +308,17 @@ class TelegramHandoffNotifier:
                 assignee=str(task_fields.get("assignee") or ""),
                 path=self.ref_path,
             )
-        photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params)
-        media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params)
+        if telegram_message_id:
+            photo_results, photo_errors, photo_statuses = await self._send_handoff_photos(handoff, topic_params=topic_params)
+            media_results, media_errors, media_statuses = await self._send_handoff_media(handoff, topic_params=topic_params)
+        else:
+            photo_results, photo_errors, photo_statuses = [], [], []
+            media_results, media_errors, media_statuses = [], [], []
         attachment_statuses = photo_statuses + media_statuses
         if telegram_message_id and attachment_statuses:
             await asyncio.to_thread(_store_ref_media_statuses, self.chat_id, telegram_message_id, attachment_statuses, self.ref_path)
         failure_notify = await self._notify_media_failures(handoff, photo_errors + media_errors)
-        return {
+        response = {
             "sent": bool(telegram_message_id) and not notify_error,
             "error": notify_error,
             "telegram": result,
@@ -328,6 +338,114 @@ class TelegramHandoffNotifier:
             "topic_fallback": topic_fallback,
             "text": handoff_text,
         }
+        if not bool(telegram_message_id) or notify_error:
+            payload = await asyncio.to_thread(
+                _record_handoff_delivery_failure,
+                self.delivery_failures_path,
+                handoff,
+                handoff_text,
+                notify_error or "telegram_message_not_delivered",
+                result,
+                topic_result,
+                topic_params,
+                topic_fallback,
+            )
+            response["delivery_failure_record"] = payload
+        return response
+
+    async def _send_handoff_text_with_rescue(
+        self,
+        handoff: Handoff,
+        text: str,
+        *,
+        topic_result: dict[str, Any],
+        topic_params: dict[str, str],
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
+        attempts: list[dict[str, Any]] = []
+        result, used_topic_params, topic_fallback = await _send_message_with_topic_fallback(
+            self.bot,
+            self.chat_id,
+            text,
+            topic_params=topic_params,
+        )
+        attempts.append(
+            {
+                "stage": "client_topic",
+                "result": result,
+                "topic": topic_result,
+                "topic_params": used_topic_params,
+                "topic_fallback": topic_fallback,
+            }
+        )
+        if _telegram_delivery_ok(result):
+            return result, used_topic_params, {"attempts": attempts} if attempts else topic_fallback, topic_result
+
+        bad_thread_id = str(used_topic_params.get("message_thread_id") or "").strip()
+        if bad_thread_id and _message_thread_not_found(result):
+            await self._invalidate_handoff_topic(handoff, bad_thread_id)
+            retry_topic_result = await self._topic_for_handoff(handoff, invalid_thread_ids={bad_thread_id})
+            retry_topic_params = dict(retry_topic_result.get("topic_params") or {})
+            if retry_topic_params and retry_topic_params != used_topic_params:
+                retry_result, retry_used_params, retry_fallback = await _send_message_with_topic_fallback(
+                    self.bot,
+                    self.chat_id,
+                    text,
+                    topic_params=retry_topic_params,
+                )
+                attempts.append(
+                    {
+                        "stage": "recreated_client_topic",
+                        "result": retry_result,
+                        "topic": retry_topic_result,
+                        "topic_params": retry_used_params,
+                        "topic_fallback": retry_fallback,
+                    }
+                )
+                if _telegram_delivery_ok(retry_result):
+                    return retry_result, retry_used_params, {"reason": "message_thread_not_found", "attempts": attempts}, retry_topic_result
+                result, used_topic_params, topic_result = retry_result, retry_used_params, retry_topic_result
+
+        emergency_text = _handoff_delivery_emergency_text(handoff, text)
+        error_topic_result = await self._error_topic()
+        error_topic_params = dict(error_topic_result.get("topic_params") or {})
+        if error_topic_params:
+            error_result, error_used_params, error_fallback = await _send_message_with_topic_fallback(
+                self.bot,
+                self.chat_id,
+                emergency_text,
+                topic_params=error_topic_params,
+            )
+            attempts.append(
+                {
+                    "stage": "error_topic",
+                    "result": error_result,
+                    "topic": error_topic_result,
+                    "topic_params": error_used_params,
+                    "topic_fallback": error_fallback,
+                }
+            )
+            if _telegram_delivery_ok(error_result):
+                return error_result, error_used_params, {"reason": "delivered_to_error_topic", "attempts": attempts}, error_topic_result
+            result, used_topic_params, topic_result = error_result, error_used_params, error_topic_result
+
+        general_result, general_used_params, general_fallback = await _send_message_with_topic_fallback(
+            self.bot,
+            self.chat_id,
+            emergency_text,
+            topic_params={},
+        )
+        attempts.append(
+            {
+                "stage": "general_chat",
+                "result": general_result,
+                "topic": {"ok": True, "reason": "general_chat", "topic_params": {}},
+                "topic_params": general_used_params,
+                "topic_fallback": general_fallback,
+            }
+        )
+        if _telegram_delivery_ok(general_result):
+            return general_result, general_used_params, {"reason": "delivered_to_general_chat", "attempts": attempts}, {"ok": True, "reason": "general_chat", "topic_params": {}}
+        return general_result, general_used_params, {"reason": "all_delivery_attempts_failed", "attempts": attempts}, topic_result
 
     async def _send_handoff_photos(
         self,
@@ -555,7 +673,7 @@ class TelegramHandoffNotifier:
         result["topic"] = topic_result
         return result
 
-    async def _topic_for_handoff(self, handoff: Handoff) -> dict[str, Any]:
+    async def _topic_for_handoff(self, handoff: Handoff, *, invalid_thread_ids: set[str] | None = None) -> dict[str, Any]:
         message = handoff.message
         listing = message.listing
         metadata = message.metadata or {}
@@ -586,6 +704,38 @@ class TelegramHandoffNotifier:
             client_name=client_name,
             listing_title=str((listing.title if listing else "") or metadata.get("listing_title") or ""),
             city=str((listing.city if listing else "") or metadata.get("city") or ""),
+            enabled=self.topics_enabled,
+            path=self.topics_path,
+            invalid_thread_ids=invalid_thread_ids,
+        )
+
+    async def _invalidate_handoff_topic(self, handoff: Handoff, thread_id: str) -> dict[str, Any]:
+        message = handoff.message
+        metadata = message.metadata or {}
+        key = client_topic_key(
+            channel=message.channel.value,
+            account_id=str(metadata.get("account_id") or ""),
+            external_chat_id=str(message.chat_id or message.client_id or "").strip(),
+            client_id=message.client_id,
+        )
+        return await asyncio.to_thread(
+            invalidate_client_topic_thread,
+            key=key,
+            telegram_chat_id=self.chat_id,
+            message_thread_id=thread_id,
+            path=self.topics_path,
+        )
+
+    async def _error_topic(self) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            get_or_create_client_topic,
+            self.bot,
+            self.chat_id,
+            key=HANDOFF_ERROR_TOPIC_KEY,
+            title=HANDOFF_ERROR_TOPIC_TITLE,
+            channel="system",
+            external_chat_id="avito_handoff_delivery_errors",
+            client_name=HANDOFF_ERROR_TOPIC_TITLE,
             enabled=self.topics_enabled,
             path=self.topics_path,
         )
@@ -1293,6 +1443,52 @@ async def _send_message_with_topic_fallback(
 def _message_thread_not_found(send_response: Any) -> bool:
     error = _telegram_send_error(send_response, "")
     return "message thread not found" in error.casefold()
+
+
+def _handoff_delivery_emergency_text(handoff: Handoff, escaped_handoff_text: str) -> str:
+    message = handoff.message
+    plain_handoff_text = str(escaped_handoff_text or "")
+    plain_handoff_text = re.sub(r"<[^>]+>", "", plain_handoff_text)
+    return (
+        "СРОЧНО: не удалось доставить handoff в тему клиента.\n"
+        "Нужно открыть Avito вручную и проверить диалог.\n"
+        f"{_dialog_line(message)}\n"
+        f"Avito chat_id: {message.chat_id}\n"
+        f"Последнее сообщение: {message.text or '[медиа/вложение]'}\n\n"
+        f"{plain_handoff_text}"
+    )
+
+
+def _record_handoff_delivery_failure(
+    path: Path,
+    handoff: Handoff,
+    handoff_text: str,
+    error: str,
+    telegram_result: Any,
+    topic_result: dict[str, Any],
+    topic_params: dict[str, str],
+    topic_fallback: dict[str, Any],
+) -> dict[str, Any]:
+    row = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending_retry",
+        "attempts": 1,
+        "reason": str(getattr(handoff.reason, "value", handoff.reason)),
+        "error": str(error or ""),
+        "avito_chat_id": handoff.message.chat_id,
+        "client_id": handoff.message.client_id,
+        "client_name": str((handoff.message.metadata or {}).get("client_name") or ""),
+        "source_message_id": handoff.message.message_id,
+        "message_text": handoff.message.text,
+        "handoff_text": handoff_text,
+        "telegram_result": telegram_result,
+        "topic_result": topic_result,
+        "topic_params": topic_params,
+        "topic_fallback": topic_fallback,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _append_jsonl(path, row)
+    return row
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:

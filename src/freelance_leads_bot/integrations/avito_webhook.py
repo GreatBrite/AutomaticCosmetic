@@ -857,13 +857,15 @@ async def process_avito_message(
     open_promise_key = _open_pending_promise_key_for_message(message, account_id) if not force_unanswered_autoreply else ""
     if open_handoff_ref or open_promise_key:
         handoff_result = await handoff_notifier.notify(decision.handoff) if decision.handoff else {"sent": False, "reason": "open_manual_item_already_exists"}
+        handoff_ok = _delivery_ok(handoff_result) if decision.handoff else True
         if history_store:
             history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
         mark_read = await _mark_avito_chat_read(avito_reader, account_id, message.chat_id)
         return {
-            "ok": True,
-            "processing_status": "processed",
-            "reason": "open_handoff_suppressed_avito_reply",
+            "ok": handoff_ok,
+            "processing_status": "processed" if handoff_ok else "retryable_error",
+            "reason": "open_handoff_suppressed_avito_reply" if handoff_ok else "handoff_delivery_failed",
+            "error": "" if handoff_ok else _delivery_error(handoff_result, "handoff_delivery_failed"),
             "action": "suppressed_open_handoff",
             "reply": "",
             "suppressed_reply": outgoing_reply,
@@ -885,7 +887,7 @@ async def process_avito_message(
     handoff_result = await handoff_notifier.notify(decision.handoff) if decision.handoff else None
     send_ok = _delivery_ok(send_result) if outgoing_reply else False
     handoff_ok = _delivery_ok(handoff_result) if decision.handoff else False
-    processing_ok = send_ok or handoff_ok
+    processing_ok = (handoff_ok and (send_ok or not outgoing_reply)) if decision.handoff else send_ok
     memory_result = mentor_memory.observe_client_decision(message=message, decision=decision, send_result=send_result) if mentor_memory else None
     if history_store:
         history_store.add_codex_chat_message("user", _history_user_content(message), conversation_key)
@@ -1105,6 +1107,8 @@ def _delivery_ok(result: Any) -> bool:
     if result.get("reason") == "preview_only" and (result.get("outbox_path") or result.get("outbox")):
         return True
     if result.get("sent") is True:
+        return True
+    if result.get("merged") is True and result.get("reason") == "merged_existing_handoff":
         return True
     telegram_result = result.get("telegram") if isinstance(result.get("telegram"), dict) else result
     return _telegram_delivery_ok(telegram_result)

@@ -20,10 +20,11 @@ STANDARD_BODY_PRICES: dict[int, int] = {
 }
 
 BODY_PRICE_SCOPE_RE = re.compile(r"(?iu)(груд|ягод|поп|тесоро|tesoro|body|контурн\w+\s+(?:пластик\w+|коррекц\w+)\s+тел)")
-PRICE_QUESTION_RE = re.compile(r"(?iu)(цен|стоим|прайс|сколько\s+(?:стоит|будет|по\s+цене)|какая\s+цена|за\s+\d|руб|₽)")
+PRICE_QUESTION_RE = re.compile(r"(?iu)(цен|стоим|прайс|сколько\s+(?:стоит|будет|по\s+цене)|какая\s+цена|за\s+\d|руб|₽|\d+\s*(?:тыс|тысяч|000))")
 VOLUME_RE = re.compile(r"(?iu)(?<!\d)(200|300|400|500|600)\s*(?:мл|ml|милли?литр\w*)?")
 NON_MODEL_RE = re.compile(r"(?iu)(не\s+как\s+модель|не\s+для\s+модел\w+|не\s+модель|обычн\w+|стандартн\w+|как\s+пациент|пациент)")
 MODEL_RE = re.compile(r"(?iu)(как\s+модель|модель|модел)")
+SIDE_OR_TOTAL_RE = re.compile(r"(?iu)(обе|оба|две|два|кажд\w+|сторон\w+|ягодиц\w+\s+вместе|вместе|140\s*(?:тыс|000)?)")
 
 
 def body_price_reply_for_message(
@@ -45,19 +46,21 @@ def body_price_reply(
     history_text = " ".join(
         str(item.get("content") or "") for item in list(conversation_history)[-6:] if str(item.get("role") or "") == "user"
     )
+    history_volume_text = " ".join(str(item.get("content") or "") for item in list(conversation_history)[-6:])
     scope_source = f"{current}\n{listing_title}\n{history_text}"
     if not BODY_PRICE_SCOPE_RE.search(scope_source):
         return ""
     if not PRICE_QUESTION_RE.search(f"{current}\n{history_text}"):
         return ""
 
-    volumes = _requested_volumes(current) or _requested_volumes(history_text)
+    volumes = _requested_volumes(current) or _requested_volumes(history_text) or _requested_volumes(history_volume_text)
     price_kind = _requested_price_kind(f"{current}\n{listing_title}\n{history_text}")
     service = _body_service_name(scope_source)
+    side_or_total_question = bool(SIDE_OR_TOTAL_RE.search(f"{current}\n{history_text}"))
 
     if volumes:
-        return _volume_price_reply(service, volumes, price_kind)
-    return _full_price_reply(service, price_kind=price_kind)
+        return _volume_price_reply(service, volumes, price_kind, side_or_total_question=side_or_total_question)
+    return _full_price_reply(service, price_kind=price_kind, side_or_total_question=side_or_total_question)
 
 
 def body_price_guard_reply(
@@ -79,9 +82,10 @@ def body_price_guard_reply(
 
 def canonical_body_price_table_text() -> str:
     return (
-        "Канонический прайс по увеличению груди/ягодиц: "
+        "Прайс грудь/ягодицы: "
         "как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽, 500 мл — 85 000 ₽, 600 мл — 100 000 ₽; "
-        "не как модель: 200 мл — 55 000 ₽, 300 мл — 80 000 ₽, 400 мл — 110 000 ₽, 500 мл — 130 000 ₽, 600 мл — 145 000 ₽."
+        "не как модель: 200 мл — 55 000 ₽, 300 мл — 80 000 ₽, 400 мл — 110 000 ₽, 500 мл — 130 000 ₽, 600 мл — 145 000 ₽. "
+        "Цена за объём препарата, не за сторону/ягодицу; не умножай на две стороны."
     )
 
 
@@ -116,7 +120,7 @@ def _body_service_name(text: str) -> str:
     return "увеличению груди/ягодиц"
 
 
-def _volume_price_reply(service: str, volumes: list[int], price_kind: str) -> str:
+def _volume_price_reply(service: str, volumes: list[int], price_kind: str, *, side_or_total_question: bool = False) -> str:
     lines = [f"Стоимость по {service}:"]
     for volume in volumes:
         if price_kind == "model":
@@ -140,17 +144,20 @@ def _volume_price_reply(service: str, volumes: list[int], price_kind: str) -> st
             lines.append(f"{volume} мл: {', '.join(parts)}.")
         else:
             lines.append(f"{volume} мл в фиксированном прайсе не указан.")
+    if side_or_total_question:
+        lines.append("Стоимость считается по объёму препарата, не умножается отдельно на стороны или ягодицы.")
     return " ".join(lines)
 
 
-def _full_price_reply(service: str, *, price_kind: str) -> str:
+def _full_price_reply(service: str, *, price_kind: str, side_or_total_question: bool = False) -> str:
     model = ", ".join(f"{volume} мл — {_money(price)}" for volume, price in MODEL_BODY_PRICES.items())
     standard = ", ".join(f"{volume} мл — {_money(price)}" for volume, price in STANDARD_BODY_PRICES.items())
+    suffix = " Стоимость считается по объёму препарата, не умножается отдельно на стороны или ягодицы." if side_or_total_question else ""
     if price_kind == "model":
-        return f"Стоимость по {service} как модель: {model}."
+        return f"Стоимость по {service} как модель: {model}.{suffix}"
     if price_kind == "standard":
-        return f"Стоимость по {service} не как модель: {standard}."
-    return f"Стоимость по {service}: как модель: {model}; не как модель: {standard}."
+        return f"Стоимость по {service} не как модель: {standard}.{suffix}"
+    return f"Стоимость по {service}: как модель: {model}; не как модель: {standard}.{suffix}"
 
 
 def _money(value: int) -> str:

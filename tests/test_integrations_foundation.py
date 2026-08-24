@@ -3270,20 +3270,25 @@ async def test_aesthetic_expectation_handoff_ref_is_critical_for_sla(tmp_path) -
 
 
 @pytest.mark.anyio
-async def test_handoff_notifier_does_not_fall_back_when_saved_topic_is_missing(tmp_path, monkeypatch) -> None:
+async def test_handoff_notifier_recreates_saved_topic_when_thread_is_missing(tmp_path, monkeypatch) -> None:
     from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
-    from src.freelance_leads_bot.integrations.telegram_client_topics import remember_client_topic
+    from src.freelance_leads_bot.integrations.telegram_client_topics import load_client_topics, remember_client_topic
     import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
 
     class FakeTelegramBot:
         def __init__(self) -> None:
             self.messages = []
+            self.topics = []
 
         def send_message(self, chat_id, text, **kwargs):
             self.messages.append((chat_id, text, kwargs))
             if kwargs.get("message_thread_id") == "missing-thread":
                 raise RuntimeError('Telegram API sendMessage failed: HTTP 400: {"description":"Bad Request: message thread not found"}')
             return {"ok": True, "result": {"message_id": len(self.messages)}}
+
+        def create_forum_topic(self, chat_id, name):
+            self.topics.append((chat_id, name))
+            return {"ok": True, "result": {"message_thread_id": "new-thread"}}
 
     async def direct_retry(func, *args, **kwargs):
         return func(*args)
@@ -3313,13 +3318,55 @@ async def test_handoff_notifier_does_not_fall_back_when_saved_topic_is_missing(t
 
     result = await notifier.notify(handoff)
 
-    assert result["sent"] is False
+    assert result["sent"] is True
     assert result["topic_fallback"]["reason"] == "message_thread_not_found"
-    assert result["topic_fallback"]["general_fallback_sent"] is False
     assert bot.messages[0][2]["message_thread_id"] == "missing-thread"
-    assert len(bot.messages) == 1
+    assert bot.messages[1][2]["message_thread_id"] == "new-thread"
+    assert bot.topics == [("admin-chat", "chat-missing-topic | Avito")]
     refs = load_telegram_handoff_refs(tmp_path / "refs.json")
-    assert refs == {}
+    assert len(refs) == 1
+    assert next(iter(refs.values()))["telegram_message_thread_id"] == "new-thread"
+    topics = load_client_topics(topics_path)
+    assert topics["avito:chat-missing-topic"]["message_thread_id"] == "new-thread"
+    assert topics["avito:chat-missing-topic"]["invalid_message_thread_ids"] == ["missing-thread"]
+
+
+@pytest.mark.anyio
+async def test_handoff_notifier_records_failure_when_all_delivery_attempts_fail(tmp_path, monkeypatch) -> None:
+    from src.freelance_leads_bot.integrations.handoff_notify import TelegramHandoffNotifier
+    import src.freelance_leads_bot.integrations.handoff_notify as handoff_notify
+
+    class FakeTelegramBot:
+        def send_message(self, chat_id, text, **kwargs):
+            raise RuntimeError("Telegram API sendMessage failed: connection refused")
+
+        def create_forum_topic(self, chat_id, name):
+            raise RuntimeError("Telegram API createForumTopic failed")
+
+    async def direct_retry(func, *args, **kwargs):
+        return func(*args)
+
+    monkeypatch.setattr(handoff_notify, "_to_thread_retry", direct_retry)
+    failures_path = tmp_path / "delivery_failures.jsonl"
+    message = avito_inbound_message({"type": "message", "id": "m-fail", "chat_id": "chat-fail", "content": {"text": "Жду ответ по жалобе"}})
+    handoff = Handoff(reason=HandoffReason.COMPLAINT_OR_RISK, message=message, summary="Клиент ждёт ответ по жалобе.")
+    notifier = TelegramHandoffNotifier(
+        FakeTelegramBot(),
+        "admin-chat",
+        ref_path=tmp_path / "refs.json",
+        topics_path=tmp_path / "topics.json",
+        delivery_failures_path=failures_path,
+    )
+
+    result = await notifier.notify(handoff)
+
+    assert result["sent"] is False
+    assert result["topic_fallback"]["reason"] == "all_delivery_attempts_failed"
+    row = json.loads(failures_path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["status"] == "pending_retry"
+    assert row["avito_chat_id"] == "chat-fail"
+    assert row["reason"] == HandoffReason.COMPLAINT_OR_RISK.value
+    assert "Жду ответ по жалобе" in row["handoff_text"]
 
 
 @pytest.mark.anyio
@@ -4549,6 +4596,35 @@ async def test_avito_consultant_answers_model_body_price_only_when_requested(tmp
     assert reply.action == "body_price_answer"
     assert "400 мл как модель — 70 000 ₽" in reply.reply
     assert "110 000" not in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_does_not_double_body_price_for_both_buttocks(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-both-sides",
+            "content": {
+                "text": "Значит обе 140 тысяч как модель?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "city": "Краснодар"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(
+        message,
+        conversation_history=[
+            {"role": "assistant", "content": "Как модель 400 мл — 70 000 ₽."},
+            {"role": "user", "content": "Значит обе 140 тысяч как модель?"},
+        ],
+    )
+
+    assert reply.action == "body_price_answer"
+    assert "400 мл как модель — 70 000 ₽" in reply.reply
+    assert "140" not in reply.reply
+    assert "не умножается отдельно на стороны или ягодицы" in reply.reply
 
 
 @pytest.mark.anyio

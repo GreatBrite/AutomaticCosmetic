@@ -48,6 +48,10 @@ def topic_title_for_client(
     name = _clean_title_part(client_name)
     if name:
         parts.append(name)
+    else:
+        fallback = _clean_title_part(external_chat_id)
+        if fallback:
+            parts.append(fallback)
     channel_label = _clean_title_part(_channel_title(channel))
     city_label = _clean_title_part(city)
     if channel_label or city_label:
@@ -56,8 +60,7 @@ def topic_title_for_client(
     if listing:
         parts.append(listing)
     if not parts:
-        fallback = _clean_title_part(external_chat_id)
-        parts.append(fallback or "Клиент")
+        parts.append("Клиент")
     return _truncate_title(" | ".join(parts), MAX_TOPIC_TITLE_LENGTH)
 
 
@@ -111,6 +114,42 @@ def remember_client_topic(
         "created_at": int(existing.get("created_at") or now),
         "updated_at": now,
     }
+    if existing.get("invalid_message_thread_ids"):
+        row["invalid_message_thread_ids"] = existing.get("invalid_message_thread_ids")
+    if existing.get("topic_invalidated_at"):
+        row["topic_invalidated_at"] = existing.get("topic_invalidated_at")
+    rows[key] = row
+    save_client_topics(rows, path)
+    return row
+
+
+def invalidate_client_topic_thread(
+    *,
+    key: str,
+    telegram_chat_id: str,
+    message_thread_id: str | int,
+    path: Path | str = DEFAULT_TELEGRAM_CLIENT_TOPICS_PATH,
+) -> dict[str, Any]:
+    key = str(key or "").strip()
+    telegram_chat_id = str(telegram_chat_id or "").strip()
+    message_thread_id = str(message_thread_id or "").strip()
+    if not key or not telegram_chat_id or not message_thread_id:
+        return {}
+    rows = load_client_topics(path)
+    row = rows.get(key) if isinstance(rows.get(key), dict) else None
+    if not row or str(row.get("telegram_chat_id") or "").strip() != telegram_chat_id:
+        return {}
+    invalid = row.get("invalid_message_thread_ids")
+    if isinstance(invalid, str):
+        invalid = [invalid]
+    if not isinstance(invalid, list):
+        invalid = []
+    invalid_ids = sorted({str(item).strip() for item in invalid if str(item).strip()} | {message_thread_id})
+    row["invalid_message_thread_ids"] = invalid_ids
+    if str(row.get("message_thread_id") or "").strip() == message_thread_id:
+        row["message_thread_id"] = ""
+    row["topic_invalidated_at"] = int(time.time())
+    row["updated_at"] = int(time.time())
     rows[key] = row
     save_client_topics(rows, path)
     return row
@@ -159,7 +198,7 @@ def get_or_create_client_topic(
     invalid_threads = {str(item).strip() for item in (invalid_thread_ids or ()) if str(item).strip()}
     existing = find_client_topic(key, telegram_chat_id=telegram_chat_id, path=path)
     existing_thread_id = str((existing or {}).get("message_thread_id") or "").strip()
-    if existing and existing_thread_id not in invalid_threads:
+    if existing and existing_thread_id and existing_thread_id not in invalid_threads:
         return {"ok": True, "created": False, "topic": existing, "topic_params": topic_params_from_row(existing)}
     try:
         created = bot.create_forum_topic(telegram_chat_id, title)
