@@ -4628,6 +4628,58 @@ async def test_avito_consultant_does_not_double_body_price_for_both_buttocks(tmp
 
 
 @pytest.mark.anyio
+async def test_avito_consultant_body_price_understands_each_buttock_wording(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-each-buttock",
+            "content": {
+                "text": "То есть если по 400 мл на каждую ягодицу, как модель сколько?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "city": "Краснодар"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "body_price_answer"
+    assert "400 мл как модель — 70 000 ₽" in reply.reply
+    assert "140" not in reply.reply
+    assert "не умножается отдельно на стороны или ягодицы" in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_body_price_understands_plain_140_total_followup(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-body-plain-140-total",
+            "content": {
+                "text": "Нет, получается 140 за две?",
+                "item": {"id": 10, "title": "Увеличение ягодиц", "city": "Краснодар"},
+            },
+        }
+    )
+
+    reply = await consultant.respond(
+        message,
+        conversation_history=[
+            {"role": "assistant", "content": "Стоимость по увеличению ягодиц: 400 мл как модель — 70 000 ₽."},
+            {"role": "user", "content": "Нет, получается 140 за две?"},
+        ],
+    )
+
+    assert reply.action == "body_price_answer"
+    assert "400 мл как модель — 70 000 ₽" in reply.reply
+    assert "140" not in reply.reply
+    assert "не умножается отдельно на стороны или ягодицы" in reply.reply
+
+
+@pytest.mark.anyio
 async def test_avito_consultant_answers_standard_body_price_only_when_requested(tmp_path) -> None:
     toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
     consultant = AvitoConsultant(toolbox)

@@ -20,7 +20,11 @@ STANDARD_BODY_PRICES: dict[int, int] = {
 }
 
 BODY_PRICE_SCOPE_RE = re.compile(r"(?iu)(груд|ягод|поп|тесоро|tesoro|body|контурн\w+\s+(?:пластик\w+|коррекц\w+)\s+тел)")
-PRICE_QUESTION_RE = re.compile(r"(?iu)(цен|стоим|прайс|сколько\s+(?:стоит|будет|по\s+цене)|какая\s+цена|за\s+\d|руб|₽|\d+\s*(?:тыс|тысяч|000))")
+PRICE_QUESTION_RE = re.compile(
+    r"(?iu)(цен|стоим|прайс|сколько\s+(?:стоит|будет|по\s+цене)|какая\s+цена|"
+    r"за\s+\d|руб|₽|\d+\s*(?:тыс|тысяч|000))"
+)
+SHORT_PRICE_QUESTION_RE = re.compile(r"(?iu)(сколько\??|получается|итого)")
 VOLUME_RE = re.compile(r"(?iu)(?<!\d)(200|300|400|500|600)\s*(?:мл|ml|милли?литр\w*)?")
 NON_MODEL_RE = re.compile(r"(?iu)(не\s+как\s+модель|не\s+для\s+модел\w+|не\s+модель|обычн\w+|стандартн\w+|как\s+пациент|пациент)")
 MODEL_RE = re.compile(r"(?iu)(как\s+модель|модель|модел)")
@@ -48,15 +52,20 @@ def body_price_reply(
     )
     history_volume_text = " ".join(str(item.get("content") or "") for item in list(conversation_history)[-6:])
     scope_source = f"{current}\n{listing_title}\n{history_text}"
+    volumes = _requested_volumes(current) or _requested_volumes(history_text) or _requested_volumes(history_volume_text)
+    side_or_total_question = bool(SIDE_OR_TOTAL_RE.search(f"{current}\n{history_text}"))
     if not BODY_PRICE_SCOPE_RE.search(scope_source):
         return ""
-    if not PRICE_QUESTION_RE.search(f"{current}\n{history_text}"):
+    price_source = f"{current}\n{history_text}"
+    if not PRICE_QUESTION_RE.search(price_source) and not (
+        volumes and (SHORT_PRICE_QUESTION_RE.search(price_source) or side_or_total_question)
+    ):
         return ""
 
-    volumes = _requested_volumes(current) or _requested_volumes(history_text) or _requested_volumes(history_volume_text)
     price_kind = _requested_price_kind(f"{current}\n{listing_title}\n{history_text}")
+    if price_kind == "both":
+        price_kind = _requested_history_price_kind(history_volume_text)
     service = _body_service_name(scope_source)
-    side_or_total_question = bool(SIDE_OR_TOTAL_RE.search(f"{current}\n{history_text}"))
 
     if volumes:
         return _volume_price_reply(service, volumes, price_kind, side_or_total_question=side_or_total_question)
@@ -105,6 +114,17 @@ def _requested_price_kind(text: str) -> str:
     if NON_MODEL_RE.search(source):
         return "standard"
     if MODEL_RE.search(source):
+        return "model"
+    return "both"
+
+
+def _requested_history_price_kind(text: str) -> str:
+    source = str(text or "")
+    has_standard = bool(NON_MODEL_RE.search(source))
+    has_model = bool(MODEL_RE.search(source))
+    if has_standard and not has_model:
+        return "standard"
+    if has_model and not has_standard:
         return "model"
     return "both"
 
