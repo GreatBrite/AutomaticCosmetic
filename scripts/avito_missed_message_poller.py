@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from src.freelance_leads_bot.integrations.agent_tools import AutomationToolbox
 from src.freelance_leads_bot.integrations.agent_trace import JsonlAgentTraceLogger
 from src.freelance_leads_bot.integrations.avito_dedup import PersistentProcessedEventStore
+from src.freelance_leads_bot.integrations.avito_listing_context import restore_avito_listing_context
 from src.freelance_leads_bot.integrations.avito_read import AvitoReadClient
 from src.freelance_leads_bot.integrations.avito_consultant import CodexToolLoopPlanner
 from src.freelance_leads_bot.integrations.avito_identity import client_name_from_chat, update_client_name_cache
@@ -164,7 +165,7 @@ def _inbound_from_message(
     has_photo = message_type in {"image", "photo", "video", "file"} or bool(content.get("image") or content.get("photo") or content.get("video") or content.get("file"))
     is_own_account = author_id == str(account_id)
     client_name = client_name_from_chat(chat, account_id=account_id, author_id=author_id)
-    return InboundMessage(
+    message = InboundMessage(
         channel=Channel.AVITO,
         client_id=author_id,
         chat_id=str(chat.get("id") or ""),
@@ -191,6 +192,7 @@ def _inbound_from_message(
             "source": "avito_poller",
         },
     )
+    return restore_avito_listing_context(message)
 
 
 def _should_process(raw_message: dict[str, Any], *, since_ts: int, settings: IntegrationSettings) -> tuple[bool, str]:

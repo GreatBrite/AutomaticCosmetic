@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from ..codex_runner import chat_with_codex
 from .body_pricing import body_price_guard_reply, canonical_body_price_table_text
 from .avito_consultant import AvitoConsultantReply
+from .avito_listing_context import listing_context_from_history
 from .codex_planner import parse_codex_step
 from .models import Handoff, HandoffReason, InboundMessage
 
@@ -243,7 +244,7 @@ def deterministic_review_guard(
         metadata["body_price_guard"] = {"reason": "canonical_body_price_table"}
         return replace(decision, action="body_price_answer", reply=body_price_reply, metadata=metadata)
 
-    scope_guard = face_body_scope_guard(reply, message=message)
+    scope_guard = face_body_scope_guard(reply, message=message, conversation_history=conversation_history)
     if scope_guard:
         metadata["service_scope_guard"] = scope_guard
         return replace(decision, reply=scope_guard["safe_reply"], metadata=metadata)
@@ -261,9 +262,18 @@ def deterministic_review_guard(
     return None
 
 
-def face_body_scope_guard(reply: str, *, message: InboundMessage) -> dict[str, str]:
-    listing_title = str(message.listing.title if message.listing else "")
-    scope_text = f"{listing_title}\n{message.text or ''}".casefold().replace("ё", "е")
+def face_body_scope_guard(
+    reply: str,
+    *,
+    message: InboundMessage,
+    conversation_history: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+) -> dict[str, str]:
+    restored_listing = message.listing or listing_context_from_history(conversation_history)
+    listing_title = str(restored_listing.title if restored_listing else "")
+    history_text = " ".join(
+        str(item.get("content") or "") for item in list(conversation_history)[-8:] if str(item.get("role") or "") == "user"
+    )
+    scope_text = f"{listing_title}\n{message.text or ''}\n{history_text}".casefold().replace("ё", "е")
     reply_text = str(reply or "").casefold().replace("ё", "е")
     if not (FACE_SCOPE_RE.search(scope_text) and BODY_REPLY_RE.search(reply_text)):
         return {}

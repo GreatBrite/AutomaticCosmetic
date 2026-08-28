@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from itertools import count
 from typing import Any, Awaitable, Callable, Protocol
@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from .agent_tools import AutomationToolbox
 from .agent_trace import JsonlAgentTraceLogger
 from .avito import avito_photo_handoff
+from .avito_listing_context import listing_context_from_history
 from .body_pricing import body_price_reply_for_message
 from .booking_flow import AvitoBookingFlow, booking_request_from_message, extract_date, extract_time
 from .city_utils import fixed_cities_reply
@@ -40,6 +41,16 @@ RISK_WORDS = (
     "температура",
     "жалоба",
     "плохо после",
+)
+FACE_MODEL_LISTING_REPLY = (
+    "Да, по модели на контурную пластику лица. Подскажите, какая зона интересует: "
+    "губы, носогубки, скулы, подбородок, углы нижней челюсти, нижняя треть/брыли?"
+)
+FACE_PRICE_UNKNOWN_REPLY = "Стоимость по лицу зависит от зоны и объёма, уточню по вашему набору зон."
+MODEL_ONLY_RE = re.compile(r"(?iu)^\s*(?:модель|моделью|как\s+модель|по\s+модели)\s*[?.!]*\s*$")
+DIRECT_PRICE_QUESTION_RE = re.compile(
+    r"(?iu)(стоимост|прайс|цена|цену|ценник|сколько\s+(?:стоит|будет|по\s+цене)|"
+    r"какая\s+цена|руб|₽|\d+\s*(?:тыс|тысяч|000))"
 )
 TEMPORAL_FACT_RE = re.compile(
     r"(?iu)(?:\b(?:сегодня|завтра|послезавтра)\b|"
@@ -272,6 +283,9 @@ class AvitoConsultant:
     async def _router_reply(self, context: AvitoAgentContext) -> AvitoConsultantReply | None:
         if context.role_profile.role not in {CodexRole.AVITO_CLIENT, CodexRole.TELEGRAM_CLIENT, CodexRole.VK_CLIENT}:
             return None
+        service_context = _service_context_reply(context)
+        if service_context:
+            return service_context
         body_price_reply = body_price_reply_for_message(context.message, conversation_history=context.conversation_history)
         if body_price_reply:
             return AvitoConsultantReply(
@@ -430,6 +444,7 @@ class AvitoConsultant:
         *,
         conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     ) -> AvitoAgentContext:
+        message = _with_history_listing_context(message, conversation_history)
         knowledge_items = await self._knowledge_items(message)
         retrieved_expert_answers = self._retrieved_expert_answers(message)
         return AvitoAgentContext(
@@ -788,7 +803,8 @@ def _knowledge_queries(message: InboundMessage) -> list[str]:
     if _asks_amount_or_calculation(text):
         queries.extend(["расчет", "мл", "объем"])
     words = re.findall(r"[а-яёa-z0-9]{4,}", text, flags=re.IGNORECASE)
-    queries.extend(words[:5])
+    if not _model_only_without_known_scope(message):
+        queries.extend(words[:5])
     return [query for query in queries if query]
 
 
@@ -867,11 +883,99 @@ def _knowledge_item_matches_message_scope(item: dict[str, Any], message: Inbound
     scope_is_body = bool(BODY_SCOPE_RE.search(scope_source))
     item_is_body = bool(BODY_SCOPE_RE.search(item_source))
     item_is_face = bool(FACE_SCOPE_RE.search(item_source))
+    item_kind = str(item.get("kind") or "")
+    if item_is_body and item_kind in {"price", "service_price"} and not scope_is_body:
+        return False
     if scope_is_face and not scope_is_body and item_is_body:
         return False
     if scope_is_body and not scope_is_face and item_is_face:
         return False
     return True
+
+
+def _with_history_listing_context(
+    message: InboundMessage,
+    conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> InboundMessage:
+    if message.listing and message.listing.has_listing:
+        return message
+    listing = listing_context_from_history(conversation_history)
+    if not listing:
+        return message
+    return replace(
+        message,
+        listing=listing,
+        metadata={**message.metadata, "listing_restored": True, "listing_restored_from": "history"},
+    )
+
+
+def _service_context_reply(context: AvitoAgentContext) -> AvitoConsultantReply | None:
+    scope = _message_service_scope(context.message, context.conversation_history)
+    text = str(context.message.text or "")
+    lowered = text.casefold()
+    if scope == "face" and MODEL_ONLY_RE.match(text):
+        return AvitoConsultantReply(
+            action="listing_service_context",
+            reply=FACE_MODEL_LISTING_REPLY,
+            metadata={"planner": "service_context_guard", "scope": "face", "reason": "model_only_face_listing"},
+        )
+    if scope == "face" and _is_face_contour_listing(context.message) and DIRECT_PRICE_QUESTION_RE.search(lowered) and not BODY_SCOPE_RE.search(lowered):
+        return AvitoConsultantReply(
+            action="face_price_needs_zone",
+            reply=FACE_PRICE_UNKNOWN_REPLY,
+            metadata={"planner": "service_context_guard", "scope": "face", "reason": "face_price_without_confirmed_zone"},
+        )
+    if not scope and MODEL_ONLY_RE.match(text):
+        return AvitoConsultantReply(
+            action="ask_procedure_for_model",
+            reply="Подскажите, пожалуйста, по какой процедуре хотите быть моделью? Тогда сориентирую по условиям.",
+            metadata={"planner": "service_context_guard", "reason": "model_without_service_context"},
+        )
+    return None
+
+
+def _message_service_scope(
+    message: InboundMessage,
+    conversation_history: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
+) -> str:
+    user_history = " ".join(
+        str(item.get("content") or "") for item in list(conversation_history)[-8:] if str(item.get("role") or "") == "user"
+    )
+    source = " ".join(
+        part
+        for part in (
+            message.text,
+            message.listing.title if message.listing else "",
+            user_history,
+        )
+        if part
+    ).casefold().replace("ё", "е")
+    is_face = bool(FACE_SCOPE_RE.search(source))
+    is_body = bool(BODY_SCOPE_RE.search(source))
+    if is_face and not is_body:
+        return "face"
+    if is_body and not is_face:
+        return "body"
+    return ""
+
+
+def _is_face_contour_listing(message: InboundMessage) -> bool:
+    title = str(message.listing.title if message.listing else "").casefold().replace("ё", "е")
+    return bool(FACE_SCOPE_RE.search(title) and ("контур" in title or "модель" in title))
+
+
+def _model_only_without_known_scope(message: InboundMessage) -> bool:
+    if not MODEL_ONLY_RE.match(str(message.text or "")):
+        return False
+    scope_source = " ".join(
+        part
+        for part in (
+            message.listing.title if message.listing else "",
+            message.listing.price_string if message.listing else "",
+        )
+        if part
+    ).casefold().replace("ё", "е")
+    return not (FACE_SCOPE_RE.search(scope_source) or BODY_SCOPE_RE.search(scope_source))
 
 
 def _booking_critical_client_reply(message: InboundMessage) -> str:

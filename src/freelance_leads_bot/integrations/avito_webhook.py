@@ -20,6 +20,7 @@ from .avito_dedup import PersistentProcessedEventStore
 from .avito_media import AvitoApiPhotoResolver, AvitoPhotoResolver, enrich_reply_handoff_photos
 from .avito_read import AvitoReadGateway, avito_read_client_from_settings
 from .avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
+from .avito_listing_context import restore_avito_listing_context
 from .avito_sender import AvitoSender, avito_sender_from_settings
 from .avito_turn_buffer import (
     batch_to_inbound_message,
@@ -785,6 +786,7 @@ async def process_avito_message(
     )
     conversation_key = f"avito:client:{message.chat_id or message.client_id}"
     conversation_history = history_store.recent_codex_chat(settings.telegram_admin_history_limit, conversation_key) if history_store else []
+    message = restore_avito_listing_context(message, conversation_history=conversation_history)
     if history_store and _history_has_message_id(conversation_history, message.message_id) and not force_unanswered_autoreply:
         return {
             "ok": True,

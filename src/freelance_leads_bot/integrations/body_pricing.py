@@ -20,6 +20,10 @@ STANDARD_BODY_PRICES: dict[int, int] = {
 }
 
 BODY_PRICE_SCOPE_RE = re.compile(r"(?iu)(груд|ягод|поп|тесоро|tesoro|body|контурн\w+\s+(?:пластик\w+|коррекц\w+)\s+тел)")
+FACE_SCOPE_RE = re.compile(
+    r"(?iu)(контурн\w*\s+пластик\w*\s+лиц|лиц[аоеу]?|скул|угл[ыо]?\s+нижн\w+\s+челюст|"
+    r"челюст|подбород|нососл[её]з|носогуб|нефертити|овал|брыл|морщ)"
+)
 PRICE_QUESTION_RE = re.compile(
     r"(?iu)(цен|стоим|прайс|сколько\s+(?:стоит|будет|по\s+цене)|какая\s+цена|"
     r"за\s+\d|руб|₽|\d+\s*(?:тыс|тысяч|000))"
@@ -52,6 +56,8 @@ def body_price_reply(
     )
     history_volume_text = " ".join(str(item.get("content") or "") for item in list(conversation_history)[-6:])
     scope_source = f"{current}\n{listing_title}\n{history_text}"
+    if FACE_SCOPE_RE.search(listing_title) and not BODY_PRICE_SCOPE_RE.search(f"{current}\n{history_text}"):
+        return ""
     volumes = _requested_volumes(current) or _requested_volumes(history_text) or _requested_volumes(history_volume_text)
     side_or_total_question = bool(SIDE_OR_TOTAL_RE.search(f"{current}\n{history_text}"))
     if not BODY_PRICE_SCOPE_RE.search(scope_source):

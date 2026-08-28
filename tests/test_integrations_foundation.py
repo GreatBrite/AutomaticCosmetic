@@ -39,6 +39,7 @@ from src.freelance_leads_bot.integrations.client_router import route_client_mess
 from src.freelance_leads_bot.integrations.booking_flow import AvitoBookingFlow, BookingRequest, extract_date
 from src.freelance_leads_bot.integrations.avito_sender import AvitoSdkSender, PreviewAvitoSender
 from src.freelance_leads_bot.integrations.avito_history import prepare_avito_outgoing_text, remember_avito_outgoing, sent_successfully
+from src.freelance_leads_bot.integrations.avito_listing_context import restore_avito_listing_context
 from src.freelance_leads_bot.integrations.avito_turn_buffer import batch_to_inbound_message
 from src.freelance_leads_bot.integrations.care_crm import (
     CareLearningService,
@@ -4743,6 +4744,160 @@ async def test_avito_consultant_answers_model_table_for_model_listing_without_vo
     assert reply.action == "body_price_answer"
     assert "как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽, 500 мл — 85 000 ₽, 600 мл — 100 000 ₽" in reply.reply
     assert "не как модель" not in reply.reply
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_keeps_model_face_listing_in_face_scope(tmp_path) -> None:
+    async def fail_codex_loop(payload, trace):
+        raise AssertionError("face listing model clarification must be deterministic before Codex planner")
+
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox, planner=CodexToolLoopPlanner(fail_codex_loop))
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-alla-face-model",
+            "text": "Модель",
+            "content": {
+                "listing": {
+                    "id": 8353479902,
+                    "title": "Модель на контурную пластику лица Москва",
+                    "price_string": "5 000 ₽",
+                    "city": "Москва",
+                }
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "listing_service_context"
+    assert "контурную пластику лица" in reply.reply.casefold()
+    assert "губы" in reply.reply.casefold()
+    assert "носогубки" in reply.reply.casefold()
+    assert "скулы" in reply.reply.casefold()
+    assert "груд" not in reply.reply.casefold()
+    assert "ягод" not in reply.reply.casefold()
+    assert "300 мл" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_restores_face_listing_from_history_for_model_reply(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-history-face-model", "text": "Модель"})
+
+    reply = await consultant.respond(
+        message,
+        conversation_history=[
+            {"role": "user", "content": "Объявление: Модель на контурную пластику лица Москва | 5 000 ₽ | Москва"},
+            {"role": "user", "content": "Модель"},
+        ],
+    )
+
+    assert reply.action == "listing_service_context"
+    assert "контурную пластику лица" in reply.reply.casefold()
+    assert "груд" not in reply.reply.casefold()
+    assert "ягод" not in reply.reply.casefold()
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_model_without_listing_asks_procedure_not_body_price(tmp_path) -> None:
+    async def fail_codex_loop(payload, trace):
+        raise AssertionError("generic model message must not reach Codex with body price knowledge")
+
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    knowledge.create(
+        kind="price",
+        title="Цены по объёмам для грудь/ягодицы",
+        content="Как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽. Tesoro Body для контурной пластики тела.",
+        tags=("model", "body_contouring", "увеличение ягодиц"),
+    )
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), knowledge), planner=CodexToolLoopPlanner(fail_codex_loop))
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-model-no-listing", "text": "Модель"})
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "ask_procedure_for_model"
+    assert "какой процедуре" in reply.reply.casefold()
+    assert "груд" not in reply.reply.casefold()
+    assert "ягод" not in reply.reply.casefold()
+    assert "300 мл" not in reply.reply.casefold()
+
+
+def test_avito_listing_context_cache_restores_next_message(tmp_path) -> None:
+    path = tmp_path / "listing_contexts.json"
+    first = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-listing-cache",
+            "text": "Здравствуйте",
+            "content": {
+                "listing": {
+                    "id": 8353479902,
+                    "title": "Модель на контурную пластику лица Москва",
+                    "price_string": "5 000 ₽",
+                    "city": "Москва",
+                }
+            },
+        }
+    )
+    restored_first = restore_avito_listing_context(first, path=path)
+    second = avito_inbound_message({"type": "message", "chat_id": "chat-listing-cache", "text": "Модель"})
+
+    restored_second = restore_avito_listing_context(second, path=path)
+
+    assert restored_first.listing is not None
+    assert restored_second.listing is not None
+    assert restored_second.listing.title == "Модель на контурную пластику лица Москва"
+    assert restored_second.metadata["listing_restored"] is True
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_filters_body_price_knowledge_without_body_scope(tmp_path) -> None:
+    knowledge = JsonKnowledgeStore(tmp_path / "knowledge.json")
+    body_item = knowledge.create(
+        kind="price",
+        title="Цены по объёмам для грудь/ягодицы",
+        content="Как модель: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽. Tesoro Body для контурной пластики тела.",
+        tags=("model", "body_contouring", "увеличение ягодиц"),
+    )
+    consultant = AvitoConsultant(AutomationToolbox(DryRunYClientsGateway(), knowledge))
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-model-knowledge-scope", "text": "Модель"})
+
+    context = await consultant.build_context(message)
+    ids = {str(item.get("id") or "") for item in context.knowledge_items}
+
+    assert body_item.id not in ids
+
+
+@pytest.mark.anyio
+async def test_avito_consultant_face_listing_price_does_not_use_body_price_table(tmp_path) -> None:
+    toolbox = AutomationToolbox(DryRunYClientsGateway(), JsonKnowledgeStore(tmp_path / "knowledge.json"))
+    consultant = AvitoConsultant(toolbox)
+    message = avito_inbound_message(
+        {
+            "type": "message",
+            "chat_id": "chat-face-price",
+            "text": "Можно стоимость за все лицо, зоны выше",
+            "content": {
+                "listing": {
+                    "id": 8353479902,
+                    "title": "Модель на контурную пластику лица Москва",
+                    "price_string": "5 000 ₽",
+                    "city": "Москва",
+                }
+            },
+        }
+    )
+
+    reply = await consultant.respond(message)
+
+    assert reply.action == "face_price_needs_zone"
+    assert "по лицу" in reply.reply.casefold()
+    assert "груд" not in reply.reply.casefold()
+    assert "ягод" not in reply.reply.casefold()
+    assert "300 мл" not in reply.reply.casefold()
 
 
 def test_codex_review_guard_replaces_wrong_body_price_with_canonical_table() -> None:
@@ -11823,6 +11978,29 @@ def test_codex_review_guard_removes_body_answer_from_face_listing() -> None:
 
     assert reviewed.action == "codex_reply"
     assert "зона лица" in reviewed.reply
+    assert "ягод" not in reviewed.reply.casefold()
+    assert reviewed.metadata["service_scope_guard"]["reason"] == "face_body_scope_mismatch"
+
+
+def test_codex_review_guard_removes_body_answer_from_restored_face_listing_history() -> None:
+    message = avito_inbound_message({"type": "message", "chat_id": "chat-face-scope-history", "text": "модель"})
+    decision = AvitoConsultantReply(
+        action="codex_reply",
+        reply="По модели для груди или ягодиц: 300 мл — 50 000 ₽, 400 мл — 70 000 ₽.",
+    )
+
+    reviewed = apply_review_outcome(
+        message,
+        decision,
+        {"action": "approve", "notes": "ok"},
+        conversation_history=[
+            {"role": "user", "content": "Объявление: Модель на контурную пластику лица Москва | 5 000 ₽ | Москва"},
+        ],
+    )
+
+    assert reviewed.action == "codex_reply"
+    assert "зона лица" in reviewed.reply
+    assert "груд" not in reviewed.reply.casefold()
     assert "ягод" not in reviewed.reply.casefold()
     assert reviewed.metadata["service_scope_guard"]["reason"] == "face_body_scope_mismatch"
 
